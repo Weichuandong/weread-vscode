@@ -1,0 +1,103 @@
+name: Release
+
+# 触发: push 一个形如 v0.0.5 的 tag 时
+# 用法:
+#   1. 修改 package.json 的 version (例如 0.0.5)
+#   2. 在 CHANGELOG.md 里新增 ## [0.0.5] 段
+#   3. git commit -am "release: v0.0.5"
+#   4. git tag v0.0.5 && git push --follow-tags
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+# 创建 release / 上传附件 需要写 contents
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Verify version matches tag
+        run: |
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          echo "package.json version: $PKG_VERSION"
+          echo "git tag version:      $TAG_VERSION"
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::package.json version ($PKG_VERSION) does not match tag ($TAG_VERSION)"
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Compile TypeScript
+        run: npm run compile
+
+      - name: Package VSIX
+        run: npx --yes @vscode/vsce package
+
+      - name: Extract CHANGELOG section for this version
+        id: changelog
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          # 抠出 "## [VERSION]" 段的内容到下一个 "## [" 之前
+          NOTES=$(awk -v ver="^## \\[${VERSION}\\]" '
+            $0 ~ ver { flag=1; next }
+            /^## \[/ && flag { exit }
+            flag { print }
+          ' CHANGELOG.md)
+
+          # 如果 CHANGELOG 里没找到对应版本段, 给一个兜底说明
+          if [ -z "$NOTES" ]; then
+            NOTES="See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/main/CHANGELOG.md) for details."
+          fi
+
+          # 写到 GITHUB_OUTPUT (多行 heredoc 格式)
+          {
+            echo "notes<<__EOF__"
+            echo "$NOTES"
+            echo "## 📥 安装"
+            echo ""
+            echo "**通过 vsix 离线安装**: 下载下方的 \`weread-vscode-${VERSION}.vsix\` 后, 在 VSCode 里 \`扩展 → ... → 从 VSIX 安装\`, 或命令行:"
+            echo '```bash'
+            echo "code --install-extension weread-vscode-${VERSION}.vsix"
+            echo '```'
+            echo ""
+            echo "**通过 Open VSX**: 在 Cursor / VSCodium 扩展面板搜索 \`weread\` 即可。"
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body: ${{ steps.changelog.outputs.notes }}
+          files: '*.vsix'
+          make_latest: 'true'
+          draft: false
+          prerelease: false
+
+      - name: Publish to Open VSX (optional)
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+        continue-on-error: true
+        run: |
+          if [ -n "$OVSX_PAT" ]; then
+            echo "Publishing to Open VSX..."
+            npx --yes ovsx publish *.vsix
+          else
+            echo "::warning::OVSX_PAT secret is not set, skip Open VSX publish."
+            echo "To enable, add OVSX_PAT secret in: Settings → Secrets and variables → Actions"
+          fi

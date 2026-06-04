@@ -9,6 +9,7 @@ tsconfig.json
 .vscode/**
 .vscode-test/**
 .codewiz/**
+.github/**
 .gitignore
 **/.DS_Store
 
