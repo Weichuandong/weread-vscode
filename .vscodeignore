@@ -1,0 +1,36 @@
+# 源码 / 构建中间物
+src/**
+out/**/*.map
+out/**/*.d.ts
+tsconfig.json
+*.tsbuildinfo
+
+# IDE / OS
+.vscode/**
+.vscode-test/**
+.codewiz/**
+.gitignore
+**/.DS_Store
+
+# 发布之前打的本地 vsix, 不要把旧 vsix 打进新 vsix
+*.vsix
+
+# icon 源文件 (PNG 已经打包, SVG 不需要)
+resources/icon.svg
+
+# node_modules 精简 (axios 必须保留, 但裁掉它的废文件)
+node_modules/.cache/**
+node_modules/**/test/**
+node_modules/**/tests/**
+node_modules/**/*.md
+node_modules/**/*.ts
+node_modules/**/.github/**
+node_modules/**/*.map
+node_modules/**/LICENSE*
+node_modules/**/license*
+node_modules/@types/**
+**/.eslintrc*
+**/tsconfig*.json
+
+# 不要打包工具相关
+package-lock.json

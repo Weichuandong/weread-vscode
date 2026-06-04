@@ -1,0 +1,17 @@
+# 依赖 / 构建产物
+node_modules/
+out/
+*.vsix
+*.tsbuildinfo
+
+# 编辑器 / 系统
+.vscode-test/
+.DS_Store
+*.log
+
+# Codewiz / AI agent 工作区(本地状态, 不要公开)
+.codewiz/
+
+# 环境变量
+.env
+.env.local

@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!-- 圆角矩形渐变背景 -->
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#2BAE66"/>
+      <stop offset="100%" stop-color="#19905F"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#000" flood-opacity="0.18"/>
+    </filter>
+  </defs>
+
+  <rect x="0" y="0" width="128" height="128" rx="24" ry="24" fill="url(#bg)"/>
+
+  <!-- 翻开的书 -->
+  <g filter="url(#shadow)" transform="translate(64,68)">
+    <!-- 书脊阴影 -->
+    <rect x="-2" y="-26" width="4" height="52" fill="#0a3a25" opacity="0.35" rx="1"/>
+
+    <!-- 左页 -->
+    <path d="M -42 -28
+             L  -2 -22
+             L  -2  26
+             L -42  20
+             Z"
+          fill="#FFFFFF" stroke="#0c4a30" stroke-width="1.2" stroke-linejoin="round"/>
+
+    <!-- 右页 -->
+    <path d="M  42 -28
+             L   2 -22
+             L   2  26
+             L  42  20
+             Z"
+          fill="#FFFFFF" stroke="#0c4a30" stroke-width="1.2" stroke-linejoin="round"/>
+
+    <!-- 左页文字线 -->
+    <line x1="-36" y1="-18" x2="-8"  y2="-13.8" stroke="#9bbfa8" stroke-width="1.6" stroke-linecap="round"/>
+    <line x1="-36" y1="-10" x2="-12" y2="-6.4"  stroke="#9bbfa8" stroke-width="1.6" stroke-linecap="round"/>
+    <line x1="-36" y1="-2"  x2="-8"  y2="1.4"   stroke="#9bbfa8" stroke-width="1.6" stroke-linecap="round"/>
+    <line x1="-36" y1="6"   x2="-14" y2="9.0"   stroke="#9bbfa8" stroke-width="1.6" stroke-linecap="round"/>
+
+    <!-- 右页文字线 -->
+    <line x1="8"  y1="-13.8" x2="36" y2="-18" stroke="#9bbfa8" stroke-width="1.6" stroke-linecap="round"/>
+    <line x1="12" y1="-6.4"  x2="36" y2="-10" stroke="#9bbfa8" stroke-width="1.6" stroke-linecap="round"/>
+    <line x1="8"  y1="1.4"   x2="36" y2="-2"  stroke="#9bbfa8" stroke-width="1.6" stroke-linecap="round"/>
+    <line x1="14" y1="9.0"   x2="36" y2="6"   stroke="#9bbfa8" stroke-width="1.6" stroke-linecap="round"/>
+  </g>
+
+  <!-- 顶部小书签 -->
+  <path d="M 90 0
+           L 90 28
+           L 84 22
+           L 78 28
+           L 78 0
+           Z"
+        fill="#FF6B6B"/>
+</svg>

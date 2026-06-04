@@ -1,0 +1,162 @@
+{
+  "name": "weread-vscode",
+  "displayName": "WeRead for VSCode",
+  "description": "在 VSCode 侧边栏阅读微信读书 — 书架/章节/正文/云端进度同步，支持扫码与浏览器登录助手",
+  "version": "0.0.4",
+  "publisher": "weichuandong",
+  "license": "MIT",
+  "author": {
+    "name": "weichuandong"
+  },
+  "icon": "resources/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/weichuandong/weread-vscode.git"
+  },
+  "bugs": {
+    "url": "https://github.com/weichuandong/weread-vscode/issues"
+  },
+  "homepage": "https://github.com/weichuandong/weread-vscode#readme",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Other",
+    "Visualization"
+  ],
+  "keywords": [
+    "weread",
+    "微信读书",
+    "reading",
+    "ebook",
+    "book",
+    "novel",
+    "摸鱼",
+    "epub"
+  ],
+  "galleryBanner": {
+    "color": "#2a2a2a",
+    "theme": "dark"
+  },
+  "qna": false,
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "weread",
+          "title": "微信读书",
+          "icon": "resources/weread.svg"
+        }
+      ]
+    },
+    "views": {
+      "weread": [
+        {
+          "type": "webview",
+          "id": "weread.main",
+          "name": "微信读书",
+          "icon": "resources/weread.svg",
+          "contextualTitle": "微信读书"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "weread.qrLogin",
+        "title": "微信读书: 扫码登录 (Beta)",
+        "icon": "$(device-mobile)"
+      },
+      {
+        "command": "weread.browserLogin",
+        "title": "微信读书: 浏览器登录助手",
+        "icon": "$(globe)"
+      },
+      {
+        "command": "weread.importCookie",
+        "title": "微信读书: 导入 Cookie 登录",
+        "icon": "$(sign-in)"
+      },
+      {
+        "command": "weread.logout",
+        "title": "微信读书: 退出登录",
+        "icon": "$(sign-out)"
+      },
+      {
+        "command": "weread.refreshBookshelf",
+        "title": "微信读书: 刷新书架",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "weread.openBook",
+        "title": "微信读书: 打开书籍"
+      },
+      {
+        "command": "weread.openInBrowser",
+        "title": "微信读书: 在浏览器中打开",
+        "icon": "$(link-external)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "weread.refreshBookshelf",
+          "when": "view == weread.main",
+          "group": "navigation@1"
+        },
+        {
+          "command": "weread.browserLogin",
+          "when": "view == weread.main",
+          "group": "1_actions@1"
+        },
+        {
+          "command": "weread.qrLogin",
+          "when": "view == weread.main",
+          "group": "1_actions@2"
+        },
+        {
+          "command": "weread.importCookie",
+          "when": "view == weread.main",
+          "group": "1_actions@3"
+        },
+        {
+          "command": "weread.logout",
+          "when": "view == weread.main",
+          "group": "1_actions@4"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "微信读书",
+      "properties": {
+        "weread.requestTimeout": {
+          "type": "number",
+          "default": 15000,
+          "description": "HTTP 请求超时时间（毫秒）"
+        },
+        "weread.userAgent": {
+          "type": "string",
+          "default": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          "description": "请求使用的 User-Agent"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "echo \"(skip)\""
+  },
+  "dependencies": {
+    "axios": "^1.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^18.19.0",
+    "@types/vscode": "^1.80.0",
+    "typescript": "^5.3.3"
+  }
+}
