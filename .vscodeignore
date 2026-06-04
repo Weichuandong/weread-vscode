@@ -5,6 +5,10 @@ out/**/*.d.ts
 tsconfig.json
 *.tsbuildinfo
 
+# 发布脚本/文档不进 vsix
+scripts/**
+RELEASING.md
+
 # IDE / OS
 .vscode/**
 .vscode-test/**

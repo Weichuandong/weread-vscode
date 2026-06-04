@@ -85,6 +85,7 @@
 
 - Bug / 建议：[GitHub Issues](https://github.com/weichuandong/weread-vscode/issues)
 - PR 欢迎，但请先开 issue 沟通避免重复工作
+- 想为本插件发布新版本？参见 [发布流程文档](RELEASING.md)
 
 ---
 
