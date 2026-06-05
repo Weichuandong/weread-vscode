@@ -2,7 +2,7 @@
   "name": "weread-vscode",
   "displayName": "WeRead for VSCode",
   "description": "在 VSCode 侧边栏阅读微信读书 — 书架/章节/正文/云端进度同步，通过粘贴 Cookie 登录",
-  "version": "0.0.5",
+  "version": "1.0.0",
   "publisher": "weichuandong",
   "license": "MIT",
   "author": {
