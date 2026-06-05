@@ -2,6 +2,11 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)，所有重要变更都会记录在这里。
 
+## [1.0.1] - 2026-06-05
+
+### Docs
+- 📖 **README 功能描述刷新到与代码一致** —— 重写功能特性章节: 准确列出书架双 Tab / 分组折叠 / 阅读器图片代理 + 缓存 + 两阶段渲染 / entity 反解 / 脚注 CSS 化 / 翻章节 / 目录抽屉 / 想法-划线-书评三 Tab 抽屉 / 正文 inline 划线 + 按 range 拉想法 popover; 修正登录方式段(原"三种登录" → "唯一 Cookie 登录"); 补全命令面板一览表; Releases / Issues 链接修正到正确大小写 `Weichuandong/weread-vscode`
+
 ## [1.0.0] - 2026-06-05
 
 > 首个正式版。在 0.0.4 公开 Beta 之上完成了一轮渲染管线重构 + 登录方式收敛，行为稳定可日常使用。
