@@ -9,8 +9,8 @@ import { getBookReaderUrl } from './api/wereadUrl';
  * 扩展入口。
  *
  * v0.0.2 起视图组合简化为：
- *  - Activity Bar 容器 "weread"
- *    └── 微信读书 (单一 Webview View, weread.main)
+ *  - Activity Bar 容器 "wereadVscode" (id 加 vscode 后缀避开社区里其他微信读书插件)
+ *    └── 微信读书 (单一 Webview View, wereadVscode.main)
  *         顶部 tab 切换: 📚 书架 / 📖 在读
  *
  * 设计动机：原先的 TreeView + 阅读 WebviewView 双视图占据较多纵向 header,
@@ -53,34 +53,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
     }),
 
-    // 扫码登录: 唤出 webview 并启动扫码会话, UI 走状态机渲染
-    vscode.commands.registerCommand('weread.qrLogin', async () => {
-      try {
-        await vscode.commands.executeCommand('weread.main.focus');
-      } catch {
-        try {
-          await vscode.commands.executeCommand('workbench.view.extension.weread');
-        } catch {
-          /* ignore */
-        }
-      }
-      mainView.triggerQrLogin();
-    }),
-
-    // 浏览器登录助手: 打开浏览器 + UI 引导用户 console 复制 cookie
-    vscode.commands.registerCommand('weread.browserLogin', async () => {
-      try {
-        await vscode.commands.executeCommand('weread.main.focus');
-      } catch {
-        try {
-          await vscode.commands.executeCommand('workbench.view.extension.weread');
-        } catch {
-          /* ignore */
-        }
-      }
-      await mainView.startBrowserLogin();
-    }),
-
     vscode.commands.registerCommand('weread.logout', async () => {
       const choice = await vscode.window.showWarningMessage(
         '确定要退出微信读书登录吗？',
@@ -119,6 +91,27 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         await vscode.env.openExternal(vscode.Uri.parse(url));
       },
     ),
+
+    // 诊断: 把当前章节的 HTML/CSS/format 写到 Output 面板, 用于排查渲染异常
+    vscode.commands.registerCommand('weread.diagnoseChapter', () => {
+      mainView.diagnoseChapter();
+    }),
+
+    // 紧急解锁: 某些 EPUB 章节(尤其是封面/插图章)解密出来的 CSS/HTML 可能
+    // 污染整个 webview, 让侧栏卡死、点啥都不动。这个命令独立于 webview 通道,
+    // 通过命令面板就能触发, 清掉"在读"快照回到书架。
+    vscode.commands.registerCommand('weread.resetReadingState', async () => {
+      try {
+        await vscode.commands.executeCommand('wereadVscode.main.focus');
+      } catch {
+        try {
+          await vscode.commands.executeCommand('workbench.view.extension.wereadVscode');
+        } catch {
+          /* ignore */
+        }
+      }
+      await mainView.resetReadingState();
+    }),
   );
 
   context.subscriptions.push({ dispose: () => auth.dispose() });

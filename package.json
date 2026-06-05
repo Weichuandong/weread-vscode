@@ -1,8 +1,8 @@
 {
   "name": "weread-vscode",
   "displayName": "WeRead for VSCode",
-  "description": "在 VSCode 侧边栏阅读微信读书 — 书架/章节/正文/云端进度同步，支持扫码与浏览器登录助手",
-  "version": "0.0.4",
+  "description": "在 VSCode 侧边栏阅读微信读书 — 书架/章节/正文/云端进度同步，通过粘贴 Cookie 登录",
+  "version": "0.0.5",
   "publisher": "weichuandong",
   "license": "MIT",
   "author": {
@@ -47,17 +47,17 @@
     "viewsContainers": {
       "activitybar": [
         {
-          "id": "weread",
+          "id": "wereadVscode",
           "title": "微信读书",
           "icon": "resources/weread.svg"
         }
       ]
     },
     "views": {
-      "weread": [
+      "wereadVscode": [
         {
           "type": "webview",
-          "id": "weread.main",
+          "id": "wereadVscode.main",
           "name": "微信读书",
           "icon": "resources/weread.svg",
           "contextualTitle": "微信读书"
@@ -65,16 +65,6 @@
       ]
     },
     "commands": [
-      {
-        "command": "weread.qrLogin",
-        "title": "微信读书: 扫码登录 (Beta)",
-        "icon": "$(device-mobile)"
-      },
-      {
-        "command": "weread.browserLogin",
-        "title": "微信读书: 浏览器登录助手",
-        "icon": "$(globe)"
-      },
       {
         "command": "weread.importCookie",
         "title": "微信读书: 导入 Cookie 登录",
@@ -98,34 +88,39 @@
         "command": "weread.openInBrowser",
         "title": "微信读书: 在浏览器中打开",
         "icon": "$(link-external)"
+      },
+      {
+        "command": "weread.resetReadingState",
+        "title": "微信读书: 清除在读缓存(卡死时使用)",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "weread.diagnoseChapter",
+        "title": "微信读书: 诊断当前章节(导出 HTML/CSS)",
+        "icon": "$(beaker)"
       }
     ],
     "menus": {
       "view/title": [
         {
           "command": "weread.refreshBookshelf",
-          "when": "view == weread.main",
+          "when": "view == wereadVscode.main",
           "group": "navigation@1"
         },
         {
-          "command": "weread.browserLogin",
-          "when": "view == weread.main",
-          "group": "1_actions@1"
-        },
-        {
-          "command": "weread.qrLogin",
-          "when": "view == weread.main",
-          "group": "1_actions@2"
-        },
-        {
           "command": "weread.importCookie",
-          "when": "view == weread.main",
+          "when": "view == wereadVscode.main",
           "group": "1_actions@3"
         },
         {
           "command": "weread.logout",
-          "when": "view == weread.main",
+          "when": "view == wereadVscode.main",
           "group": "1_actions@4"
+        },
+        {
+          "command": "weread.resetReadingState",
+          "when": "view == wereadVscode.main",
+          "group": "9_recovery@1"
         }
       ]
     },

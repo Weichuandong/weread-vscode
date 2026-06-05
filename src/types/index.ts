@@ -109,3 +109,79 @@ export interface WereadUser {
 
 /** Cookie 键值对 */
 export type CookieJar = Record<string, string>;
+
+// ============================================================
+// 社交内容(只读): 想法 / 划线 / 书评
+// ============================================================
+
+/** 想法/书评的作者(对应接口里的 user 字段) */
+export interface ReviewAuthor {
+  vid?: number | string;
+  name?: string;
+  avatar?: string;
+  [key: string]: unknown;
+}
+
+/**
+ * 想法 / 书评(/web/review/list 返回的单条记录)。
+ *
+ * 接口对同一种结构复用很彻底:
+ *   - listType=11(章节想法)  → type=1, 通常带 markText(被引用的原文片段)
+ *   - listType=4 (全书书评)  → type=4, 一般无 markText, content 为评论正文
+ * 写操作所需的 range(EPUB CFI) 字段我们只透传不解析。
+ */
+export interface Review {
+  reviewId: string;
+  author: ReviewAuthor;
+  /** 评论/想法的正文(可能为空, 比如纯划线) */
+  content?: string;
+  /** 引用的原文片段(章节想法常带, 用作"挂在哪段话上") */
+  markText?: string;
+  chapterUid?: number;
+  chapterIdx?: number;
+  /** 秒级时间戳 */
+  createTime?: number;
+  likesCount?: number;
+  commentsCount?: number;
+  /** 1=想法 4=书评(社区习惯) */
+  type?: number;
+  /** EPUB CFI range, 只读不解析 */
+  range?: string;
+  [key: string]: unknown;
+}
+
+/**
+ * 章节级"热门划线"(/web/book/underlines 返回的单条)。
+ *
+ * touchFish 用的就是这个接口而不是 bestbookmarks: 它保证返回 range,
+ * 而且 count 字段直接告诉你"有多少人划过这段", 适合做 inline 渲染。
+ * 注意它和 bestbookmarks 是两个独立接口, 这里只关心做 inline 高亮需要的字段。
+ */
+export interface ChapterUnderline {
+  /** "start-end", 同 bestbookmarks 的 range 语义, 在章节 HTML 字符串上的偏移 */
+  range: string;
+  /** 多少人划过这段 */
+  count?: number;
+  /** 划线类型, 透传不解析 */
+  type?: number;
+  [key: string]: unknown;
+}
+
+/** 热门划线(/web/book/bestbookmarks 返回的单条) */
+export interface BestBookmark {
+  bookmarkId: string;
+  markText: string;
+  chapterUid?: number;
+  /** 多少人划过这段 */
+  totalCount?: number;
+  /**
+   * 划线在章节 HTML 字符串里的范围 "start-end"。
+   *
+   * 微信读书后端给的索引参考的是 EPUB 原始 HTML(含 <html>/<head>/<body>...)
+   * 的字符偏移, 直接 slice(start, end) 即可取到对应 HTML 片段。
+   * 用于在正文 inline 渲染时, 把热门划线包成 <span class="hot-underline">,
+   * 让用户在阅读时直接看到大家划过的句子。
+   */
+  range?: string;
+  [key: string]: unknown;
+}

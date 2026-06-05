@@ -79,29 +79,6 @@ export class AuthService {
     return true;
   }
 
-  /**
-   * 把外部(扫码/编程)取到的 cookie 直接保存为登录态。
-   * 跟 importCookie 走的是同一个底层 secret store。
-   */
-  public async setCookieString(raw: string, opts?: { silent?: boolean }): Promise<boolean> {
-    const trimmed = (raw ?? '').trim();
-    if (!trimmed) return false;
-    const jar = AuthService.parseCookieString(trimmed);
-    if (!jar['wr_vid'] && !jar['wr_skey']) {
-      if (!opts?.silent) {
-        vscode.window.showWarningMessage('微信读书：Cookie 不合法（缺少 wr_vid/wr_skey）');
-      }
-      return false;
-    }
-    await this.context.secrets.store(AuthService.SECRET_KEY, trimmed);
-    this.cachedCookie = trimmed;
-    this._onDidChangeLoginState.fire(true);
-    if (!opts?.silent) {
-      vscode.window.showInformationMessage('微信读书：登录成功');
-    }
-    return true;
-  }
-
   /** 退出登录：清除 Cookie 与缓存 */
   public async logout(): Promise<void> {
     await this.context.secrets.delete(AuthService.SECRET_KEY);

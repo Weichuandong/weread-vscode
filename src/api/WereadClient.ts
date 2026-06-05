@@ -5,10 +5,14 @@ import { getBookReaderUrl } from './wereadUrl';
 import { calcHash, sign, currentTime } from './wereadSign';
 import { chk, dH, dS, dT } from './wereadDecrypt';
 import {
+  BestBookmark,
   BookProgress,
   BookshelfData,
   BookshelfResponse,
   ChapterInfosResponse,
+  ChapterUnderline,
+  Review,
+  ReviewAuthor,
   WereadArchive,
   WereadBook,
   WereadChapter,
@@ -58,6 +62,18 @@ export class WereadClient {
   private static readonly BASE_URL = 'https://weread.qq.com';
 
   private http: AxiosInstance;
+
+  /**
+   * 图片 dataURL 缓存: url → Promise<dataURL|null>。
+   *
+   * 为什么用 Promise 而不是直接 string?
+   *   1) 多个并发请求同一张图(同章节里 srcset / 多次出现)只发一次 axios
+   *   2) 章节"二次渲染"(先无 underlines 兜底, underlines 到了再重渲)
+   *      不会重复下载 — 第二轮 rewriteImageSrcsToDataUrls 直接 hit 缓存
+   *
+   * 不上 LRU: 一本书的图片总数有限(几百张顶天), 切书也罕见到要清, 简单 Map 够用。
+   */
+  private imageDataUrlCache: Map<string, Promise<string | null>> = new Map();
 
   constructor(private readonly auth: AuthService) {
     this.http = this.buildHttpClient();
@@ -500,5 +516,362 @@ export class WereadClient {
       log(`  ${shard}: 异常 ${msg}`);
       return '';
     }
+  }
+
+  // ============================================================
+  // 社交内容(只读): 想法 / 划线 / 书评
+  // ============================================================
+
+  /**
+   * 拉取某一章的"想法"列表。
+   *
+   * 接口: GET /web/review/list?bookId=&chapterUid=&listType=11&count=20&maxIdx=0&synckey=0
+   * - listType=11 是社区逆向出来的"章节维度的想法/评论"
+   * - 返回结构里 reviews 是数组, 每项形如 { review: { ... }, ... }
+   * - 失败/未登录都返回空数组, 不抛错(社交内容属于增强体验, 不应阻断正文)
+   */
+  public async getChapterReviews(bookId: string, chapterUid: number | string): Promise<Review[]> {
+    if (!this.auth.isLoggedIn()) return [];
+    try {
+      const res = await this.http.get('/web/review/list', {
+        params: {
+          bookId,
+          chapterUid,
+          listType: 11,
+          maxIdx: 0,
+          count: 20,
+          synckey: 0,
+        },
+        headers: this.buildHeaders(),
+      });
+      if (res.status < 200 || res.status >= 300) return [];
+      return this.normalizeReviewList(res.data);
+    } catch (e) {
+      console.warn('[weread-vscode] getChapterReviews 失败', e);
+      return [];
+    }
+  }
+
+  /**
+   * 拉取一本书的"书评"列表(全书维度, 非章节维度)。
+   *
+   * 接口: GET /web/review/list?bookId=&listType=4&maxIdx=0&count=20
+   * - listType=4 是社区习惯的"全书书评"
+   */
+  public async getBookReviews(bookId: string, count = 20): Promise<Review[]> {
+    if (!this.auth.isLoggedIn()) return [];
+    try {
+      const res = await this.http.get('/web/review/list', {
+        params: {
+          bookId,
+          listType: 4,
+          maxIdx: 0,
+          count,
+          synckey: 0,
+        },
+        headers: this.buildHeaders(),
+      });
+      if (res.status < 200 || res.status >= 300) return [];
+      return this.normalizeReviewList(res.data);
+    } catch (e) {
+      console.warn('[weread-vscode] getBookReviews 失败', e);
+      return [];
+    }
+  }
+
+  /**
+   * 拉取一本书的"热门划线"。
+   *
+   * 接口: GET /web/book/bestbookmarks?bookId=  (可选 chapterUid 限定到某章)
+   * - 返回结构: { updated: [ { bookmarkId, markText, chapterUid, totalCount, ... } ] }
+   */
+  public async getBestBookmarks(
+    bookId: string,
+    chapterUid?: number | string,
+  ): Promise<BestBookmark[]> {
+    if (!this.auth.isLoggedIn()) return [];
+    try {
+      const params: Record<string, string | number> = { bookId };
+      if (chapterUid !== undefined && chapterUid !== '') {
+        params.chapterUid = chapterUid;
+      }
+      const res = await this.http.get('/web/book/bestbookmarks', {
+        params,
+        headers: this.buildHeaders(),
+      });
+      if (res.status < 200 || res.status >= 300) return [];
+      const data = (res.data ?? {}) as Record<string, unknown>;
+      const arr = Array.isArray(data.updated)
+        ? (data.updated as Array<Record<string, unknown>>)
+        : Array.isArray(data.items)
+        ? (data.items as Array<Record<string, unknown>>)
+        : [];
+      const out: BestBookmark[] = [];
+      for (const it of arr) {
+        if (!it) continue;
+        const markText = typeof it.markText === 'string' ? it.markText : '';
+        const bookmarkId =
+          typeof it.bookmarkId === 'string'
+            ? it.bookmarkId
+            : typeof it.bookMarkId === 'string'
+            ? (it.bookMarkId as string)
+            : '';
+        if (!markText) continue;
+        out.push({
+          bookmarkId: bookmarkId || `bm-${out.length}`,
+          markText,
+          chapterUid: typeof it.chapterUid === 'number' ? (it.chapterUid as number) : undefined,
+          totalCount: typeof it.totalCount === 'number' ? (it.totalCount as number) : undefined,
+          // range 是 EPUB 原始 HTML 中的字符偏移 "start-end",
+          // 给 MainViewProvider.injectHotUnderlinesIntoHtml 用来在正文 inline 渲染时
+          // 把热门划线包成 <span class="hot-underline">, 模仿 touchFish 体验。
+          range: typeof it.range === 'string' ? (it.range as string) : undefined,
+        });
+      }
+      return out;
+    } catch (e) {
+      console.warn('[weread-vscode] getBestBookmarks 失败', e);
+      return [];
+    }
+  }
+
+  /**
+   * 拉取章节级"热门划线"(touchFish 实测在用的接口)。
+   *
+   * 接口: GET /web/book/underlines?bookId=&chapterUid=
+   * - 返回结构: { underlines: [ { range, count, type, ... } ] }
+   * - 相比 bestbookmarks, 这里 range 字段是稳定返回的, 直接用来在章节 HTML 上
+   *   inline 渲染热门划线最稳。markText 这个接口不给, 因此 popover 里要展示
+   *   "划过的原文片段" 时, 由前端用 range 反 slice 出来即可。
+   */
+  public async getChapterUnderlines(
+    bookId: string,
+    chapterUid: number | string,
+  ): Promise<ChapterUnderline[]> {
+    if (!this.auth.isLoggedIn()) return [];
+    try {
+      const res = await this.http.get('/web/book/underlines', {
+        params: { bookId, chapterUid },
+        headers: this.buildHeaders(),
+      });
+      if (res.status < 200 || res.status >= 300) return [];
+      const data = (res.data ?? {}) as Record<string, unknown>;
+      const arr = Array.isArray(data.underlines)
+        ? (data.underlines as Array<Record<string, unknown>>)
+        : Array.isArray(data.updated)
+        ? (data.updated as Array<Record<string, unknown>>)
+        : [];
+      const out: ChapterUnderline[] = [];
+      for (const it of arr) {
+        if (!it) continue;
+        const range = typeof it.range === 'string' ? (it.range as string) : '';
+        if (!range || !/^\d+-\d+$/.test(range)) continue;
+        out.push({
+          range,
+          count: typeof it.count === 'number' ? (it.count as number) : undefined,
+          type: typeof it.type === 'number' ? (it.type as number) : undefined,
+        });
+      }
+      return out;
+    } catch (e) {
+      console.warn('[weread-vscode] getChapterUnderlines 失败', e);
+      return [];
+    }
+  }
+
+  /**
+   * 拉取章节内某 range 的"热门想法"(点击章节内划线时弹出 popover 用)。
+   *
+   * 接口: POST https://weread.qq.com/web/book/readReviews
+   * body:
+   *   {
+   *     bookId,
+   *     chapterUid,
+   *     reviews: [{ range, maxIdx: 0, count: 30, synckey: 0 }]
+   *   }
+   * 响应:
+   *   {
+   *     reviews: [
+   *       {
+   *         range: "457-485",
+   *         pageReviews: [ { review: {...}, likesCount?: number, ... }, ... ]
+   *       },
+   *       ...
+   *     ]
+   *   }
+   *
+   * 说明: 这个接口是**书内章节 + range 维度的热门评论**, 跟 `/web/review/list?listType=11`
+   * (全书 / 全平台维度) 不是一个东西。touchFish 同款做法 — 之前误用 listType=11 拉的多是
+   * 整书想法, 用 range 兜底常常 0 命中, 所以划线 popover 始终为空。
+   */
+  public async getReadReviewsByRange(
+    bookId: string,
+    chapterUid: number | string,
+    range: string,
+    count = 30,
+  ): Promise<Review[]> {
+    if (!this.auth.isLoggedIn()) return [];
+    try {
+      const res = await this.http.post(
+        '/web/book/readReviews',
+        {
+          bookId,
+          chapterUid: typeof chapterUid === 'string' ? Number(chapterUid) : chapterUid,
+          reviews: [{ range, maxIdx: 0, count, synckey: 0 }],
+        },
+        {
+          headers: this.buildHeaders({ 'Content-Type': 'application/json' }),
+        },
+      );
+      if (res.status < 200 || res.status >= 300) return [];
+      return this.normalizeReadReviewsResponse(res.data);
+    } catch (e) {
+      console.warn('[weread-vscode] getReadReviewsByRange 失败', e);
+      return [];
+    }
+  }
+
+  /**
+   * /web/book/readReviews 返回结构特殊: `reviews[].pageReviews[].review`,
+   * 跟 /web/review/list 的 `reviews[].review` 多套了一层 pageReviews。
+   * 这里把 pageReviews 展平回 normalizeReviewList 期望的形态再复用归一化逻辑。
+   *
+   * 同时 pageReviews 把 `likesCount` 提到了外层(原始 review 里没有), 这里回填,
+   * 以保证 popover 显示点赞数。
+   */
+  private normalizeReadReviewsResponse(raw: unknown): Review[] {
+    if (!raw || typeof raw !== 'object') return [];
+    const data = raw as Record<string, unknown>;
+    const groups = Array.isArray(data.reviews)
+      ? (data.reviews as Array<Record<string, unknown>>)
+      : [];
+    const flat: Array<Record<string, unknown>> = [];
+    for (const group of groups) {
+      if (!group) continue;
+      const pageReviews = Array.isArray(group.pageReviews)
+        ? (group.pageReviews as Array<Record<string, unknown>>)
+        : [];
+      const groupRange =
+        typeof group.range === 'string' ? (group.range as string) : undefined;
+      for (const pr of pageReviews) {
+        if (!pr) continue;
+        const r = (pr.review ?? pr) as Record<string, unknown>;
+        if (!r || typeof r !== 'object') continue;
+        // pageReviews 把 likesCount 抽到了外层, 给原始 review 补上, normalizeReviewList 才能拿到
+        if (typeof pr.likesCount === 'number' && typeof r.likesCount !== 'number') {
+          (r as Record<string, unknown>).likesCount = pr.likesCount;
+        }
+        // 若原始 review 没 range, 用 group 上的 range 兜底, 方便前端调试
+        if (groupRange && typeof r.range !== 'string') {
+          (r as Record<string, unknown>).range = groupRange;
+        }
+        flat.push(pr);
+      }
+    }
+    return this.normalizeReviewList({ reviews: flat });
+  }
+
+  /**
+   * 拉取一张图片并转成 data URL(给 webview 用)。
+   *
+   * 为什么需要这个? 微信读书章节 HTML 里很多 `<img src>` 是相对路径
+   * (EPUB 内部资源, 比如 `../Images/cover.jpg`) 或者带防盗链 referer 校验,
+   * webview 直接渲染会 404 / 黑白空白。这里走 axios(带 cookie+referer)
+   * 把图二进制拿回来, 再 base64 内嵌到 src。
+   *
+   * 失败返回 null, 调用方负责保留原 src(至少不破图)。
+   */
+  public async fetchImageAsDataUrl(imgUrl: string): Promise<string | null> {
+    if (!imgUrl) return null;
+    // 缓存命中: 直接复用上次的 Promise (无论成功/失败都不重试, 失败 retry 留给手动 reload)
+    const cached = this.imageDataUrlCache.get(imgUrl);
+    if (cached) return cached;
+    const task = (async (): Promise<string | null> => {
+      try {
+        const res = await this.http.get(imgUrl, {
+          responseType: 'arraybuffer',
+          headers: {
+            ...this.buildHeaders(),
+            // 防盗链: 必须带 weread referer, 否则 res.weread.qq.com 等 CDN 会 403
+            Referer: 'https://weread.qq.com/',
+          },
+          // 给图片单独放宽超时, 避免章节有大图时整页卡死
+          timeout: 8000,
+        });
+        if (res.status < 200 || res.status >= 300) return null;
+        const buf = Buffer.from(res.data as ArrayBuffer);
+        // 尝试从响应头读 mime, 兜底用 image/jpeg
+        const ct = (res.headers && (res.headers['content-type'] || res.headers['Content-Type'])) as
+          | string
+          | undefined;
+        const mime = (ct && ct.split(';')[0].trim()) || 'image/jpeg';
+        return `data:${mime};base64,${buf.toString('base64')}`;
+      } catch (e) {
+        // 仅 warn, 不抛: 单张图失败不应阻塞整章渲染
+        console.warn('[weread-vscode] fetchImageAsDataUrl 失败', imgUrl, (e as Error)?.message);
+        return null;
+      }
+    })();
+    this.imageDataUrlCache.set(imgUrl, task);
+    return task;
+  }
+
+  /**
+   * 把 `/web/review/list` 返回的杂乱结构, 归一化成统一的 `Review[]`。
+   *
+   * 接口实际形态: { reviews: [ { review: {...}, ... }, ... ] }
+   * - review 字段是真正的数据载荷
+   * - user 通常在 review.user 下, 偶尔出现在外层, 这里统一兜底
+   */
+  private normalizeReviewList(raw: unknown): Review[] {
+    if (!raw || typeof raw !== 'object') return [];
+    const data = raw as Record<string, unknown>;
+    const list = Array.isArray(data.reviews) ? (data.reviews as Array<Record<string, unknown>>) : [];
+    const out: Review[] = [];
+    for (const item of list) {
+      if (!item) continue;
+      const r = (item.review ?? item) as Record<string, unknown>;
+      if (!r || typeof r !== 'object') continue;
+      const reviewId =
+        typeof r.reviewId === 'string'
+          ? r.reviewId
+          : typeof r.reviewId === 'number'
+          ? String(r.reviewId)
+          : '';
+      if (!reviewId) continue;
+
+      const userRaw =
+        (r.user as Record<string, unknown> | undefined) ??
+        (item.user as Record<string, unknown> | undefined);
+      const author: ReviewAuthor = {
+        vid:
+          typeof userRaw?.vid === 'number' || typeof userRaw?.vid === 'string'
+            ? (userRaw?.vid as number | string)
+            : typeof userRaw?.userVid === 'number'
+            ? (userRaw?.userVid as number)
+            : undefined,
+        name: typeof userRaw?.name === 'string' ? (userRaw?.name as string) : undefined,
+        avatar: typeof userRaw?.avatar === 'string' ? (userRaw?.avatar as string) : undefined,
+      };
+
+      out.push({
+        reviewId,
+        author,
+        content: typeof r.content === 'string' ? (r.content as string) : undefined,
+        markText: typeof r.abstract === 'string'
+          ? (r.abstract as string)
+          : typeof r.markText === 'string'
+          ? (r.markText as string)
+          : undefined,
+        chapterUid: typeof r.chapterUid === 'number' ? (r.chapterUid as number) : undefined,
+        chapterIdx: typeof r.chapterIdx === 'number' ? (r.chapterIdx as number) : undefined,
+        createTime: typeof r.createTime === 'number' ? (r.createTime as number) : undefined,
+        likesCount: typeof r.likesCount === 'number' ? (r.likesCount as number) : undefined,
+        commentsCount: typeof r.commentsCount === 'number' ? (r.commentsCount as number) : undefined,
+        type: typeof r.type === 'number' ? (r.type as number) : undefined,
+        range: typeof r.range === 'string' ? (r.range as string) : undefined,
+      });
+    }
+    return out;
   }
 }
