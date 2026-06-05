@@ -4,6 +4,7 @@ import { WereadClient } from './api/WereadClient';
 import { MainViewProvider } from './views/MainViewProvider';
 import { WereadBook } from './types';
 import { getBookReaderUrl } from './api/wereadUrl';
+import { checkForUpdates } from './services/UpdateChecker';
 
 /**
  * 扩展入口。
@@ -115,6 +116,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   context.subscriptions.push({ dispose: () => auth.dispose() });
+
+  // 启动后异步检查 Open VSX 上是否有新版本 (本插件没发到微软 Marketplace,
+  // 原版 VSCode 无法自动升级, 用主动检查补这块体验)。
+  // 不 await, 失败/超时静默, 不阻塞 activate。
+  void checkForUpdates(context);
 }
 
 export function deactivate(): void {

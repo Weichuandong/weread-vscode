@@ -2,6 +2,13 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)，所有重要变更都会记录在这里。
 
+## [1.0.2] - 2026-06-05
+
+### Added
+- 🔔 **启动检查新版本** —— 本插件未发到微软 VS Code Marketplace（只发了 Open VSX），原版 VSCode 安装 vsix 后自身不会推升级。新增 [`src/services/UpdateChecker.ts`](src/services/UpdateChecker.ts) 在 `activate()` 末尾异步调一次 `https://open-vsx.org/api/weichuandong/weread-vscode/latest`，跟当前 `package.json` version 做 semver 比对，有新版弹通知三按钮「查看新版 / 不再提醒此版本 / 稍后再说」，点击「查看新版」直接打开 GitHub Releases 最新页下 vsix
+- ⚙️ **配置项 `weread.checkForUpdates`** —— 默认 `true`，不想被打扰可在设置里关掉
+- 网络失败 / 超时 / 接口异常一律静默，不阻塞启动
+
 ## [1.0.1] - 2026-06-05
 
 ### Docs

@@ -136,6 +136,11 @@
           "type": "string",
           "default": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
           "description": "请求使用的 User-Agent"
+        },
+        "weread.checkForUpdates": {
+          "type": "boolean",
+          "default": true,
+          "description": "启动时自动检查 Open VSX 上是否有新版本（本插件未发到微软 Marketplace，原版 VSCode 无法自动升级，此选项可手动关闭以避免提示）"
         }
       }
     }

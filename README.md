@@ -54,6 +54,7 @@
 - 🎨 完全使用 `--vscode-*` 主题变量，浅色 / 深色无缝切换
 - 🧰 顶栏内置「刷新书架」「导入 Cookie 登录」「退出登录」「清除在读缓存（卡死时用）」按钮
 - 🔬 命令面板 `微信读书: 诊断当前章节(导出 HTML/CSS)` 一键导出当前章节 HTML/CSS 到临时文件，方便排错
+- 🔔 **启动检查新版本** —— 本插件未发到微软 Marketplace，原版 VSCode 无法自动升级；启动时主动查 Open VSX 最新版本，有新版弹通知一键跳转下载（可在设置里关闭，详见下方配置）
 
 ---
 
@@ -113,6 +114,7 @@
 |--------|------|--------|------|
 | `weread.requestTimeout` | number | `15000` | HTTP 请求超时时间（毫秒） |
 | `weread.userAgent` | string | macOS Chrome 120 UA | 自定义请求 User-Agent |
+| `weread.checkForUpdates` | boolean | `true` | 启动时检查 Open VSX 是否有新版本，有则弹通知（关闭后不再提示） |
 
 ---
 
