@@ -64,6 +64,61 @@ export class WereadClient {
   private http: AxiosInstance;
 
   /**
+   * 最近一次成功(非异常)收到 response 的时间戳。
+   *
+   * 用途: 兜底体检 / 调试日志。注意 **不要** 拿这个字段做"是否需要续 cookie"的节流判断 —
+   * 业务请求并不下发 Set-Cookie 续 wr_skey (见 refreshCookieByHomepage 注释),
+   * 用它做节流会让续命心跳被业务请求 "假阳性" 地跳过, 翻几章就过期。
+   * 真正的续命节流应该用 lastHomepageRefreshAt。
+   */
+  public lastResponseAt = 0;
+
+  /**
+   * 最近一次 HEAD / 续命 **成功** (拿到 Set-Cookie) 的时间戳。
+   *
+   * 这才是定时/聚焦心跳应该看的字段。
+   *
+   * 设计动机: 之前的 tryRefreshCookie 用 lastResponseAt 做节流, 但用户连续翻章节时
+   * 业务响应一直刷新 lastResponseAt, 25min 定时永远 < 节流窗口, 一次都不会真正
+   * 触发 HEAD / — 表现就是用户日志里报的 "看了一章下一章就 -2012 登录超时"。
+   *
+   * 注意只在 **拿到 Set-Cookie** 时更新, 失败 / 没拿到 Set-Cookie 都不更新,
+   * 让下次心跳能立即重试 (HEAD / 本身代价很低)。
+   */
+  public lastHomepageRefreshAt = 0;
+
+  /**
+   * 最近一次"章节失败兜底体检"的时间戳, 用于节流。
+   *
+   * 背景: weread 的章节加密分片接口 (`/web/book/chapter/e_*`) 在 cookie 失效时
+   * **不返回 401**, 而是返回 200 + chk() 校验不过的乱码。response interceptor 里的
+   * isUnauthorized 识别不到, 用户看到的兜底提示是"可能是付费/试读/接口变更",
+   * 完全意识不到其实是登录失效, 必须手动去命令面板才能重登。
+   *
+   * 修复: 在 fetchChapterContent 解密失败时, 主动打一发 /web/user 做登录体检 —
+   * 若 /web/user 401/errcode, response interceptor 会自动 notifyExpired 弹通知,
+   * 让用户拿到准确反馈。
+   *
+   * 节流 30s 是为了避免用户连续翻多个章节都失败时一直戳 /web/user。
+   */
+  private lastHealthCheckAt = 0;
+
+  /**
+   * 标志: server 已经废弃了我们的 wr_rt — 续命彻底失败, 任何重试都是徒劳。
+   *
+   * 触发条件: /web/login/renewal 返回 errCode=-2013 (鉴权失败) 或 -12013 (授权过期)。
+   *
+   * 触发后的行为变化:
+   *   1) 后续 renewWebLogin 直接 return false, 不再打无效请求
+   *   2) fetchChapterContentOnce 收到 /web/book/info 的 -2012 时, 直接判定为"登录已失效",
+   *      不再走"体检通过 → 提示付费/试读"的误导路径
+   *   3) 心跳定时/聚焦续命直接跳过, 不再骚扰 server
+   *
+   * 重置时机: 用户成功导入新 cookie 后 (AuthService.importCookie 成功调用 markRenewalAlive)
+   */
+  private renewalDead = false;
+
+  /**
    * 图片 dataURL 缓存: url → Promise<dataURL|null>。
    *
    * 为什么用 Promise 而不是直接 string?
@@ -91,7 +146,7 @@ export class WereadClient {
       'userAgent',
       'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     );
-    return axios.create({
+    const instance = axios.create({
       baseURL: WereadClient.BASE_URL,
       timeout,
       headers: {
@@ -101,6 +156,51 @@ export class WereadClient {
       },
       validateStatus: (status) => status >= 200 && status < 500,
     });
+
+    // ---- Cookie 保活 interceptor ----
+    //
+    // 在裸 axios + 手动拼 Cookie 头的架构里, 浏览器自动处理的两件事必须我们自己做:
+    //
+    //   1) wr_skey 续签
+    //      微信读书 server 会在某些响应里下发 `Set-Cookie: wr_skey=xxx; ...` 续期,
+    //      浏览器会自动覆盖本地 cookie。我们这里把它合并回 SecretStorage,
+    //      下一次 buildHeaders() 就会带上新的 wr_skey,
+    //      理论上只要插件在跑、定期有请求, wr_skey 永远不会因自然到期而失效。
+    //
+    //   2) 失效感知
+    //      之前的代码 (isUnauthorized) 只是在某些方法里 throw,
+    //      抛上去也仅仅是个红字 errorMessage,用户得手动去点"导入 Cookie"。
+    //      在 interceptor 统一拦截后, 任何接口失效都会触发 notifyExpired()
+    //      弹一个带"重新导入"按钮的通知,降低断流成本。
+    //
+    // 注意: interceptor 返回的是 Promise, 但我们 *不 await* mergeAndPersistCookies / notifyExpired,
+    // 否则会拖慢业务响应 — 这两个副作用对调用方都是透明的,失败也只是少续一次,无需阻塞。
+    instance.interceptors.response.use(
+      (response) => {
+        this.lastResponseAt = Date.now();
+        const setCookie = response.headers?.['set-cookie'];
+        if (Array.isArray(setCookie) && setCookie.length > 0) {
+          void this.auth.mergeAndPersistCookies(setCookie);
+        }
+        if (this.isUnauthorized(response.status, response.data)) {
+          // 诊断日志: 同时打印 errcode 和 errCode (两种大小写),
+          // 之前只取 errcode 导致 "status=200 errcode=(none) 却被判失效" 的欺骗性日志,
+          // 真相是 server 用了 errCode (大写 C), 触发了判定但日志看起来一切正常。
+          const url = response.config?.url ?? '(unknown)';
+          const obj = response.data as Record<string, unknown> | null;
+          const errcode = obj?.errcode;
+          const errCode = obj?.errCode;
+          console.log(
+            `[weread-vscode] 检测到登录失效信号: url=${url} status=${response.status} errcode=${errcode ?? '(none)'} errCode=${errCode ?? '(none)'}`,
+          );
+          void this.auth.notifyExpired();
+        }
+        return response;
+      },
+      (error) => Promise.reject(error),
+    );
+
+    return instance;
   }
 
   private buildHeaders(extra?: Record<string, string>): Record<string, string> {
@@ -112,12 +212,29 @@ export class WereadClient {
   }
 
   private isUnauthorized(status: number, data: unknown): boolean {
+    // 强信号: HTTP 401/403 直接判失效, 这是 cookie 过期最可靠的标志
     if (status === 401 || status === 403) {
       return true;
     }
-    if (data && typeof data === 'object') {
-      const errcode = (data as Record<string, unknown>).errcode;
-      if (errcode === -2010 || errcode === -2012 || errcode === -2013) {
+    // 弱信号: 仅当 status 也异常 (>=400) 时, 才看 body 里的 errcode/errCode 黑名单。
+    //
+    // 修复历史 (2026-06): 之前不要求 status 异常就看 errcode, 结果 weread 的部分接口
+    // (实测 /web/book/info) 在 status=200 时会回带某个业务用途的 errCode 字段,
+    // 数值刚好落在我们的失效黑名单里, 导致每隔几分钟误弹"登录失效"通知,
+    // 但 wr_skey 续签 / 上报阅读进度 / 章节解密全程正常 — 妥妥的 false positive。
+    //
+    // 收紧到"HTTP 异常 + errcode 命中"的双重信号后, 误报应该消失;
+    // 真的失效场景 (server 返 4xx) 仍然能被准确捕获。
+    // 失效码黑名单参考 touchfish 反编译: -2010 / -2012 / -2013 / -12013。
+    if (status >= 400 && data && typeof data === 'object') {
+      const obj = data as Record<string, unknown>;
+      const code = obj.errcode ?? obj.errCode;
+      if (
+        code === -2010 ||
+        code === -2012 ||
+        code === -2013 ||
+        code === -12013
+      ) {
         return true;
       }
     }
@@ -140,6 +257,168 @@ export class WereadClient {
     if (!this.auth.isLoggedIn()) {
       throw new Error('未登录，请先导入 Cookie');
     }
+  }
+
+  /**
+   * 主动续 wr_skey 的官方接口: POST /web/login/renewal
+   *
+   * 这是微信读书 web 端**主动续 token 的官方接口** (touchFish 项目验证),
+   * 行为远比 HEAD / 可靠:
+   *
+   *   接口: POST https://weread.qq.com/web/login/renewal
+   *   body: { rq: encodeURIComponent(<原请求路径>) }
+   *   header: Cookie
+   *   响应:
+   *     成功: { succ: 1 } + Set-Cookie 头里下发新的 wr_skey / wr_vid / wr_rt
+   *     失败: { errCode: -2013, errMsg: "鉴权失败" } / { errCode: -12013, errMsg: "授权过期" }
+   *
+   * 历史教训:
+   *   - 之前我们用 HEAD / 续命, 表面看也能"偶尔"拿到 Set-Cookie, 但实测 weread server
+   *     对 HEAD / 是否下发新 wr_skey 没有保证 (取决于内部策略), 用户连续翻几章后
+   *     /web/book/info 仍会先死, 报 errCode=-2012, 体感就是"几分钟就失效"。
+   *   - /web/login/renewal 是 server 显式定义的续命入口, 只要 wr_rt (refresh token)
+   *     还有效就一定下发新 skey, 比 HEAD / 稳定一个数量级。
+   *
+   * Set-Cookie 的 merge 由 response interceptor 自动完成 (mergeAndPersistCookies),
+   * 这里只判断 succ === 1 即可。
+   *
+   * @param rq  原请求路径, 默认填首页, 一般无需关心
+   * @returns true 表示续命成功 (succ=1)
+   */
+  public async renewWebLogin(rq: string = 'https://weread.qq.com/'): Promise<boolean> {
+    if (!this.auth.isLoggedIn()) return false;
+    // 锁: renewal 已被 server 判定彻底失败 (-2013/-12013), 重试无意义
+    if (this.renewalDead) {
+      console.log('[weread-vscode] renewalDead=true, 跳过 renewal (用户需重新登录浏览器)');
+      return false;
+    }
+    // 前置体检: 没有 wr_rt (refresh token) 的话 renewal 是必败的, 直接告警让用户重导
+    const jar = this.auth.getCookieJar();
+    if (!jar['wr_rt']) {
+      console.warn(
+        '[weread-vscode] /web/login/renewal 前置检查失败 — 当前 cookie 缺少 wr_rt, ' +
+          'renewal 接口必然返回鉴权失败。请重新导入 Cookie, 务必从 Network → Request Headers → Cookie 复制完整字符串。',
+      );
+      // 主动弹通知, 否则用户只能看几分钟就 -2012 而不知道原因
+      this.renewalDead = true;
+      void this.auth.notifyRenewalDead('missing_wr_rt');
+      return false;
+    }
+    try {
+      const res = await this.http.post(
+        '/web/login/renewal',
+        { rq: encodeURIComponent(rq) },
+        {
+          headers: this.buildHeaders({
+            'Content-Type': 'application/json',
+            // weread server 对 renewal 接口校验 Origin/Referer 比较严, 显式补齐确保通过
+            Origin: 'https://weread.qq.com',
+            Referer: 'https://weread.qq.com/',
+          }),
+        },
+      );
+      const data = (res.data ?? {}) as Record<string, unknown>;
+      const succ = data.succ === 1 || data.succ === '1';
+      const setCookie = res.headers?.['set-cookie'];
+      const cookieCnt = Array.isArray(setCookie) ? setCookie.length : 0;
+      // 把每条 Set-Cookie 的 key 列出来, 便于排查 server 到底续了什么字段
+      const cookieKeys: string[] = Array.isArray(setCookie)
+        ? (setCookie as string[])
+            .map((h) => {
+              const semi = h.indexOf(';');
+              const pair = semi >= 0 ? h.slice(0, semi) : h;
+              const eq = pair.indexOf('=');
+              return eq > 0 ? pair.slice(0, eq).trim() : '?';
+            })
+            .filter(Boolean)
+        : [];
+      console.log(
+        `[weread-vscode] /web/login/renewal status=${res.status} succ=${succ} Set-Cookie=${cookieCnt} 条 [${cookieKeys.join(', ')}]` +
+          (!succ ? ` errCode=${data.errCode ?? '(none)'} errMsg=${data.errMsg ?? ''}` : ''),
+      );
+      if (succ) {
+        this.lastHomepageRefreshAt = Date.now();
+        return true;
+      }
+      // -2013 鉴权失败 / -12013 授权过期: refresh token 在 server 端已被废弃
+      // (可能用户在浏览器点了退出 / 异地登录被踢 / weread 主动清退), 此时 wr_rt
+      // 本身完好但 server 不认 — 重复调用 renewal 完全没用, 必须用户**重新登录浏览器**
+      // 再复制 cookie (而不是再复制一次同一份 cookie)。
+      if (data.errCode === -2013 || data.errCode === -12013) {
+        console.warn(
+          '[weread-vscode] renewal 鉴权失败 (errCode 命中续命彻底失败码), 锁定 renewalDead, 通知用户重新登录浏览器',
+        );
+        this.renewalDead = true;
+        void this.auth.notifyRenewalDead(
+          data.errCode === -12013 ? 'auth_expired' : 'auth_failed',
+        );
+      }
+      return false;
+    } catch (e) {
+      console.warn('[weread-vscode] /web/login/renewal 异常:', (e as Error)?.message);
+      return false;
+    }
+  }
+
+  /**
+   * 主动续 wr_skey 的统一入口 (含降级兜底)。
+   *
+   * 策略 (touchFish 反编译参考):
+   *   1. 先打官方续命接口 POST /web/login/renewal — 99% 的情况这里就续上了
+   *   2. renewal 失败再试 HEAD / 兜底 — **仅当不是鉴权失败时** 才走这一步
+   *
+   * 重要: renewalDead 锁定后不要再走 HEAD / 兜底 —
+   *   实测当 wr_rt 在 server 端已被废弃时, HEAD / 表面续到的"新 wr_skey" 实际上对
+   *   `/web/book/info` 这类校验严的接口完全无效 (体感: HEAD 续了 → /web/user 通过 →
+   *   /web/book/info 仍 -2012)。这种"假续命"反而让用户以为 cookie 没事, 继续翻章节
+   *   不断撞墙。锁定后直接返回 false, 让上层走"清退本地 cookie 提示重登"。
+   *
+   * 命名保留 `refreshCookieByHomepage` 是为了兼容外部调用方 (index.ts 心跳 /
+   * fetchChapterContent 重试外壳), 但实际不一定走 HEAD / 了。
+   */
+  public async refreshCookieByHomepage(): Promise<boolean> {
+    if (!this.auth.isLoggedIn()) return false;
+
+    // 优先: 官方续命接口
+    if (await this.renewWebLogin()) {
+      return true;
+    }
+
+    // renewal 已被 server 判定彻底失败时, HEAD / 即使返回 Set-Cookie 也是无效的"幽灵续命"
+    // 直接放弃, 让上层走重登提示链路
+    if (this.renewalDead) {
+      return false;
+    }
+
+    // 兜底: HEAD / — 仅在 renewal 网络异常时再赌一次
+    try {
+      const res = await this.http.head('/', { headers: this.buildHeaders() });
+      const setCookie = res.headers?.['set-cookie'];
+      const got = Array.isArray(setCookie) && setCookie.length > 0;
+      console.log(
+        `[weread-vscode] HEAD / (兜底) status=${res.status} Set-Cookie=${got ? (setCookie as string[]).length + ' 条' : '无'}`,
+      );
+      if (got) {
+        this.lastHomepageRefreshAt = Date.now();
+      }
+      return got;
+    } catch (e) {
+      console.warn('[weread-vscode] HEAD / (兜底) 异常:', (e as Error)?.message);
+      return false;
+    }
+  }
+
+  /** 用户成功导入新 cookie 后由外部调用, 重置 renewal 状态 */
+  public markRenewalAlive(): void {
+    if (this.renewalDead) {
+      console.log('[weread-vscode] renewalDead 已重置 — 新 cookie 已生效, 续命链路重新激活');
+    }
+    this.renewalDead = false;
+  }
+
+  /** 当前 renewal 是否处于"死锁"状态 (UI 层判断时用) */
+  public isRenewalDead(): boolean {
+    return this.renewalDead;
   }
 
   /** 获取当前用户信息（用作登录态验证） */
@@ -366,7 +645,81 @@ export class WereadClient {
   }
 
   /**
-   * 抓取章节内容。
+   * 抓取章节内容 (带"失败自动续 wr_skey 重试一次"的外壳)。
+   *
+   * 背景: weread 的 /web/book/info 在 wr_skey 弱化但未完全过期时会先于其它接口
+   * 返回 `status=200 + errCode=-2012 "登录超时"`, 同期 /web/book/read 和 /web/user
+   * 仍然 OK — 表现就是 "看了一章下一章就报登录超时, 而体检又说没事"。
+   *
+   * 这种 "部分接口失活" 通过 /web/login/renewal 续 wr_skey 立即能恢复 (touchFish 同款做法),
+   * 不需要让用户重新粘 cookie。
+   *
+   * 流程: 抓一次 → 失败 → renewal 续命 → 再抓一次 → 还失败才走兜底体检。
+   * 用户视角: 翻章节最多多花一次 renewal 的时间 (~200ms), 而非要求重新登录。
+   *
+   * 真正的章节抓取逻辑在 fetchChapterContentOnce, 这里只编排。
+   */
+  public async fetchChapterContent(
+    bookId: string,
+    chapterUid: number | string,
+  ): Promise<ChapterFetchResult> {
+    const first = await this.fetchChapterContentOnce(bookId, chapterUid);
+    if (this.chapterFetchSucceeded(first)) {
+      return first;
+    }
+
+    // renewalDead 状态: server 已经废弃会话, 再续也是徒劳, 而且体检通过会让用户以为
+    // "可能是付费/试读"——这是上一版本最坑的误导路径。直接打明确日志 + 触发重登通知。
+    if (this.renewalDead) {
+      console.warn(
+        '[weread-vscode] 章节抓取失败且 renewalDead=true — server 已废弃会话, 跳过重试/体检, 通知用户重新登录浏览器',
+      );
+      void this.auth.notifyRenewalDead('auth_failed');
+      first.diagnostics =
+        (first.diagnostics ? first.diagnostics + '\n' : '') +
+        '[登录已失效] server 端会话已被废弃, 必须在浏览器里重新登录 weread.qq.com 再导入新 Cookie。';
+      return first;
+    }
+
+    console.log(
+      '[weread-vscode] 章节抓取失败 → 主动续 wr_skey (/web/login/renewal) 后重试一次',
+    );
+    const refreshed = await this.refreshCookieByHomepage();
+    if (!refreshed) {
+      // 续命接口没拿到新 wr_skey 说明 wr_rt 也死了 (或服务器异常),
+      // 重试基本拿不到不同结果, 没必要再叠一次接口压力 → 直接走体检, 让用户重登
+      console.log('[weread-vscode] 续命未成功, 跳过重试, 启动体检');
+      void this.healthCheckAfterChapterFailure();
+      return first;
+    }
+
+    const second = await this.fetchChapterContentOnce(bookId, chapterUid);
+    // 拼接两轮 diagnostics 方便排障 (用户点"诊断当前章节"能看到)
+    const combinedDiag = (label: string) =>
+      [first.diagnostics, `[第二轮: 续 wr_skey 后${label}]`, second.diagnostics]
+        .filter(Boolean)
+        .join('\n');
+    if (this.chapterFetchSucceeded(second)) {
+      console.log('[weread-vscode] 续命重试成功 ✓');
+      second.diagnostics = combinedDiag('重试成功');
+      return second;
+    }
+    console.log('[weread-vscode] 续命重试仍失败 → 启动体检');
+    second.diagnostics = combinedDiag('重试仍失败');
+    void this.healthCheckAfterChapterFailure();
+    return second;
+  }
+
+  /** 章节抓取结果是否拿到了正文 (html 或 content 任一非空) */
+  private chapterFetchSucceeded(r: ChapterFetchResult): boolean {
+    return (
+      (typeof r.html === 'string' && r.html.length > 0) ||
+      (typeof r.content === 'string' && r.content.length > 0)
+    );
+  }
+
+  /**
+   * 抓取章节内容 — 单次实现, 不带重试。
    *
    * 真接口策略(参考 touchFish 项目):
    *   1. 先 GET /web/book/info?bookId=xxx 拿到 format(epub|pdf|txt)
@@ -375,8 +728,11 @@ export class WereadClient {
    *   3. 每个分片响应都先 chk() 做 MD5 校验, 再 dH/dS/dT 解密
    *
    * 失败时返回详细 diagnostics, UI 仍可展示「在浏览器中打开」兜底。
+   *
+   * 注意: 这一层不做 healthCheckAfterChapterFailure 调用, 体检由外层 fetchChapterContent
+   * 统一编排, 避免重试两次都体检导致节流命中却"假成功"的假象。
    */
-  public async fetchChapterContent(
+  private async fetchChapterContentOnce(
     bookId: string,
     chapterUid: number | string,
   ): Promise<ChapterFetchResult> {
@@ -410,10 +766,38 @@ export class WereadClient {
         result.diagnostics = diag.join('\n');
         return result;
       }
-      const info = infoRes.data as { format?: string };
+      const info = (infoRes.data ?? {}) as { format?: string; errCode?: number; errcode?: number };
+      // /web/book/info 在 wr_skey 弱化 / 会话被废弃时常见返回 status=200 + errCode=-2012 (登录超时),
+      // 这条不会被 isUnauthorized 命中 (我们要求 status>=400), 必须显式识别 — 否则只看到
+      // "未取到 format" 的兜底日志, 体检又通过, 用户会被引导到"可能是付费/试读"的死路。
+      const bizCode = info?.errCode ?? info?.errcode;
+      if (bizCode === -2012 || bizCode === -2010 || bizCode === -2013 || bizCode === -12013) {
+        log(
+          `/web/book/info status=${infoRes.status} errCode=${bizCode} — 业务层登录失效信号 (无 format)`,
+        );
+        // -2013/-12013 直接锁死并通知; -2012/-2010 交给外层续命重试链路
+        if (bizCode === -2013 || bizCode === -12013) {
+          this.renewalDead = true;
+          void this.auth.notifyRenewalDead(
+            bizCode === -12013 ? 'auth_expired' : 'auth_failed',
+          );
+        }
+        result.diagnostics = diag.join('\n');
+        return result;
+      }
       format = info?.format ?? '';
       result.format = format;
       log(`图书格式: ${format || '(空)'}`);
+      // 诊断日志: format 为空时把完整 body 打出来, 用来判断 server 到底返了什么
+      // (可能是 errcode、可能是某种"限制"提示、可能是真无 format 字段)
+      if (!format) {
+        try {
+          const bodyPreview = JSON.stringify(infoRes.data).slice(0, 800);
+          log(`/web/book/info status=${infoRes.status} body=${bodyPreview}`);
+        } catch {
+          log(`/web/book/info status=${infoRes.status} body=(无法序列化)`);
+        }
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       log(`获取图书信息异常: ${msg}`);
@@ -423,6 +807,7 @@ export class WereadClient {
 
     if (!format) {
       log('未取到 format, 无法决定走 e_* 还是 t_* 接口');
+      // 体检 / 续命重试由外层 fetchChapterContent 编排, 这里只返回失败结果
       result.diagnostics = diag.join('\n');
       return result;
     }
@@ -464,8 +849,50 @@ export class WereadClient {
       log(`分片请求异常: ${msg}`);
     }
 
+    // 体检 / 续命重试由外层 fetchChapterContent 统一编排
     result.diagnostics = diag.join('\n');
     return result;
+  }
+
+  /**
+   * 章节抓取失败后的"登录态体检"。
+   *
+   * 节流 30s: 用户连续翻多个失败章节时不会一直戳 /web/user。
+   *
+   * 不抛错: 体检本身的失败只用来触发 interceptor 的 notifyExpired,
+   * 不影响调用方的章节失败兜底逻辑。
+   */
+  private async healthCheckAfterChapterFailure(): Promise<void> {
+    // renewalDead: server 已废弃会话, 体检纯属浪费请求 (而且 /web/user 校验最宽松,
+    // 还可能"通过"给用户进一步制造"cookie 没事"的假象 → 必须跳过)
+    if (this.renewalDead) {
+      console.log(
+        '[weread-vscode] 跳过体检 (renewalDead=true) — server 端会话已废弃, 重登提示已发送',
+      );
+      return;
+    }
+    const now = Date.now();
+    if (now - this.lastHealthCheckAt < 30_000) {
+      return;
+    }
+    this.lastHealthCheckAt = now;
+    console.log('[weread-vscode] 章节抓取失败 → 启动登录态体检 /web/user');
+    try {
+      await this.getCurrentUser();
+      // 严谨化文案: 之前"大概率是付费/试读"被用户报告"严重误导" (实测当 wr_rt 在 server
+      // 端被废弃时, /web/user 校验最松, 即便会话已废仍可能通过, 用户依此判断会延误重登)。
+      // 现在的兜底文案明确把"登录失效"列为同等可能性, 让用户自己看 /web/book/info 的报错码。
+      console.log(
+        '[weread-vscode] 登录态体检通过 — 但 /web/book/info 失败可能仍是登录问题 ' +
+          '(server 校验 /web/user 最松), 若反复失败请执行 weread.diagnoseCookie 确认',
+      );
+    } catch (e) {
+      // notifyExpired 已在 response interceptor 里触发, 这里只记日志便于排障
+      console.log(
+        '[weread-vscode] 登录态体检失败 — cookie 大概率已失效, 通知应已弹出:',
+        (e as Error)?.message,
+      );
+    }
   }
 
   /**

@@ -11,6 +11,19 @@ import {
   WereadChapter,
 } from '../types';
 import { getBookReaderUrl, getChapterReaderUrl } from '../api/wereadUrl';
+import {
+  DEFAULT_READING_PREFS,
+  FONT_FAMILY_STEPS,
+  FONT_SIZE_STEPS,
+  LINE_HEIGHT_STEPS,
+  PAGE_WIDTH_STEPS,
+  PARAGRAPH_SPACING_STEPS,
+  ReadingPrefs,
+  loadReadingPrefs,
+  mergeReadingPrefs,
+  renderReadingPrefsCssBlock,
+  saveReadingPrefs,
+} from './readingPrefs';
 
 type Tab = 'shelf' | 'reader';
 /** "想法"抽屉里 3 个 tab */
@@ -134,6 +147,9 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
    */
   private reviewsToken = 0;
 
+  /** 用户阅读偏好(字号/行距/段距/页边/字体), 见 readingPrefs.ts。constructor 里 load。 */
+  private readingPrefs: ReadingPrefs = DEFAULT_READING_PREFS;
+
   constructor(
     private readonly context: vscode.ExtensionContext,
     private readonly client: WereadClient,
@@ -154,6 +170,9 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     if (savedTab === 'shelf' || savedTab === 'reader') {
       this.tab = savedTab;
     }
+
+    // 加载阅读偏好 (字号/行距/...). 无效字段会被 loadReadingPrefs 回落到默认值。
+    this.readingPrefs = loadReadingPrefs(context);
 
     // 登录态变化时让书架重拉
     auth.onDidChangeLoginState(() => {
@@ -839,6 +858,25 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
         })();
         break;
       }
+      case 'updateReadingPref': {
+        // popover 已经在前端 setProperty 即时生效, 这里只负责持久化, 不需要 render.
+        // mergeReadingPrefs 内部对非法 key/value 做白名单校验, 保证 globalState 永远存合法值.
+        const p = msg.payload as { key?: string; value?: unknown } | undefined;
+        if (!p || !p.key) break;
+        const patch = { [p.key]: p.value } as Partial<ReadingPrefs>;
+        const next = mergeReadingPrefs(this.readingPrefs, patch);
+        if (next === this.readingPrefs) break;
+        this.readingPrefs = next;
+        void saveReadingPrefs(this.context, next);
+        break;
+      }
+      case 'resetReadingPrefs': {
+        // 恢复默认: 写回 DEFAULT + 重 render 让前端 popover 的 .active/数值显示也跟着刷新
+        this.readingPrefs = { ...DEFAULT_READING_PREFS };
+        void saveReadingPrefs(this.context, this.readingPrefs);
+        this.render();
+        break;
+      }
       default:
         break;
     }
@@ -860,12 +898,18 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       ? this.buildLoginCardHtml()
       : `${this.buildTabBarHtml()}${this.buildContentHtml()}`;
 
+    // :root 上注入用户阅读偏好对应的 CSS 变量。
+    // 放在主 <style> 之后, 让 .reading { font-size: var(--rd-font-size, 15px) } 能拿到值,
+    // 同时变量更新走 popover.setProperty(:root), 优先级 > 选择器默认 fallback。
+    const prefsBlock = renderReadingPrefsCssBlock(this.readingPrefs);
+
     return /* html */ `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8" />
 ${csp}
 <style>${this.buildCss()}</style>
+${prefsBlock}
 </head>
 <body>
   ${body}
@@ -1204,11 +1248,17 @@ ${csp}
           ${reviewsBadge}
         </button>`;
 
+    // Aa 阅读设置触发器: 跟 toc/reviews 共用 footer-mini 风格, 点击弹 settings popover
+    const settingsFooterBtn = `<button class="toc-trigger footer-mini" id="settings-trigger" title="阅读设置 (字号/行距/段距/页边/字体)">
+          <span class="ft-icon">Aa</span>
+        </button>`;
+
     const footer = `
       <footer class="reader-footer">
         <button class="ghost" data-act="prev" ${prevDisabled ? 'disabled' : ''}>◀ 上一章</button>
         <div class="footer-mid-group">
           ${tocFooterBtn}
+          ${settingsFooterBtn}
           ${reviewsFooterBtn}
         </div>
         <button class="ghost" data-act="next" ${nextDisabled ? 'disabled' : ''}>下一章 ▶</button>
@@ -1234,7 +1284,105 @@ ${csp}
     // 都复用这一个 fixed 浮层, 内容动态写入。点击容器外 / Esc 关闭。
     const inlinePopover = `<div class="weread-popover" id="weread-popover" hidden></div>`;
 
-    return `<main class="content reader"><div class="reader-body">${articleHtml}</div>${footer}${tocDrawer}${reviewsDrawer}${inlinePopover}${reviewsDataScript}</main>`;
+    // 阅读设置 popover (Aa). HTML 静态预渲染含全部档位 chips,
+    // popover 显示时只需根据 readingPrefs 计算 .active class; 切换样式由前端 JS 完成.
+    const settingsPopover = this.buildSettingsPopoverHtml();
+
+    // 注入档位元数据 + 字体 stack 映射给前端 JS, 让 stepper 知道下一档值,
+    // 也让 fontFamily 切换时能拿到完整 CSS font-family stack 立即 setProperty.
+    // 单独 <script type=application/json> 是为了避免在 buildScript 模板字符串里拼复杂结构.
+    const prefsMeta = {
+      fontSizes: FONT_SIZE_STEPS,
+      fontFamilies: FONT_FAMILY_STEPS.map((s) => ({ key: s.key, stack: s.stack })),
+      current: this.readingPrefs,
+    };
+    const prefsMetaJson = JSON.stringify(prefsMeta).replace(/</g, '\\u003c');
+    const prefsMetaScript = `<script id="weread-reading-prefs-meta" type="application/json">${prefsMetaJson}</script>`;
+
+    return `<main class="content reader"><div class="reader-body">${articleHtml}</div>${footer}${tocDrawer}${reviewsDrawer}${inlinePopover}${settingsPopover}${reviewsDataScript}${prefsMetaScript}</main>`;
+  }
+
+  /**
+   * 阅读设置 popover 静态 HTML.
+   *
+   * 设计:
+   *   - 一段一行 (.sp-row), 左侧 label 38px, 右侧 chips 右对齐, 视觉对齐微信读书 App Aa 面板
+   *   - chip 用 [data-pref-key][data-pref-value] 标记, JS 用统一 click 委托处理 → 减少绑定开销
+   *   - 字号用 -/数值/+ 步进器代替 7 个 chips, 视觉更紧凑, 也符合读书 App 习惯
+   *   - .active 在 buildScript 启动时根据当前 readingPrefs 计算并打上; 之后调档时前端 JS 切换,
+   *     不需要重 render webview
+   *
+   * 注意: 这里渲染的是 popover 的"骨架 + 全部档位选项", currentXxx 仅用于打 .active 类标记,
+   * 实际 CSS 变量值由 buildHtml 头部注入的 <style id="rd-vars"> 提供.
+   */
+  private buildSettingsPopoverHtml(): string {
+    const p = this.readingPrefs;
+
+    // 字号 stepper: 当前值在 FONT_SIZE_STEPS 里的下标
+    const sizeIdx = FONT_SIZE_STEPS.indexOf(p.fontSize);
+    const sizeMin = sizeIdx <= 0;
+    const sizeMax = sizeIdx >= FONT_SIZE_STEPS.length - 1;
+
+    const sizeRow = `
+      <div class="sp-row">
+        <span class="sp-label">字号</span>
+        <div class="sp-chips" style="flex: 0 0 auto;">
+          <div class="sp-stepper">
+            <button id="sp-size-minus" ${sizeMin ? 'disabled' : ''} title="减小字号">−</button>
+            <span class="sp-val" id="sp-size-val">${p.fontSize}</span>
+            <button id="sp-size-plus" ${sizeMax ? 'disabled' : ''} title="增大字号">+</button>
+          </div>
+        </div>
+      </div>`;
+
+    const renderChips = (
+      key: keyof ReadingPrefs,
+      options: { label: string; value: string | number }[],
+      currentValue: string | number,
+    ): string =>
+      options
+        .map((opt) => {
+          const active = opt.value === currentValue ? ' active' : '';
+          // value 序列化成字符串放到 data 属性, JS 侧根据 key 反序列化(数字 vs 字符串)
+          return `<button class="sp-chip${active}" data-pref-key="${key}" data-pref-value="${escapeAttr(String(opt.value))}">${escapeHtml(opt.label)}</button>`;
+        })
+        .join('');
+
+    const lineRow = `
+      <div class="sp-row">
+        <span class="sp-label">行距</span>
+        <div class="sp-chips">${renderChips('lineHeight', LINE_HEIGHT_STEPS, p.lineHeight)}</div>
+      </div>`;
+    const paraRow = `
+      <div class="sp-row">
+        <span class="sp-label">段距</span>
+        <div class="sp-chips">${renderChips('paragraphSpacing', PARAGRAPH_SPACING_STEPS, p.paragraphSpacing)}</div>
+      </div>`;
+    const widthRow = `
+      <div class="sp-row">
+        <span class="sp-label">页边</span>
+        <div class="sp-chips">${renderChips('pageWidth', PAGE_WIDTH_STEPS, p.pageWidth)}</div>
+      </div>`;
+    const fontRow = `
+      <div class="sp-row">
+        <span class="sp-label">字体</span>
+        <div class="sp-chips">${renderChips(
+          'fontFamily',
+          FONT_FAMILY_STEPS.map((s) => ({ label: s.label, value: s.key })),
+          p.fontFamily,
+        )}</div>
+      </div>`;
+
+    return `<div class="settings-popover" id="settings-popover" hidden>
+      ${sizeRow}
+      ${lineRow}
+      ${paraRow}
+      ${widthRow}
+      ${fontRow}
+      <div class="sp-footer">
+        <button class="sp-reset" id="sp-reset" title="恢复默认排版">恢复默认</button>
+      </div>
+    </div>`;
   }
 
   /**
@@ -1757,18 +1905,22 @@ ${csp}
        *     再 inline 渲染, EPUB CSS 完全失效, 不会污染
        *   - 用户切 vscode 主题, 阅读区背景/文字/链接颜色全部自动跟随
        */
+      /* 阅读卡片样式: 全部尺寸/字体由 :root --rd-* CSS 变量驱动,
+       * 默认值在 var() 第二参数兜底, popover 实时调档走
+       * documentElement.style.setProperty('--rd-font-size', '17px') 即可全图刷新, 无需重 render webview. */
       .reading {
-        max-width: 720px;
+        max-width: var(--rd-page-width, 720px);
         margin: 6px auto 14px;
         padding: 18px 24px 28px;
         background: var(--vscode-editor-background);
         color: var(--vscode-editor-foreground, var(--vscode-foreground));
         border-radius: 6px;
         border: 1px solid var(--vscode-panel-border, transparent);
-        font-family: -apple-system, "PingFang SC", "Microsoft YaHei",
+        font-family: var(--rd-font-family, -apple-system, "PingFang SC", "Microsoft YaHei",
           "Hiragino Sans GB", "Songti SC", "STSong", "Source Han Serif SC",
-          "Noto Serif SC", Georgia, serif;
-        font-size: 15px; line-height: 1.85;
+          "Noto Serif SC", Georgia, serif);
+        font-size: var(--rd-font-size, 15px);
+        line-height: var(--rd-line-height, 1.85);
       }
       .reading .ch-title {
         margin: 0 0 22px; font-size: 18px; font-weight: 600;
@@ -1778,7 +1930,7 @@ ${csp}
         color: var(--vscode-foreground);
         border-bottom: 1px solid var(--vscode-panel-border);
       }
-      .reading p { margin: 0 0 0.95em; text-indent: 2em; }
+      .reading p { margin: 0 0 var(--rd-paragraph-spacing, 0.95em); text-indent: 2em; }
       .reading p:first-of-type::first-letter { font-size: 1.05em; }
       .reading img { max-width: 100%; height: auto; display: block; margin: 14px auto; border-radius: 4px; }
 
@@ -1805,7 +1957,7 @@ ${csp}
         max-width: 100% !important;
       }
       .reading.rich .rich-body p {
-        margin: 0 0 0.95em; text-indent: 2em;
+        margin: 0 0 var(--rd-paragraph-spacing, 0.95em); text-indent: 2em;
         text-align: justify;
       }
       .reading.rich .rich-body h1,
@@ -2312,6 +2464,113 @@ ${csp}
         word-break: break-word;
         white-space: pre-wrap;
       }
+
+      /* ====== 阅读设置 popover (Aa) ======
+       * 触发: 阅读 footer 中间的 Aa 按钮; 显示位置: fixed, 在按钮**上方**(footer 是底部, 不能向下弹).
+       * 设计风格跟微信读书 App "Aa" 面板对齐: 一段一行, label + chips/数值.
+       * 任何 chip 点击都通过 [data-pref-key][data-pref-value] 透传到 JS, 同一份代码路径处理. */
+      .settings-popover {
+        position: fixed;
+        z-index: 120;
+        width: min(320px, calc(100vw - 24px));
+        padding: 12px 14px 10px;
+        background: var(--vscode-editorHoverWidget-background, var(--vscode-editor-background));
+        color: var(--vscode-editorHoverWidget-foreground, var(--vscode-foreground));
+        border: 1px solid var(--vscode-editorHoverWidget-border, var(--vscode-panel-border));
+        border-radius: 8px;
+        box-shadow: 0 8px 28px rgba(0, 0, 0, .42);
+        font-size: 12.5px;
+      }
+      .settings-popover[hidden] { display: none; }
+      .settings-popover .sp-row {
+        display: flex; align-items: center;
+        gap: 10px;
+        margin: 0 0 9px;
+      }
+      .settings-popover .sp-row:last-of-type { margin-bottom: 4px; }
+      .settings-popover .sp-label {
+        flex-shrink: 0;
+        width: 38px;
+        font-size: 11.5px;
+        color: var(--vscode-descriptionForeground);
+        letter-spacing: .04em;
+      }
+      .settings-popover .sp-chips {
+        flex: 1; min-width: 0;
+        display: flex; flex-wrap: wrap; gap: 4px;
+        justify-content: flex-end;
+      }
+      .settings-popover .sp-chip {
+        display: inline-flex; align-items: center; justify-content: center;
+        min-width: 28px; height: 24px; padding: 0 9px;
+        background: transparent;
+        color: var(--vscode-foreground);
+        border: 1px solid var(--vscode-panel-border);
+        border-radius: 4px;
+        font-size: 11.5px;
+        cursor: pointer;
+        transition: all .12s ease;
+        font-variant-numeric: tabular-nums;
+      }
+      .settings-popover .sp-chip:hover:not(.active) {
+        background: var(--vscode-list-hoverBackground);
+        border-color: var(--vscode-focusBorder, var(--vscode-panel-border));
+      }
+      .settings-popover .sp-chip.active {
+        background: var(--vscode-list-activeSelectionBackground, var(--vscode-button-background));
+        color: var(--vscode-list-activeSelectionForeground, var(--vscode-button-foreground));
+        border-color: var(--vscode-focusBorder, transparent);
+        font-weight: 600;
+      }
+      /* 字号: 大量数字档位用 -/数值/+ 的紧凑步进 UI 比 7 个 chips 整齐 */
+      .settings-popover .sp-stepper {
+        display: inline-flex; align-items: center; gap: 0;
+        border: 1px solid var(--vscode-panel-border);
+        border-radius: 4px;
+        overflow: hidden;
+      }
+      .settings-popover .sp-stepper button {
+        width: 26px; height: 24px;
+        background: transparent;
+        color: var(--vscode-foreground);
+        border: none;
+        font-size: 14px;
+        cursor: pointer;
+        transition: background .12s ease;
+        padding: 0;
+      }
+      .settings-popover .sp-stepper button:hover:not([disabled]) {
+        background: var(--vscode-list-hoverBackground);
+      }
+      .settings-popover .sp-stepper button[disabled] {
+        opacity: .35; cursor: not-allowed;
+      }
+      .settings-popover .sp-stepper .sp-val {
+        min-width: 38px; height: 24px;
+        display: inline-flex; align-items: center; justify-content: center;
+        font-size: 11.5px; font-variant-numeric: tabular-nums; font-weight: 600;
+        border-left: 1px solid var(--vscode-panel-border);
+        border-right: 1px solid var(--vscode-panel-border);
+        background: var(--vscode-editor-background);
+      }
+      .settings-popover .sp-footer {
+        display: flex; justify-content: flex-end; gap: 6px;
+        margin-top: 10px; padding-top: 8px;
+        border-top: 1px solid var(--vscode-panel-border);
+      }
+      .settings-popover .sp-reset {
+        background: transparent;
+        color: var(--vscode-descriptionForeground);
+        border: none;
+        padding: 3px 8px;
+        font-size: 11px;
+        border-radius: 4px;
+        cursor: pointer;
+      }
+      .settings-popover .sp-reset:hover {
+        background: var(--vscode-list-hoverBackground);
+        color: var(--vscode-foreground);
+      }
     `;
   }
 
@@ -2698,6 +2957,179 @@ ${csp}
           post('switchTab', { tab: el.getAttribute('data-tab') });
         });
       });
+
+      // ===== 阅读设置 popover (Aa) =====
+      //
+      // 关键设计:
+      //   1) 即时反馈: 所有改动都 *先* documentElement.style.setProperty 给本地视觉立即生效,
+      //      *再* post 到 extension 持久化, 无需等回包 / 不需要 webview reload。
+      //   2) 反序列化档位: chip 的 data-pref-value 是字符串, 根据 key 决定是 Number 还是
+      //      原样字符串 ("full" / FontFamilyKey)。
+      //   3) 字号 stepper: 维护当前 fontSize 在 FONT_SIZE_STEPS 里的 index, +/− 移动 index,
+      //      边界禁用按钮; 不允许越界。
+      //   4) 定位: popover 在按钮上方弹出 (footer 在底部, 下方不够), 水平右对齐避免溢出。
+      //   5) 抽屉互斥: toc / reviews / settings 三者打开任一必关闭另外两个 (用户体感更清爽)。
+      (function setupSettings() {
+        const trigger = document.getElementById('settings-trigger');
+        const popover = document.getElementById('settings-popover');
+        if (!trigger || !popover) return;
+
+        // ---- 读取后端注入的元数据 (档位数组 + family stack 映射 + 当前值) ----
+        let meta = { fontSizes: [12,13,14,15,16,18,20,22], fontFamilies: [], current: {} };
+        try {
+          const node = document.getElementById('weread-reading-prefs-meta');
+          if (node && node.textContent) meta = JSON.parse(node.textContent) || meta;
+        } catch (e) { /* 用默认 fallback */ }
+        const familyMap = {};
+        (meta.fontFamilies || []).forEach(function(f) { familyMap[f.key] = f.stack; });
+        // 当前值: 字号 / 字体族 是 stepper 和 family 切换需要的状态
+        let curFontSize = Number(meta.current.fontSize) || 15;
+        let curFontFamily = String(meta.current.fontFamily || 'serif');
+
+        // ---- 位置: 锚到 settings-trigger 按钮**上方** ----
+        function positionPopover() {
+          const rect = trigger.getBoundingClientRect();
+          popover.hidden = false;
+          popover.style.visibility = 'hidden';
+          popover.style.left = '0px';
+          popover.style.top = '0px';
+          const pw = popover.offsetWidth;
+          const ph = popover.offsetHeight;
+          const vw = window.innerWidth;
+          const vh = window.innerHeight;
+          // 默认: 按钮上方 6px gap
+          let top = rect.top - ph - 6;
+          if (top < 8) {
+            // 真的没空间(极矮窗口) → 退回到按钮下方
+            top = Math.min(vh - ph - 8, rect.bottom + 6);
+          }
+          // 水平: 让 popover 中心对齐按钮中心, 但两侧防溢出
+          let left = rect.left + rect.width / 2 - pw / 2;
+          if (left + pw > vw - 8) left = Math.max(8, vw - pw - 8);
+          if (left < 8) left = 8;
+          popover.style.top = top + 'px';
+          popover.style.left = left + 'px';
+          popover.style.visibility = '';
+        }
+
+        function openPopover() {
+          // 跟 toc/reviews 抽屉互斥, 关掉它们
+          closeOtherDrawer('none');
+          positionPopover();
+        }
+        function closePopover() {
+          popover.hidden = true;
+        }
+        function toggle() { popover.hidden ? openPopover() : closePopover(); }
+        trigger.addEventListener('click', function(e) {
+          e.preventDefault();
+          e.stopPropagation();
+          toggle();
+        });
+        // ESC / 点击外部关闭
+        document.addEventListener('keydown', function(e) {
+          if (e.key === 'Escape' && !popover.hidden) closePopover();
+        });
+        document.addEventListener('click', function(e) {
+          if (popover.hidden) return;
+          if (popover.contains(e.target)) return;
+          if (trigger.contains(e.target)) return;
+          closePopover();
+        });
+        // 窗口尺寸/正文滚动时, popover 浮层就重新定位(滚动不关, 用户改 chip 时可能正在浏览预览效果)
+        window.addEventListener('resize', function() { if (!popover.hidden) positionPopover(); });
+
+        // ---- 实际应用 prefs 到 CSS 变量 (本地即时) ----
+        function applyPrefLocally(key, value) {
+          const root = document.documentElement;
+          switch (key) {
+            case 'fontSize':
+              root.style.setProperty('--rd-font-size', value + 'px');
+              break;
+            case 'lineHeight':
+              root.style.setProperty('--rd-line-height', String(value));
+              break;
+            case 'paragraphSpacing':
+              root.style.setProperty('--rd-paragraph-spacing', value + 'em');
+              break;
+            case 'pageWidth':
+              root.style.setProperty('--rd-page-width', value === 'full' ? '100%' : value + 'px');
+              break;
+            case 'fontFamily':
+              root.style.setProperty('--rd-font-family', familyMap[value] || 'serif');
+              break;
+          }
+        }
+
+        // ---- chip 点击 (lineHeight / paragraphSpacing / pageWidth / fontFamily) ----
+        popover.addEventListener('click', function(e) {
+          const chip = e.target && e.target.closest && e.target.closest('.sp-chip');
+          if (chip) {
+            e.preventDefault();
+            const key = chip.getAttribute('data-pref-key');
+            const raw = chip.getAttribute('data-pref-value');
+            if (!key || raw == null) return;
+
+            // 反序列化: 数字 vs 字符串档位
+            let value;
+            if (key === 'lineHeight' || key === 'paragraphSpacing') {
+              value = Number(raw);
+              if (!isFinite(value)) return;
+            } else if (key === 'pageWidth') {
+              value = (raw === 'full') ? 'full' : Number(raw);
+              if (value !== 'full' && !isFinite(value)) return;
+            } else if (key === 'fontFamily') {
+              value = raw;
+              curFontFamily = raw;
+            } else {
+              return;
+            }
+
+            // 切 chip .active class (同 key 的其他 chip 取消激活)
+            const row = chip.parentElement;
+            if (row) {
+              row.querySelectorAll('.sp-chip[data-pref-key="' + key + '"]')
+                .forEach(function(c) { c.classList.remove('active'); });
+              chip.classList.add('active');
+            }
+            applyPrefLocally(key, value);
+            post('updateReadingPref', { key: key, value: value });
+            return;
+          }
+
+          // 字号 stepper +/−
+          const stepBtn = e.target && e.target.closest && e.target.closest('#sp-size-minus, #sp-size-plus');
+          if (stepBtn) {
+            e.preventDefault();
+            const sizes = meta.fontSizes;
+            const idx = sizes.indexOf(curFontSize);
+            const direction = stepBtn.id === 'sp-size-plus' ? 1 : -1;
+            const nextIdx = idx < 0 ? sizes.indexOf(15) : (idx + direction);
+            if (nextIdx < 0 || nextIdx >= sizes.length) return;
+            curFontSize = sizes[nextIdx];
+            // 更新数值与按钮 disabled
+            const valEl = document.getElementById('sp-size-val');
+            const minusEl = document.getElementById('sp-size-minus');
+            const plusEl = document.getElementById('sp-size-plus');
+            if (valEl) valEl.textContent = String(curFontSize);
+            if (minusEl) { if (nextIdx <= 0) minusEl.setAttribute('disabled', ''); else minusEl.removeAttribute('disabled'); }
+            if (plusEl)  { if (nextIdx >= sizes.length - 1) plusEl.setAttribute('disabled', ''); else plusEl.removeAttribute('disabled'); }
+            applyPrefLocally('fontSize', curFontSize);
+            post('updateReadingPref', { key: 'fontSize', value: curFontSize });
+            return;
+          }
+
+          // 重置默认
+          const resetBtn = e.target && e.target.closest && e.target.closest('#sp-reset');
+          if (resetBtn) {
+            e.preventDefault();
+            post('resetReadingPrefs');
+            // 让 extension 回包后 render 整页刷新拿默认值 (popover 自身的 .active / 数值显示也会刷)
+            closePopover();
+            return;
+          }
+        });
+      })();
     `;
   }
 }

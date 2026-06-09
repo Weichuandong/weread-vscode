@@ -1,8 +1,8 @@
 {
   "name": "weread-vscode",
-  "displayName": "WeRead for VSCode",
-  "description": "在 VSCode 侧边栏阅读微信读书 — 书架/章节/正文/云端进度同步，通过粘贴 Cookie 登录",
-  "version": "1.0.2",
+  "displayName": "TouchPlus for VSCode",
+  "description": "VSCode 摸鱼套件 — 微信读书 / 知乎推荐流，统一侧边栏，通过粘贴 Cookie 登录",
+  "version": "1.0.3",
   "publisher": "weichuandong",
   "license": "MIT",
   "author": {
@@ -27,12 +27,15 @@
   "keywords": [
     "weread",
     "微信读书",
+    "zhihu",
+    "知乎",
     "reading",
     "ebook",
     "book",
     "novel",
     "摸鱼",
-    "epub"
+    "epub",
+    "feed"
   ],
   "galleryBanner": {
     "color": "#2a2a2a",
@@ -48,8 +51,13 @@
       "activitybar": [
         {
           "id": "wereadVscode",
-          "title": "微信读书",
+          "title": "Folio",
           "icon": "resources/weread.svg"
+        },
+        {
+          "id": "zhihuVscode",
+          "title": "Curio",
+          "icon": "resources/zhihu.svg"
         }
       ]
     },
@@ -58,46 +66,80 @@
         {
           "type": "webview",
           "id": "wereadVscode.main",
-          "name": "微信读书",
+          "name": "folio",
           "icon": "resources/weread.svg",
-          "contextualTitle": "微信读书"
+          "contextualTitle": "Folio"
+        }
+      ],
+      "zhihuVscode": [
+        {
+          "type": "webview",
+          "id": "zhihuTouch.main",
+          "name": "curio",
+          "icon": "resources/zhihu.svg",
+          "contextualTitle": "Curio"
         }
       ]
     },
     "commands": [
       {
         "command": "weread.importCookie",
-        "title": "微信读书: 导入 Cookie 登录",
+        "title": "Folio: 导入 Cookie 登录",
         "icon": "$(sign-in)"
       },
       {
         "command": "weread.logout",
-        "title": "微信读书: 退出登录",
+        "title": "Folio: 退出登录",
         "icon": "$(sign-out)"
       },
       {
         "command": "weread.refreshBookshelf",
-        "title": "微信读书: 刷新书架",
+        "title": "Folio: 刷新书架",
         "icon": "$(refresh)"
       },
       {
         "command": "weread.openBook",
-        "title": "微信读书: 打开书籍"
+        "title": "Folio: 打开书籍"
       },
       {
         "command": "weread.openInBrowser",
-        "title": "微信读书: 在浏览器中打开",
+        "title": "Folio: 在浏览器中打开",
         "icon": "$(link-external)"
       },
       {
         "command": "weread.resetReadingState",
-        "title": "微信读书: 清除在读缓存(卡死时使用)",
+        "title": "Folio: 清除在读缓存(卡死时使用)",
         "icon": "$(clear-all)"
       },
       {
         "command": "weread.diagnoseChapter",
-        "title": "微信读书: 诊断当前章节(导出 HTML/CSS)",
+        "title": "Folio: 诊断当前章节(导出 HTML/CSS)",
         "icon": "$(beaker)"
+      },
+      {
+        "command": "weread.diagnoseCookie",
+        "title": "Folio: 诊断 Cookie 续命健康度",
+        "icon": "$(pulse)"
+      },
+      {
+        "command": "zhihu.importCookie",
+        "title": "Curio: 导入 Cookie 登录",
+        "icon": "$(sign-in)"
+      },
+      {
+        "command": "zhihu.logout",
+        "title": "Curio: 退出登录",
+        "icon": "$(sign-out)"
+      },
+      {
+        "command": "zhihu.refreshRecommend",
+        "title": "Curio: 刷新推荐流",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "zhihu.openInBrowser",
+        "title": "Curio: 在浏览器中打开",
+        "icon": "$(link-external)"
       }
     ],
     "menus": {
@@ -121,29 +163,78 @@
           "command": "weread.resetReadingState",
           "when": "view == wereadVscode.main",
           "group": "9_recovery@1"
+        },
+        {
+          "command": "zhihu.refreshRecommend",
+          "when": "view == zhihuTouch.main",
+          "group": "navigation@1"
+        },
+        {
+          "command": "zhihu.importCookie",
+          "when": "view == zhihuTouch.main",
+          "group": "1_actions@3"
+        },
+        {
+          "command": "zhihu.logout",
+          "when": "view == zhihuTouch.main",
+          "group": "1_actions@4"
         }
       ]
     },
-    "configuration": {
-      "title": "微信读书",
-      "properties": {
-        "weread.requestTimeout": {
-          "type": "number",
-          "default": 15000,
-          "description": "HTTP 请求超时时间（毫秒）"
-        },
-        "weread.userAgent": {
-          "type": "string",
-          "default": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-          "description": "请求使用的 User-Agent"
-        },
-        "weread.checkForUpdates": {
-          "type": "boolean",
-          "default": true,
-          "description": "启动时自动检查 Open VSX 上是否有新版本（本插件未发到微软 Marketplace，原版 VSCode 无法自动升级，此选项可手动关闭以避免提示）"
+    "configuration": [
+      {
+        "title": "Folio",
+        "properties": {
+          "weread.requestTimeout": {
+            "type": "number",
+            "default": 15000,
+            "description": "HTTP 请求超时时间（毫秒）"
+          },
+          "weread.userAgent": {
+            "type": "string",
+            "default": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "description": "请求使用的 User-Agent"
+          },
+          "weread.checkForUpdates": {
+            "type": "boolean",
+            "default": true,
+            "description": "启动时自动检查 Open VSX 上是否有新版本（本插件未发到微软 Marketplace，原版 VSCode 无法自动升级，此选项可手动关闭以避免提示）"
+          }
+        }
+      },
+      {
+        "title": "Curio",
+        "properties": {
+          "zhihu.requestTimeout": {
+            "type": "number",
+            "default": 15000,
+            "description": "知乎 HTTP 请求超时时间（毫秒）"
+          },
+          "zhihu.userAgent": {
+            "type": "string",
+            "default": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "description": "知乎请求使用的 User-Agent"
+          },
+          "zhihu.pageSize": {
+            "type": "number",
+            "default": 6,
+            "description": "推荐流每页拉取条数（知乎默认 6，调大可能被风控）"
+          },
+          "zhihu.reportRead": {
+            "type": "boolean",
+            "default": true,
+            "description": "是否向知乎上报\"已读\"行为（开启后服务端会去重，关闭则可能频繁刷到重复内容）"
+          },
+          "zhihu.readChunkSize": {
+            "type": "number",
+            "default": 400,
+            "minimum": 50,
+            "maximum": 5000,
+            "description": "点击卡片展开正文时，每次显示的字符数（避免长回答一次性灌满屏幕，看完再点\"继续阅读\"加载下一段）"
+          }
         }
       }
-    }
+    ]
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
@@ -153,7 +244,7 @@
     "package": "vsce package",
     "release": "bash scripts/release.sh"
   },
-  "dependencies": {
+  "dependencies": { 
     "axios": "^1.6.7"
   },
   "devDependencies": {
