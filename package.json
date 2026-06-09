@@ -2,7 +2,7 @@
   "name": "weread-vscode",
   "displayName": "TouchPlus for VSCode",
   "description": "VSCode 摸鱼套件 — 微信读书 / 知乎推荐流，统一侧边栏，通过粘贴 Cookie 登录",
-  "version": "1.0.3",
+  "version": "2.0.0",
   "publisher": "weichuandong",
   "license": "MIT",
   "author": {
@@ -303,7 +303,7 @@
     "package": "vsce package",
     "release": "bash scripts/release.sh"
   },
-  "dependencies": { 
+  "dependencies": {
     "axios": "^1.6.7"
   },
   "devDependencies": {
