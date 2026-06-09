@@ -19,13 +19,26 @@ import type {
  *   2. 没上报 feedback/read → 即使有 session_token, 服务端也不知道你看过什么
  *   3. 前端追加列表时没去重 → 即使前两个 fix 都不做, 至少能避免同一会话内同 id 多次入列
  *
- * 我们三层都做了:
+ * 但只做这三层还是会被用户反馈 "怎么还看到看过的内容":
+ *   服务端 session_token 在 vscode 重启 / 网络抖动 / 凌晨服务端 session 清理时都会失效,
+ *   一旦回到匿名会话, 之前 reportRead 的状态服务端也未必长期记着 (尤其是热门内容,
+ *   服务端会重复打捞), 内存 Set seenFeedIds 在重启后清空, 于是又能看到一遍.
  *
- *   - this.sessionToken / this.pageNumber / this.endOffset 维护会话状态,
- *     每次请求带上, 服务端能识别这是同一个连续会话
- *   - reportRead() 把"刚返回给前端展示"的 item 用 feedback/read 接口告诉服务端,
- *     下次推荐流会避开这些条目 (除非 config 关闭 zhihu.reportRead)
- *   - this.seenFeedIds 一个 Set 在内存里去重, 哪怕服务端发了重复也不会入列
+ * 所以加了第 4 层 — 跨重启的持久化去重 (this.seenTargetKeys):
+ *   key 形如 "回答:12345678" / "文章:87654321" (用 kind + targetId 而不是 feedId,
+ *   因为 feedId 在不同时段同一条内容可能不同, targetId 才是内容稳定主键),
+ *   存到 globalState 'zhihu.seenTargetKeys', LRU 上限 5000 条, 写满删最早的.
+ *   resetSession() **不**清空这层 — 用户点刷新只想换会话, 不想重看; 想重头来过提供
+ *   命令 'zhihu.clearReadHistory'.
+ *
+ * 四层各自的失效场景互补:
+ *
+ *   | 层            | 作用范围      | 失效场景                                   |
+ *   | ---           | ---           | ---                                        |
+ *   | session_token | 跨请求(同会话)| 重启 / 服务端清理 / 切登录态                |
+ *   | reportRead    | 服务端记忆    | 服务端窗口未知, 热门内容会被重复打捞        |
+ *   | seenFeedIds   | 进程内存      | 进程重启即丢                                |
+ *   | seenTargetKeys| 持久化(跨重启)| LRU 满, 5000 条之前的会被淘汰 (设计上接受)  |
  *
  * 关于知乎的反爬:
  *   /api/v3/feed/topstory/recommend 这个 web 接口对登录用户 (有 z_c0 cookie) 比较宽松,
@@ -54,7 +67,7 @@ export class ZhihuClient {
   private endOffset = 0;
 
   /**
-   * 已经见过的 feed id, 用于本地二次去重。
+   * 已经见过的 feed id, 用于本地二次去重 (会话内)。
    *
    * 为什么用 Set 而不是直接信 paging.is_end?
    * — 即使带了 session_token, 知乎服务端偶尔也会下发重复 id (尤其是热门内容),
@@ -65,13 +78,57 @@ export class ZhihuClient {
    */
   private readonly seenFeedIds = new Set<string>();
 
+  /**
+   * 已经看过的"内容主键" — 跨重启持久化的去重集合。
+   *
+   * key 形态: `${kind}:${targetId}` (例: "回答:12345678", "文章:87654321").
+   * 用 kind 做命名空间, 避免不同类型 id 撞 (理论上不会, 但便宜).
+   *
+   * 数据源: globalState 'zhihu.seenTargetKeys', 启动时一次性 load.
+   * 写回: fetchRecommend 拿到新通过去重的 cards 后立刻 flush 一次 (LRU 内裁剪).
+   *
+   * 大小约束: 最多保留 MAX_SEEN_TARGET_KEYS 条, 超过删最早的 (FIFO).
+   * 5000 条 * 平均 20 字节 = ~100KB JSON, globalState 完全扛得住.
+   *
+   * 跟 seenFeedIds 的区别:
+   *   - seenFeedIds 用 feed id, 同一条内容不同时段拉取 feed id 可能不同, 跨重启意义有限
+   *   - seenTargetKeys 用 targetId, 内容稳定主键, 跨重启依旧能识别 "看过"
+   *   - 所以 resetSession() 会清前者但保留后者
+   */
+  private seenTargetKeys = new Set<string>();
+
+  /** 持久化去重的容量上限. 5000 条够正常摸鱼几个月不见重 */
+  private static readonly MAX_SEEN_TARGET_KEYS = 5000;
+
+  /** globalState 中保存的 key */
+  private static readonly SEEN_TARGET_KEYS_STORAGE = 'zhihu.seenTargetKeys';
+
   /** 上次"用过期通知去骚扰用户"的时刻, 防止网络抖动导致弹一堆 */
   private lastExpiredNotifyAt = 0;
 
-  constructor(private readonly auth: ZhihuAuthService) {
+  constructor(
+    private readonly auth: ZhihuAuthService,
+    private readonly context: vscode.ExtensionContext,
+  ) {
     const timeout = vscode.workspace
       .getConfiguration('zhihu')
       .get<number>('requestTimeout', 15000);
+
+    // 启动时从 globalState 加载持久化的 "已看过 targetKey" 集合.
+    // 这里做了一层防御性校验 — 用户/旧版本可能写过非数组结构进来.
+    const persisted = this.context.globalState.get<unknown>(
+      ZhihuClient.SEEN_TARGET_KEYS_STORAGE,
+    );
+    if (Array.isArray(persisted)) {
+      for (const v of persisted) {
+        if (typeof v === 'string' && v) {
+          this.seenTargetKeys.add(v);
+        }
+      }
+    }
+    console.log(
+      `[zhihu] 加载持久化已读集合 ${this.seenTargetKeys.size} 条 (上限 ${ZhihuClient.MAX_SEEN_TARGET_KEYS})`,
+    );
 
     this.axios = axios.create({
       baseURL: 'https://www.zhihu.com',
@@ -153,7 +210,7 @@ export class ZhihuClient {
     // 1. 服务端会话状态推进
     this.applyPagingState(resp, items.length);
 
-    // 2. 前端去重: 同 id 一律丢弃
+    // 2. 会话内去重: 用 feed id 拦同会话重复
     const fresh: ZhihuFeedItem[] = [];
     for (const item of items) {
       const fid = this.feedIdOf(item);
@@ -169,18 +226,49 @@ export class ZhihuClient {
       fresh.push(item);
     }
 
-    // 3. 归一化成 card
-    const cards = fresh
-      .map((it) => this.toCard(it))
-      .filter((c): c is ZhihuCardForView => c !== null);
+    // 3. 归一化成 card (不识别的 type 在这里被过滤为 null)
+    const candidateCards: Array<{ raw: ZhihuFeedItem; card: ZhihuCardForView }> = [];
+    for (const it of fresh) {
+      const card = this.toCard(it);
+      if (card) {
+        candidateCards.push({ raw: it, card });
+      }
+    }
+
+    // 4. 跨重启持久化去重: 用 "kind:targetId" 作为内容稳定主键, 拦截"看过的旧内容".
+    //    会话内重启 / 服务端会话失效 / 热门内容被反复打捞, 都靠这层兜底.
+    //    rawItems 也同步过滤 — 已经看过的不必再 reportRead (服务端早就收到过).
+    const cards: ZhihuCardForView[] = [];
+    const rawItems: ZhihuFeedItem[] = [];
+    let dedupedByPersisted = 0;
+    for (const { raw, card } of candidateCards) {
+      const persistKey = this.persistKeyOfCard(card);
+      if (persistKey && this.seenTargetKeys.has(persistKey)) {
+        dedupedByPersisted++;
+        continue;
+      }
+      if (persistKey) {
+        this.seenTargetKeys.add(persistKey);
+      }
+      cards.push(card);
+      rawItems.push(raw);
+    }
+
+    // 5. 异步落盘 (本批确实有新 key 加入才写, 避免反复 update 空白)
+    if (cards.length > 0) {
+      void this.flushSeenTargetKeys();
+    }
 
     console.log(
-      `[zhihu] recommend page=${this.pageNumber - 1} 服务端 ${items.length} 条 -> 去重后 ${fresh.length} 条 -> 可渲染 ${cards.length} 条; session=${this.sessionToken ? this.sessionToken.slice(0, 8) + '...' : '(none)'}`,
+      `[zhihu] recommend page=${this.pageNumber - 1} 服务端 ${items.length} 条` +
+        ` -> 会话去重 ${fresh.length} 条 -> 持久化去重 ${candidateCards.length - dedupedByPersisted} 条` +
+        ` -> 可渲染 ${cards.length} 条 (持久化集合现有 ${this.seenTargetKeys.size} 条);` +
+        ` session=${this.sessionToken ? this.sessionToken.slice(0, 8) + '...' : '(none)'}`,
     );
 
     return {
       cards,
-      rawItems: fresh,
+      rawItems,
       isEnd: Boolean(resp.paging?.is_end),
     };
   }
@@ -250,16 +338,66 @@ export class ZhihuClient {
     }
   }
 
-  /** 用户主动刷新 / 切回视图时调用, 清掉会话状态从头开始 */
+  /**
+   * 用户主动刷新 / 切回视图时调用, 清掉**会话**状态从头开始。
+   *
+   * 注意: 这里**不**清空 seenTargetKeys (跨重启持久化集合).
+   * 用户点"刷新"想要的是"换一批新内容看", 而不是"重新看一遍看过的".
+   * 想真正重置已读历史用 clearSeenHistory() (绑命令 zhihu.clearReadHistory).
+   */
   public resetSession(): void {
     this.sessionToken = undefined;
     this.pageNumber = 1;
     this.endOffset = 0;
     this.seenFeedIds.clear();
-    console.log('[zhihu] session 已重置');
+    console.log('[zhihu] session 已重置 (保留持久化已读集合)');
+  }
+
+  /**
+   * 清空跨重启的已读集合 — 一切重新开始.
+   * 内存与 globalState 同步清掉, 失败由调用方感知.
+   */
+  public async clearSeenHistory(): Promise<void> {
+    const before = this.seenTargetKeys.size;
+    this.seenTargetKeys.clear();
+    await this.context.globalState.update(
+      ZhihuClient.SEEN_TARGET_KEYS_STORAGE,
+      [],
+    );
+    console.log(`[zhihu] 已清空持久化已读集合 (${before} 条 -> 0 条)`);
   }
 
   // ---------- 内部 ----------
+
+  /**
+   * 给一张 card 算出持久化去重 key (kind:targetId).
+   * 没有 targetId 的卡片返回空串 — 几乎不会发生 (toCard 已要求 target.id 存在),
+   * 但兜底防御一下, 不要让 "想法" 之类标题为空的卡片永久占位.
+   */
+  private persistKeyOfCard(card: ZhihuCardForView): string {
+    if (!card.targetId) return '';
+    return `${card.kind}:${card.targetId}`;
+  }
+
+  /**
+   * 把当前 seenTargetKeys 持久化到 globalState.
+   * 超过上限时按 FIFO 删最早的 (Set 自身保留插入顺序, 直接 slice 即可).
+   *
+   * 不需要 await — 调用方都是 fire-and-forget; 即便偶尔丢一次写入,
+   * 下次 fetchRecommend 触发时还会再写一次, 数据收敛.
+   */
+  private flushSeenTargetKeys(): Thenable<void> {
+    if (this.seenTargetKeys.size > ZhihuClient.MAX_SEEN_TARGET_KEYS) {
+      const arr = [...this.seenTargetKeys];
+      // Set 保留插入顺序, 最早的在头部 -> 保留尾部 MAX_SEEN_TARGET_KEYS 条
+      const kept = arr.slice(arr.length - ZhihuClient.MAX_SEEN_TARGET_KEYS);
+      this.seenTargetKeys = new Set(kept);
+    }
+    return this.context.globalState.update(
+      ZhihuClient.SEEN_TARGET_KEYS_STORAGE,
+      [...this.seenTargetKeys],
+    );
+  }
 
   /**
    * 从响应推进会话状态。
@@ -442,14 +580,14 @@ export class ZhihuClient {
           `/api/v4/answers/${encodeURIComponent(targetId)}`,
           { params: { include: 'content' } },
         );
-        return stripHtmlPreserveBreaks(r.data?.content ?? '') || '(此回答暂无正文)';
+        return stripHtmlPreserveBreaks(r.data?.content ?? '', true) || '(此回答暂无正文)';
       }
       if (kind === '文章') {
         const r = await this.axios.get<{ content?: string }>(
           `/api/v4/articles/${encodeURIComponent(targetId)}`,
           { params: { include: 'content' } },
         );
-        return stripHtmlPreserveBreaks(r.data?.content ?? '') || '(此文章暂无正文)';
+        return stripHtmlPreserveBreaks(r.data?.content ?? '', true) || '(此文章暂无正文)';
       }
       if (kind === '想法') {
         const r = await this.axios.get<{
@@ -464,12 +602,12 @@ export class ZhihuClient {
         for (const b of blocks) {
           if (!b || !b.type) continue;
           if (b.type === 'text') {
-            const t = stripHtmlPreserveBreaks(b.content ?? '');
+            const t = stripHtmlPreserveBreaks(b.content ?? '', true);
             if (t) parts.push(t);
           } else if (b.type === 'image') {
-            // webview 当前不内嵌图片, 用 [图片] 占位提示读者此处原本有图;
-            // 与正文里 stripHtmlPreserveBreaks 对 <img> 的处理保持一致.
-            parts.push('[图片]');
+            // 想法的图片以结构化 block 返回, 转成与正文 <img> 一致的占位符,
+            // 由 webview 在展开正文时渲染成真正图片.
+            parts.push(imgPlaceholder(b.url ?? ''));
           } else if (b.type === 'video') {
             parts.push('[视频]');
           } else if (b.type === 'link') {
@@ -626,7 +764,11 @@ export class ZhihuClient {
           // status / 角色字段省略 — 默认全部评论
         },
       });
-      return this.normalizeCommentsResponse(r.data);
+      // 'root' 模式: 过滤掉接口在 data 数组里平铺塞进来的子评论 (V5 接口 /pins/{id}/comments
+      // 以及部分场景下 /root_comments 会把根评论 + 它的子评论一起平铺返回, 靠 raw 字段区分).
+      // 不过滤就会出现 "根评论下面紧跟着几条子评论一起平铺" 的视觉, 跟我们 UI 上"点查看 N
+      // 条回复才出现子评论" 的交互冲突.
+      return this.normalizeCommentsResponse(r.data, 'root');
     } catch (e) {
       this.handleError(e, `comments/${kind}`);
       throw e;
@@ -663,20 +805,34 @@ export class ZhihuClient {
           },
         },
       );
-      return this.normalizeCommentsResponse(r.data);
+      // 'child' 模式: 子评论接口的 data 里全都是子评论, 不能按 isChildComment 过滤
+      // (否则就把要拉的内容全过滤没了).
+      return this.normalizeCommentsResponse(r.data, 'child');
     } catch (e) {
       this.handleError(e, `child_comments/${rootCommentId}`);
       throw e;
     }
   }
 
-  /** 把 server 返回的 root_comments/child_comments 响应统一归一化成 ZhihuCommentsPage */
+  /**
+   * 把 server 返回的 root_comments/child_comments 响应统一归一化成 ZhihuCommentsPage.
+   *
+   * mode:
+   *   - 'root':  调用方在拉根评论. 此时 data 数组里可能混入子评论 (V5 接口 /pins/{id}/comments
+   *              + 部分回答接口会把根 + 子平铺返回), 需要靠 raw 上的 comment_type /
+   *              reply_root_comment_id / reply_comment_id 字段过滤掉子评论, 否则 UI 上根评论
+   *              下面会平铺出几条子评论, 跟 "点 N 条回复才展开" 的交互冲突.
+   *   - 'child': 调用方在拉某根评论下的子评论. data 里全都是子评论, 不能过滤.
+   */
   private normalizeCommentsResponse(
     data: ZhihuRootCommentsResponse | undefined,
+    mode: 'root' | 'child',
   ): ZhihuCommentsPage {
     const body = data ?? {};
     const items = Array.isArray(body.data) ? body.data : [];
-    const comments = items
+    const filtered =
+      mode === 'root' ? items.filter((c) => !isChildComment(c)) : items;
+    const comments = filtered
       .map((c) => this.toCommentView(c))
       .filter((c): c is ZhihuCommentForView => c !== null);
     const totals =
@@ -817,12 +973,26 @@ function stripHtml(html: string): string {
  * 这个函数则把 <p>/<br>/<li> 转成 \n, 让用户在 webview 里看到的还是分段文章,
  * 否则一坨没换行的长字符串读起来很痛苦。
  *
- * 图片暂不内嵌展示, 统一替换为 [图片] 占位 — 避免读者看到突兀的段落断裂.
+ * preserveImages=true 时, 把 <img> 转成 [IMG:url] 安全占位符, 交给 webview 展开正文时渲染;
+ * 默认仍显示 [图片] 文本, 避免评论等位置无意内嵌图片.
  */
-function stripHtmlPreserveBreaks(html: string): string {
+function stripHtmlPreserveBreaks(html: string, preserveImages = false): string {
   if (!html) return '';
-  return html
-    // 所有 <img> 统一替换为 [图片] 占位 (不区分 src/data-original)
+  let text = html;
+  if (preserveImages) {
+    text = text
+      // 优先取 data-original / data-actualsrc 这类高清图字段, 再退到 src.
+      .replace(
+        /<img\b[^>]*?\b(?:data-original|data-actualsrc)=["']([^"']+)["'][^>]*>/gi,
+        (_, src: string) => imgPlaceholder(src),
+      )
+      .replace(
+        /<img\b[^>]*?\bsrc=["']([^"']+)["'][^>]*>/gi,
+        (_, src: string) => imgPlaceholder(src),
+      );
+  }
+  return text
+    // preserveImages 未命中 src 或关闭图片保留时, 统一降级为 [图片].
     .replace(/<img\b[^>]*>/gi, '[图片]')
     .replace(/<br\s*\/?>/gi, '\n')
     .replace(/<\/(p|div|section|article|h[1-6]|blockquote|pre|tr)>/gi, '\n\n')
@@ -838,6 +1008,13 @@ function stripHtmlPreserveBreaks(html: string): string {
     .replace(/[ \t]+\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+}
+
+/** 生成 [IMG:url] 占位符。只接受 http(s), 避免把可疑协议透传给 webview。 */
+function imgPlaceholder(src: string): string {
+  const s = (src ?? '').trim();
+  if (!s || !/^https?:\/\//i.test(s)) return '[图片]';
+  return `[IMG:${s.replace(/\]/g, '%5D')}]`;
 }
 
 /**
@@ -875,6 +1052,32 @@ interface ZhihuRawComment {
   reply_to_author?: ZhihuRawAuthor;
   child_comments?: unknown[];
   child_comment_count?: number;
+  /** 子评论判别字段 — 不同接口/版本字段不一样, 这里全列上方便 isChildComment 一并兜底 */
+  comment_type?: string;
+  reply_root_comment_id?: string | number;
+  reply_comment_id?: string | number;
+}
+
+/**
+ * 判定一条 raw 是不是 "子评论 (回复)" — 用于在拉根评论列表时, 过滤掉接口平铺
+ * 塞进 data 数组的子评论 (V5 /pins/{id}/comments 等会这么干).
+ *
+ * 字段选择: 任意一条命中即视为子评论. 之所以列三个字段全部兜底:
+ *   - comment_type === 'reply':  V5 接口新格式, 直接区分根/回复
+ *   - reply_root_comment_id:     老接口形态, 子评论上指向根评论 id (根评论自己这个字段是 0 / 空)
+ *   - reply_comment_id:          某些场景下子评论指向 "被回复的那条评论" (可能是另一条子评论)
+ * 任意一个 "非 0/非空字符串" 即可判定; 根评论上这些字段要么是 undefined 要么是 0/空.
+ *
+ * 注意: 不能用 raw.reply_to_author 来判 — 根评论也可能因为某些数据回填带上这个字段
+ * (例如 "回复用户 X" 的提及), 误杀风险高.
+ */
+function isChildComment(raw: ZhihuRawComment): boolean {
+  if (raw.comment_type === 'reply') return true;
+  const root = raw.reply_root_comment_id;
+  if (root != null && String(root) !== '0' && String(root) !== '') return true;
+  const reply = raw.reply_comment_id;
+  if (reply != null && String(reply) !== '0' && String(reply) !== '') return true;
+  return false;
 }
 
 interface ZhihuRootCommentsResponse {

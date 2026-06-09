@@ -12,7 +12,7 @@ import type { ZhihuCardForView, ZhihuFeedItem } from '../types';
  *      视频类型只显示元信息提示 (实际播放需在外部进行)。
  *   2. 「就地看评论」: 任何卡片展开后都能点 "查看评论 (N)", 在正文下方再就地展开评论列表,
  *      每页 20 条, 滚到底/手动点继续加载, 完全不离开 VSCode (摸鱼必备)。
- *   3. 不重复: 三层去重 (服务端 session_token / feedback/read 上报 / 前端 Set), 详见 ZhihuClient
+ *   3. 不重复: 四层去重 (session_token / feedback/read 上报 / 会话内 Set / 持久化 targetKey), 详见 ZhihuClient
  *   4. 摸鱼友好: 整个视图不出现任何"在浏览器打开"按钮 — 一旦带浏览器跳转,
  *      工位上扫到的同事一眼就发现是知乎; 保持"VSCode 文档列表"的伪装感。
  *
@@ -120,10 +120,13 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   private async handleMessage(msg: { type?: string; [k: string]: unknown }): Promise<void> {
     switch (msg?.type) {
       case 'ready':
-        // webview 初次挂载后通知一次登录态 + 同步分段大小配置 (前端切片用) + 当前点赞过滤器
+        // webview 初次挂载后通知一次登录态 + 同步分段大小配置 (前端切片用)
+        //   + 当前点赞过滤器 + 当前图片显示开关 + 当前阅读字号缩放
         this.post({ type: 'loginState', loggedIn: this.auth.isLoggedIn() });
         this.post({ type: 'config', chunkSize: this.getChunkSize() });
         this.post({ type: 'filterState', filter: this.getFilter() });
+        this.post({ type: 'imagesState', enabled: this.getImagesEnabled() });
+        this.post({ type: 'readerFontScaleState', scale: this.getReaderFontScale() });
         if (this.auth.isLoggedIn()) {
           await this.fetchAndPush(true);
         }
@@ -137,6 +140,21 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
         const max =
           raw && typeof raw.max === 'number' && raw.max > 0 ? Math.floor(raw.max) : -1;
         await this.saveFilter({ min, max });
+        return;
+      }
+      case 'setImagesEnabled': {
+        // 用户在前端点了图片开关. 仅持久化, 不需要重拉数据 —
+        // 前端自己已经 syncImagesEnabledToDOM 把现有卡片切完了.
+        await this.saveImagesEnabled(msg.enabled === true);
+        return;
+      }
+      case 'setReaderFontScale': {
+        // 用户在前端点了 A- / A+ 改阅读字号. 仅持久化 — 前端写 CSS var 即时生效.
+        // clamp 在前端已经做过一遍, 这里再 clamp 一次防御 (postMessage 内容理论上
+        // 可被篡改, workspaceState 写入异常值后下次启动会出怪事).
+        const raw = msg.scale;
+        const scale = typeof raw === 'number' && Number.isFinite(raw) ? raw : 1;
+        await this.saveReaderFontScale(scale);
         return;
       }
       case 'loadMore':
@@ -320,6 +338,40 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
+   * 图片显示开关 — 存 workspaceState, 默认 false (摸鱼场景: 默认不发图床请求, 不出图).
+   * 跟过滤器一样选 workspaceState 而非 configuration:
+   *   - 不需要让用户在 settings.json 里改, 顶部按钮一键切;
+   *   - 不同 workspace 可以不同 (公司项目里默认关, 个人项目里随便).
+   */
+  private getImagesEnabled(): boolean {
+    return this.context.workspaceState.get<boolean>('zhihu.imagesEnabled') === true;
+  }
+
+  private async saveImagesEnabled(enabled: boolean): Promise<void> {
+    await this.context.workspaceState.update('zhihu.imagesEnabled', enabled);
+  }
+
+  /**
+   * 阅读字号缩放系数 — 同样选 workspaceState (而非 configuration), 理由同 imagesEnabled:
+   *   - 顶部 A- / A+ 按钮一键切, 不需要让用户去 settings.json 改;
+   *   - 不同 workspace 可以不同 (大屏外接 vs 笔记本字号偏好不一样).
+   *
+   * 默认 1.0. clamp 到 [0.7, 1.8] 跟前端约束保持一致 — 防御 workspaceState 被外部写入
+   * 异常值 (比如旧版本残留 / 手动改 storage) 导致下次启动正文字号怪异.
+   */
+  private getReaderFontScale(): number {
+    const raw = this.context.workspaceState.get<number>('zhihu.readerFontScale');
+    return clampReaderFontScale(raw);
+  }
+
+  private async saveReaderFontScale(scale: number): Promise<void> {
+    await this.context.workspaceState.update(
+      'zhihu.readerFontScale',
+      clampReaderFontScale(scale),
+    );
+  }
+
+  /**
    * 真正打到 ZhihuClient 的入口。
    * `replace = true` 表示是刷新, 前端会清空再 append; false 表示加载更多。
    */
@@ -398,6 +450,24 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
 <style>
   :root {
     color-scheme: light dark;
+    /* 卡片底色 — 关键: 必须是"看起来"不透明的, 否则 sticky 头部浮在内容上方时
+       下面的回答正文会从半透明背景里透出来, 字叠字非常脏.
+       vscode 的 --vscode-textCodeBlock-background 在多数主题下是半透明 rgba
+       (设计用来叠在 editor/sidebar 之上才出"代码块"层次感), 直接拿来当 sticky
+       背景会透字. 这里用 linear-gradient 把同色叠两次铺成实色覆盖, 再用
+       --vscode-sideBar-background 做底层兜底 — 即便上层 token 是半透明, 也会被
+       下层 sideBar 实色挡住, 视觉跟原来基本一致, 但 sticky 头部不再透字. */
+    --card-bg:
+      linear-gradient(
+        var(--vscode-textCodeBlock-background, rgba(128,128,128,0.06)),
+        var(--vscode-textCodeBlock-background, rgba(128,128,128,0.06))
+      ),
+      var(--vscode-sideBar-background);
+    /* 阅读字号缩放系数 — 只作用于 "正文 / 评论" 这种长文本阅读区域, 不动 chrome
+       (标题/按钮/作者/meta) 字号, 否则按钮一起变大会撑破布局.
+       由前端 A- / A+ 按钮调, 持久化到 workspaceState 'zhihu.readerFontScale'.
+       范围 0.7 ~ 1.8, 默认 1.0; JS 端 applyReaderFontScale 会 clamp 并写回这里. */
+    --reader-font-scale: 1;
   }
   body {
     margin: 0;
@@ -426,19 +496,39 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   .login-tip button:hover {
     background: var(--vscode-button-hoverBackground);
   }
+  /*
+    卡片化视觉 — 每张 .card-wrap 都做成独立的圆角小卡片:
+      - background 用 textCodeBlock-background, 跟 vscode 聊天界面里代码块同一类视觉
+        (主题切换时自动跟随; fallback 一层半透明灰).
+      - border 用 widget-border / panel-border, 一道细描边.
+      - border-radius 6px, margin 8px 让卡片之间留空气感.
+    !!! 这里**不能**写 overflow:hidden — 任何 overflow != visible 的祖先都会成为
+    sticky 的 scroll container, 导致内部 .card sticky 失效 (展开后标题不再吸顶).
+    .card hover 块色溢出圆角的问题由 .card 自己加 border-radius 解决, 不依赖父级裁剪.
+  */
   .card-wrap {
-    border-bottom: 1px solid var(--vscode-sideBarSectionHeader-border, rgba(128,128,128,0.15));
+    /* 用 --card-bg 双层背景 (sideBar 实色兜底 + codeBlock 半透明叠加), 解决 sticky 头部透字.
+       详细原因见 :root 里 --card-bg 的注释. */
+    background: var(--card-bg);
+    border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border, rgba(128,128,128,0.18)));
+    border-radius: 6px;
+    margin: 8px 8px;
+    transition: border-color 0.15s;
   }
+  /* 展开态: 整张卡片描边换成柔和的中性灰 (descriptionForeground), 仍跟折叠态有明显
+     对比, 但不像 --vscode-focusBorder 那么刺眼 (后者多数主题是高饱和蓝, 整圈描边
+     视觉太重). */
   .card-wrap.expanded {
-    /* 展开时不再整体染色, 只靠左侧细色条 + 顶部分隔做视觉锚点, 避免像"被选中的文件"一样刺眼 */
-    background: transparent;
-    box-shadow: inset 2px 0 0 var(--vscode-focusBorder, var(--vscode-textLink-foreground, rgba(128,128,128,0.4)));
+    border-color: var(--vscode-descriptionForeground, rgba(128,128,128,0.55));
   }
   .card {
     padding: 12px 14px;
     cursor: pointer;
     transition: background 0.1s;
     position: relative;
+    /* 折叠态: 整圆角, 让 hover 时的块色不会超出 wrap 边界露出方角 (没有 wrap overflow:hidden 兜底).
+       展开态会被下面 .card-wrap.expanded .card 的 6px 6px 0 0 覆盖, 只保留顶部圆角. */
+    border-radius: 6px;
   }
   .card:hover {
     background: var(--vscode-list-hoverBackground);
@@ -460,6 +550,32 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   .card-wrap.expanded .card-toggle {
     transform: rotate(90deg);
   }
+  /*
+    展开后的卡片头 sticky 在顶部 (紧贴 filter-bar 下方) — 长答案看到一半也能随时
+    在原位置看到标题, 点一下头部直接折叠回去, 不用滚回顶部.
+      - top 用 --filter-bar-h 变量, 由 ResizeObserver 实时同步 filter-bar 实际高度
+        (登录态切换 hidden / 用户改 vscode 字号 都会自动跟); 兜底 36px.
+      - z-index 5 < filter-bar 的 10, 确保 filter-bar 在最上.
+      - background 必须不透明, 否则 sticky 时下面正文会从下面透上来.
+      - 左侧色条用 inset box-shadow 重新画一遍 — 因为 .card 的不透明背景会盖住
+        .card-wrap.expanded 自己的 inset 阴影, 不补就视觉上断掉.
+      - 底部一道细阴影暗示 "已浮起在内容上方".
+    多张卡片同时展开时, 每张 .card 在自己的 .card-wrap 内 sticky, 滚出 wrap 边界
+    会自然被下一张顶替 — 这是 position:sticky 的天然行为, 不会重叠.
+  */
+  .card-wrap.expanded .card {
+    position: sticky;
+    top: var(--filter-bar-h, 36px);
+    z-index: 5;
+    /* sticky 必须"看起来"不透明, 否则滚动时下面的正文会从背景透上来叠在标题文字上.
+       用跟 .card-wrap 一致的 --card-bg (linear-gradient 实色兜底), 既保证不透字,
+       又跟卡片本体融为一体, 不出现两段色. */
+    background: var(--card-bg);
+    /* 只顶部圆角 — 因为下方紧贴 .card-detail, 底部如果留圆角会露出 wrap 背景缺口. */
+    border-radius: 6px 6px 0 0;
+    /* 底部一道细线分隔头部与正文; 用 inset 不会被任何祖先裁掉, 也不会推开下方内容. */
+    box-shadow: inset 0 -1px 0 var(--vscode-sideBarSectionHeader-border, rgba(128,128,128,0.2));
+  }
   /* 展开后的正文区
      之前用 list-activeSelectionBackground 整块染蓝 — 体感像被选中的文件, 且打破了 sidebar 的视觉层级.
      现在保持透明背景, 只用一条 dashed 分隔线把"标题/正文"轻量切开, 蓝色仅留在 wrap 的左侧色条上. */
@@ -479,6 +595,37 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     word-break: break-word;
     padding-top: 10px;
     color: var(--vscode-foreground);
+    /* 正文阅读字号 — 用户可在 filter-bar 上 A- / A+ 调整, 见 --reader-font-scale 定义.
+       这里基础值取 12.5px (跟之前 .card-detail 的 12.5px 视觉一致), 不动 chrome 区. */
+    font-size: calc(12.5px * var(--reader-font-scale, 1));
+  }
+  .detail-text .inline-img {
+    display: block;
+    max-width: 100%;
+    max-height: 360px;
+    object-fit: contain;
+    margin: 8px 0;
+    border-radius: 4px;
+    background: var(--vscode-editor-background, transparent);
+  }
+  .detail-text .inline-img-broken {
+    display: inline-block;
+    color: var(--vscode-descriptionForeground);
+    font-size: 12px;
+    margin: 4px 0;
+  }
+  /* 图片占位符 — imagesEnabled=false 时, 把原本应渲染的 <img> 全部替换成它,
+     既不发任何网络请求 (摸鱼场景不能让公司网络/旁观者看到 zhimg.com 的图加载),
+     又给用户一个明确的 "这里原本有图" 提示, 可以随时点顶部 🖼️ 按钮切换显示. */
+  .detail-text .inline-img-placeholder {
+    display: inline-block;
+    padding: 2px 8px;
+    margin: 4px 0;
+    color: var(--vscode-descriptionForeground);
+    border: 1px dashed var(--vscode-sideBarSectionHeader-border, rgba(128,128,128,0.3));
+    border-radius: 3px;
+    font-size: 11.5px;
+    user-select: none;
   }
   .detail-loading, .detail-error {
     padding: 12px 0;
@@ -594,7 +741,8 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     margin-bottom: 2px;
   }
   .comment-body {
-    font-size: 12px;
+    /* 评论正文也走 --reader-font-scale 缩放, 跟 .detail-text 同步变化, 体验一致 */
+    font-size: calc(12px * var(--reader-font-scale, 1));
     line-height: 1.55;
     color: var(--vscode-foreground);
     white-space: pre-wrap;
@@ -674,6 +822,18 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   .filter-bar button:hover {
     background: var(--vscode-button-secondaryHoverBackground, var(--vscode-list-hoverBackground));
   }
+  /* 图片显示开关 — 视觉上区分 on/off:
+       off (默认): 复用 filter-bar button 灰底, 跟其他次要按钮一致;
+       on:        切到主色 button-background, 让用户一眼看到"图片是开着的" (摸鱼场景下
+                  这是个需要警觉的状态 — 同事走过来一眼能看到知乎图). */
+  .filter-bar .images-toggle.on {
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+    border-color: transparent;
+  }
+  .filter-bar .images-toggle.on:hover {
+    background: var(--vscode-button-hoverBackground);
+  }
   .filter-bar .filter-stat {
     margin-left: auto;
     font-size: 10.5px;
@@ -709,7 +869,8 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     border-bottom: none;
   }
   .child-comment-item .comment-body {
-    font-size: 11.5px;
+    /* 子评论字号比根评论再小一档 (基础 11.5px), 同样跟随 --reader-font-scale */
+    font-size: calc(11.5px * var(--reader-font-scale, 1));
   }
   .child-comments-actions {
     display: flex;
@@ -891,6 +1052,20 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     <input id="filterMax" type="number" min="0" placeholder="不限" title="最高赞数 (留空 = 不限)" />
     <button id="filterApply" type="button" title="应用筛选 (回车也可)">应用</button>
     <button id="filterClear" type="button" title="清除筛选, 恢复全部显示">清除</button>
+    <!--
+      图片开关 — 摸鱼场景默认关闭 (workspaceState 'zhihu.imagesEnabled' = false):
+        - 关闭时正文里所有 [IMG:url] 渲染成纯占位符 "🖼️ 图片", 完全不发请求, 不出图;
+        - 打开后已经展开的卡片里占位符立即就地变成 <img> (无需重新展开).
+      放在 filter-bar 里跟过滤按钮同一行, sticky 顶部, 滚到哪都点得到.
+    -->
+    <button id="imagesToggle" type="button" class="images-toggle" title="开启/关闭正文图片显示 (默认关闭, 摸鱼伪装感)">🖼️ 图片</button>
+    <!--
+      阅读字号调整 — A- / A+ 一对按钮, 只影响 .detail-text 与 .comment-body
+      (chrome 区域字号保持 vscode 默认, 避免按钮一起变大撑破布局).
+      title 里 JS 会动态写入当前百分比, 让用户知道在哪一档.
+    -->
+    <button id="fontSmaller" type="button" class="font-zoom" title="缩小阅读字号">A-</button>
+    <button id="fontLarger" type="button" class="font-zoom" title="放大阅读字号">A+</button>
     <span id="filterStat" class="filter-stat"></span>
   </div>
   <div id="root">
@@ -932,6 +1107,9 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   const filterMaxInput = /** @type {HTMLInputElement} */ (document.getElementById('filterMax'));
   const filterApplyBtn = document.getElementById('filterApply');
   const filterClearBtn = document.getElementById('filterClear');
+  const imagesToggleBtn = document.getElementById('imagesToggle');
+  const fontSmallerBtn = document.getElementById('fontSmaller');
+  const fontLargerBtn = document.getElementById('fontLarger');
   const filterStat = document.getElementById('filterStat');
 
   let loggedIn = false;
@@ -946,6 +1124,30 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
    * 初值是"全部不限", ready 后 extension 会下发 'filterState' 用持久化值覆盖.
    */
   let currentFilter = { min: 0, max: -1 };
+  /**
+   * 是否允许在正文里渲染图片. 默认 false (摸鱼场景: 别让网络流量 / 屏幕上突然冒出
+   * zhimg.com 的高饱和图片暴露你在看知乎). ready 后 extension 会下发 'imagesState'
+   * 用持久化值覆盖.
+   *
+   * 渲染策略 (见 renderTextWithImages):
+   *   - true:  [IMG:url] -> <img class="inline-img" src=url>
+   *   - false: [IMG:url] -> <span class="inline-img-placeholder" data-src=url>🖼️ 图片</span>
+   * 用户切换时遍历 DOM 替换节点, 实现"已展开的卡片也立即响应"且默认态完全不发请求.
+   */
+  let imagesEnabled = false;
+  /**
+   * 阅读字号缩放系数. 只作用于正文 (.detail-text) + 评论正文 (.comment-body),
+   * 不动 chrome 字号 (标题/按钮/作者/meta), 避免按钮一起变大撑破 sidebar 布局.
+   *
+   * 范围 0.7 ~ 1.8, step 0.1, 默认 1.0.
+   * 写到 CSS var --reader-font-scale, 三处 calc(基础px * var(--reader-font-scale))
+   * 实时跟随. 持久化到 workspaceState 'zhihu.readerFontScale', ready 后 extension
+   * 通过 'readerFontScaleState' 下发覆盖.
+   */
+  let readerFontScale = 1;
+  const READER_FONT_MIN = 0.7;
+  const READER_FONT_MAX = 1.8;
+  const READER_FONT_STEP = 0.1;
   /**
    * 正在加载正文的请求 -> wrap 元素映射。
    * 收到 'content' / 'contentError' 时按 reqId 路由回正确的卡片 DOM。
@@ -966,6 +1168,167 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       .replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;')
       .replace(/'/g, '&#39;');
+  }
+
+  // 注意: 这一段 JS 嵌在 TS template literal (反引号) 里, \\[ \\] \\/ 必须双写,
+  // 否则模板求值时反斜杠被吞, 注入到 webview 的正则会变成 /[IMG:(https?://[^]]+)]/g,
+  // 抛 "Unmatched ')'" SyntaxError, 整个 IIFE 不执行, 前端永远停在 "初始化中...".
+  const IMG_PLACEHOLDER_RE = /\\[IMG:(https?:\\/\\/[^\\]]+)\\]/g;
+
+  /**
+   * 把正文中的 [IMG:url] 占位符渲染成图片或占位符, 其它内容保持纯文本。
+   * 只处理 http(s) url, 并用 DOM API 创建节点, 不拼 innerHTML, 避免 XSS。
+   *
+   * 根据 imagesEnabled 决定生成什么节点 (二选一, 不会同时存在):
+   *   - true:  <img class="inline-img" src=url>  — 会发请求
+   *   - false: <span class="inline-img-placeholder" data-src=url>🖼️ 图片</span> — 不发请求
+   * 两种节点都带 data-src, 切换开关时由 syncImagesEnabledToDOM 全量替换.
+   */
+  function renderTextWithImages(container, content) {
+    const raw = String(content == null ? '' : content);
+    let last = 0;
+    let match;
+    IMG_PLACEHOLDER_RE.lastIndex = 0;
+    while ((match = IMG_PLACEHOLDER_RE.exec(raw))) {
+      if (match.index > last) {
+        container.appendChild(document.createTextNode(raw.slice(last, match.index)));
+      }
+      const src = match[1];
+      if (/^https?:\\/\\//i.test(src)) {
+        container.appendChild(imagesEnabled ? createImgNode(src) : createImgPlaceholder(src));
+      } else {
+        container.appendChild(document.createTextNode('[图片]'));
+      }
+      last = match.index + match[0].length;
+    }
+    if (last < raw.length) {
+      container.appendChild(document.createTextNode(raw.slice(last)));
+    }
+  }
+
+  /** 创建真实 <img> 节点 (图片开启态). 失败时降级为 inline-img-broken 占位. */
+  function createImgNode(src) {
+    const img = document.createElement('img');
+    img.className = 'inline-img';
+    img.dataset.src = src;
+    img.src = src;
+    img.loading = 'lazy';
+    img.referrerPolicy = 'no-referrer';
+    img.alt = '[图片]';
+    img.addEventListener('error', () => {
+      const fallback = document.createElement('span');
+      fallback.className = 'inline-img-broken';
+      fallback.textContent = '[图片加载失败]';
+      img.replaceWith(fallback);
+    });
+    return img;
+  }
+
+  /** 创建占位 span (图片关闭态). data-src 留着, 切到开启时一键升级为 <img>. */
+  function createImgPlaceholder(src) {
+    const span = document.createElement('span');
+    span.className = 'inline-img-placeholder';
+    span.dataset.src = src;
+    span.textContent = '🖼️ 图片';
+    return span;
+  }
+
+  /**
+   * 把 DOM 里所有图片节点同步到当前 imagesEnabled 状态:
+   *   开启 → 把 .inline-img-placeholder 替换成 <img>;
+   *   关闭 → 把 <img.inline-img> 替换成 .inline-img-placeholder (注意: 已发出的 HTTP 请求
+   *           无法撤销 — 但默认就是关闭, 用户主动开过才会有"已加载"的图, 那时再关回去
+   *           只是把视觉去掉, 网络流量已经发生, 这是合理的取舍).
+   * 同时遍历 inline-img-broken (加载失败占位) — 关闭态下也替换为统一的占位符,
+   * 避免视觉杂乱.
+   */
+  function syncImagesEnabledToDOM() {
+    if (imagesEnabled) {
+      const placeholders = document.querySelectorAll('.detail-text .inline-img-placeholder');
+      placeholders.forEach((el) => {
+        const src = el.dataset && el.dataset.src;
+        if (src) el.replaceWith(createImgNode(src));
+      });
+    } else {
+      const imgs = document.querySelectorAll('.detail-text img.inline-img, .detail-text .inline-img-broken');
+      imgs.forEach((el) => {
+        const src = (el.dataset && el.dataset.src) || (el.getAttribute && el.getAttribute('src')) || '';
+        if (src) el.replaceWith(createImgPlaceholder(src));
+      });
+    }
+  }
+
+  /** 同步图片开关按钮的视觉状态 (class + 文案). */
+  function updateImagesToggleUI() {
+    if (!imagesToggleBtn) return;
+    imagesToggleBtn.classList.toggle('on', imagesEnabled);
+    imagesToggleBtn.textContent = imagesEnabled ? '🖼️ 图片开' : '🖼️ 图片';
+    imagesToggleBtn.title = imagesEnabled
+      ? '当前: 显示正文图片 — 点击关闭 (摸鱼伪装感)'
+      : '当前: 不显示正文图片 (默认, 不发任何请求) — 点击开启';
+  }
+
+  /**
+   * 把 readerFontScale clamp 到合法区间, 并截到小数点 1 位.
+   *
+   * 截位的动机: 0.1+0.1+0.1 在 JS 里等于 0.30000000000000004 — 这串塞进 CSS var
+   * 也能用, 但 hover tooltip 上显示成 "30.000000000000004%" 太丑.
+   */
+  function clampReaderFontScale(v) {
+    let n = typeof v === 'number' ? v : parseFloat(v);
+    if (!Number.isFinite(n)) n = 1;
+    if (n < READER_FONT_MIN) n = READER_FONT_MIN;
+    if (n > READER_FONT_MAX) n = READER_FONT_MAX;
+    return Math.round(n * 10) / 10;
+  }
+
+  /**
+   * 把当前 readerFontScale 写到 :root 的 CSS var, 并同步 A- / A+ 按钮的
+   * disabled 状态 + tooltip 文案 (展示当前百分比).
+   *
+   * 调用方: ready 下发时 / 用户点 A- A+ 时 / extension 推回灌时.
+   */
+  function applyReaderFontScale() {
+    readerFontScale = clampReaderFontScale(readerFontScale);
+    document.documentElement.style.setProperty(
+      '--reader-font-scale',
+      String(readerFontScale),
+    );
+    const pct = Math.round(readerFontScale * 100) + '%';
+    // 浮点比较留 0.001 余量, 避免按钮在边界值时因精度抖动 enable/disable 反复跳
+    const atMin = readerFontScale <= READER_FONT_MIN + 0.001;
+    const atMax = readerFontScale >= READER_FONT_MAX - 0.001;
+    if (fontSmallerBtn) {
+      fontSmallerBtn.title = '缩小阅读字号 (当前 ' + pct + ')';
+      fontSmallerBtn.disabled = atMin;
+    }
+    if (fontLargerBtn) {
+      fontLargerBtn.title = '放大阅读字号 (当前 ' + pct + ')';
+      fontLargerBtn.disabled = atMax;
+    }
+  }
+
+  /** 用户点按钮: clamp 后写状态, apply, 持久化 — 已到极值则 no-op */
+  function changeReaderFontScale(delta) {
+    const next = clampReaderFontScale(readerFontScale + delta);
+    if (next === readerFontScale) return;
+    readerFontScale = next;
+    applyReaderFontScale();
+    vscode.postMessage({ type: 'setReaderFontScale', scale: readerFontScale });
+  }
+
+  /** 如果分段光标刚好落在 [IMG:url] 中间, 扩到占位符末尾, 避免露出半截文本。 */
+  function alignCursorOutsideImagePlaceholder(content, cursor) {
+    if (cursor <= 0 || cursor >= content.length) return cursor;
+    IMG_PLACEHOLDER_RE.lastIndex = 0;
+    let match;
+    while ((match = IMG_PLACEHOLDER_RE.exec(content))) {
+      const start = match.index;
+      const end = start + match[0].length;
+      if (cursor > start && cursor < end) return end;
+      if (start > cursor) break;
+    }
+    return cursor;
   }
 
   // ============================================================
@@ -1050,6 +1413,26 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       vscode.postMessage({ type: 'setFilter', filter: currentFilter });
     });
   }
+  // 图片开关 click — 立即切状态 + 同步 DOM + 持久化
+  if (imagesToggleBtn) {
+    imagesToggleBtn.addEventListener('click', () => {
+      imagesEnabled = !imagesEnabled;
+      updateImagesToggleUI();
+      syncImagesEnabledToDOM();
+      vscode.postMessage({ type: 'setImagesEnabled', enabled: imagesEnabled });
+    });
+  }
+  // 阅读字号 A- / A+ — 即时改 CSS var, 已展开的卡片/评论会自动跟随;
+  // disabled 边界由 applyReaderFontScale 维护, 这里不重复判断.
+  if (fontSmallerBtn) {
+    fontSmallerBtn.addEventListener('click', () => changeReaderFontScale(-READER_FONT_STEP));
+  }
+  if (fontLargerBtn) {
+    fontLargerBtn.addEventListener('click', () => changeReaderFontScale(READER_FONT_STEP));
+  }
+  // 初始 apply 一次 — 保证按钮 tooltip / disabled 在收到 readerFontScaleState 前
+  // 也跟当前默认值 (1.0) 对齐. extension 下发后再 apply 一次.
+  applyReaderFontScale();
   // 回车即应用 (sidebar 太窄, 用户大概率不想再去鼠标点)
   [filterMinInput, filterMaxInput].forEach((inp) => {
     if (!inp) return;
@@ -1060,6 +1443,27 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       }
     });
   });
+
+  // —— filter-bar 高度 → CSS var --filter-bar-h ——
+  // 展开的 .card 用这个值做 sticky top, 紧贴 filter-bar 下方. 必须实时跟随:
+  //   - filter-bar hidden 切换 (登录态 / 详情页打开): offsetHeight 由 N <-> 0
+  //   - vscode 字号变化: filter-bar 实际像素高度会变
+  //   - 窗口 resize: 一般不影响高度, 但兜底
+  // ResizeObserver 一招覆盖前两种, 安装后会立即回调一次, 不需要再手动调初始值;
+  // hidden 切换会触发尺寸 0 <-> N, ResizeObserver 也能正确通知 (实测).
+  function syncFilterBarHeight() {
+    const h = filterBar && !filterBar.hidden ? filterBar.offsetHeight : 0;
+    document.documentElement.style.setProperty('--filter-bar-h', h + 'px');
+  }
+  if (filterBar) {
+    if (typeof ResizeObserver !== 'undefined') {
+      new ResizeObserver(syncFilterBarHeight).observe(filterBar);
+    } else {
+      // fallback: 老环境无 ResizeObserver, 至少把当前值算一次
+      syncFilterBarHeight();
+    }
+    window.addEventListener('resize', syncFilterBarHeight);
+  }
 
   function renderLoginTip() {
     root.innerHTML = '<div class="login-tip">请先登录知乎才能加载推荐流<br/>(本插件不会上传 Cookie, 仅保存在本地 VSCode SecretStorage)<br/><button id="loginBtn">导入 Cookie 登录</button></div>';
@@ -1216,8 +1620,12 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     let cursor = parseInt(wrap.dataset.cursor || '0', 10);
     if (!Number.isFinite(cursor) || cursor < 0) cursor = 0;
 
-    // 第一次展开 cursor=0 → 至少推一段; 之后每点一次 +chunkSize
-    cursor = Math.min(content.length, cursor + chunkSize);
+    // 第一次展开 cursor=0 → 至少推一段; 之后每点一次 +chunkSize。
+    // 如果正好切进 [IMG:url] 占位符中间, 扩到占位符尾部, 让图片一次性可渲染。
+    cursor = alignCursorOutsideImagePlaceholder(
+      content,
+      Math.min(content.length, cursor + chunkSize),
+    );
     wrap.dataset.cursor = String(cursor);
 
     const visibleText = content.slice(0, cursor);
@@ -1226,7 +1634,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     detail.innerHTML = '';
     const text = document.createElement('div');
     text.className = 'detail-text';
-    text.textContent = visibleText;
+    renderTextWithImages(text, visibleText);
     detail.appendChild(text);
 
     const actions = document.createElement('div');
@@ -2020,6 +2428,23 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
         }
         return;
       }
+      case 'imagesState': {
+        // 图片开关持久化值下发 — ready 后下发一次. 收到后同步 UI + DOM
+        // (DOM 此时一般还没卡片, syncImagesEnabledToDOM 是 no-op; 但若 retainContextWhenHidden
+        // 下用户切走再回来, 卡片已存在, 这里就能正确刷一遍).
+        imagesEnabled = msg.enabled === true;
+        updateImagesToggleUI();
+        syncImagesEnabledToDOM();
+        return;
+      }
+      case 'readerFontScaleState': {
+        // 阅读字号持久化值下发 — ready 后下发一次. clamp 后写到 CSS var,
+        // 所有现存 .detail-text / .comment-body 因为用了 calc(* var(--reader-font-scale))
+        // 会自动重排, 不需要遍历 DOM.
+        readerFontScale = typeof msg.scale === 'number' ? msg.scale : 1;
+        applyReaderFontScale();
+        return;
+      }
       case 'loginState':
         loggedIn = !!msg.loggedIn;
         // 未登录时整条过滤条隐藏 — 此时 root 里只有一个登录提示, 显示筛选条没意义.
@@ -2228,4 +2653,19 @@ function generateNonce(): string {
   let s = '';
   for (let i = 0; i < 32; i++) s += chars[Math.floor(Math.random() * chars.length)];
   return s;
+}
+
+/**
+ * 阅读字号缩放系数的合法区间 + 截位规则 — 跟前端 webview 内的 clampReaderFontScale
+ * 一致 (range 0.7~1.8, step 0.1). 这里独立实现一份是因为前端那段写在 template literal
+ * 里, TS 编译期不能直接复用; 但两边的常量必须人工保持一致.
+ *
+ * 截到一位小数: 0.1 + 0.1 + 0.1 在 IEEE-754 下是 0.30000000000000004, 不截会让
+ * workspaceState 里塞进一串浮点尾巴.
+ */
+function clampReaderFontScale(v: unknown): number {
+  const n = typeof v === 'number' ? v : Number(v);
+  if (!Number.isFinite(n)) return 1;
+  const clamped = Math.min(1.8, Math.max(0.7, n));
+  return Math.round(clamped * 10) / 10;
 }

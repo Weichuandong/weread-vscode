@@ -122,6 +122,21 @@
         "icon": "$(pulse)"
       },
       {
+        "command": "weread.chapterCacheStats",
+        "title": "Folio: 查看已缓存章节 (下钻浏览)",
+        "icon": "$(database)"
+      },
+      {
+        "command": "weread.configurePrefetch",
+        "title": "Folio: 章节预缓存配置 (开关 / 章数)",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "weread.clearChapterCache",
+        "title": "Folio: 清空章节缓存",
+        "icon": "$(trash)"
+      },
+      {
         "command": "zhihu.importCookie",
         "title": "Curio: 导入 Cookie 登录",
         "icon": "$(sign-in)"
@@ -140,6 +155,11 @@
         "command": "zhihu.openInBrowser",
         "title": "Curio: 在浏览器中打开",
         "icon": "$(link-external)"
+      },
+      {
+        "command": "zhihu.clearReadHistory",
+        "title": "Curio: 清空已看过记录",
+        "icon": "$(clear-all)"
       }
     ],
     "menus": {
@@ -160,6 +180,21 @@
           "group": "1_actions@4"
         },
         {
+          "command": "weread.chapterCacheStats",
+          "when": "view == wereadVscode.main",
+          "group": "navigation@5"
+        },
+        {
+          "command": "weread.configurePrefetch",
+          "when": "view == wereadVscode.main",
+          "group": "5_cache@1"
+        },
+        {
+          "command": "weread.clearChapterCache",
+          "when": "view == wereadVscode.main",
+          "group": "5_cache@2"
+        },
+        {
           "command": "weread.resetReadingState",
           "when": "view == wereadVscode.main",
           "group": "9_recovery@1"
@@ -178,6 +213,11 @@
           "command": "zhihu.logout",
           "when": "view == zhihuTouch.main",
           "group": "1_actions@4"
+        },
+        {
+          "command": "zhihu.clearReadHistory",
+          "when": "view == zhihuTouch.main",
+          "group": "9_recovery@1"
         }
       ]
     },
@@ -199,6 +239,25 @@
             "type": "boolean",
             "default": true,
             "description": "启动时自动检查 Open VSX 上是否有新版本（本插件未发到微软 Marketplace，原版 VSCode 无法自动升级，此选项可手动关闭以避免提示）"
+          },
+          "weread.chapterPrefetch.enabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "是否开启章节预缓存。开启后会在你阅读每章时后台静默拉取下面若干章，这样 cookie 过期后仍能继续看下去。"
+          },
+          "weread.chapterPrefetch.ahead": {
+            "type": "number",
+            "default": 10,
+            "minimum": 0,
+            "maximum": 50,
+            "description": "向后预缓存的章节数（默认 10，最大 50）。占用空间约：每章 50KB ~ 300KB。"
+          },
+          "weread.chapterPrefetch.behind": {
+            "type": "number",
+            "default": 1,
+            "minimum": 0,
+            "maximum": 10,
+            "description": "向前预缓存的章节数（默认 1，最大 10）。方便回看上一章。"
           }
         }
       },

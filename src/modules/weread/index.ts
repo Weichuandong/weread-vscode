@@ -6,6 +6,7 @@ import { MainViewProvider } from './views/MainViewProvider';
 import { WereadBook } from './types';
 import { getBookReaderUrl } from './api/wereadUrl';
 import { checkForUpdates } from './services/UpdateChecker';
+import { ChapterCache } from './services/ChapterCache';
 
 /**
  * 微信读书模块。
@@ -41,7 +42,11 @@ const wereadModule: Module = {
     await auth.initialize();
 
     const client = new WereadClient(auth);
-    const mainView = new MainViewProvider(context, client, auth);
+
+    // 章节内容缓存 — 跨重启 + 抗 cookie 过期, 详见 ChapterCache 头注释
+    const chapterCache = new ChapterCache(context);
+
+    const mainView = new MainViewProvider(context, client, auth, chapterCache);
 
     // ---- 视图注册 ----
     context.subscriptions.push(
@@ -183,6 +188,282 @@ const wereadModule: Module = {
           }
         }
         await mainView.resetReadingState();
+      }),
+
+      // 章节缓存可视化 — 命令面板两级 QuickPick 下钻:
+      //   Level 1: 列出每本已缓存书 (书名/作者/章数/大小, 按占用倒序) + 顶部"清空全部"
+      //   Level 2: 选某本书后列章节 (标题/大小/更新时间, 按"书中目录顺序"升序) + 顶部"清空本书"
+      // 比一条干巴巴的 showInformationMessage 直观得多, 也顺便给用户提供就地清理入口.
+      vscode.commands.registerCommand('weread.chapterCacheStats', async () => {
+        const books = await chapterCache.listAll();
+        if (books.length === 0) {
+          vscode.window.showInformationMessage(
+            '章节缓存为空 — 翻几章后再来看吧.',
+          );
+          return;
+        }
+        const memEntries = (await chapterCache.stats()).memEntries;
+        // 按本书占用倒序 — 大头排前面方便用户决定是否清理
+        books.sort((a, b) => b.totalSizeKB - a.totalSizeKB);
+        const totalChapters = books.reduce(
+          (a, b) => a + b.chapters.length,
+          0,
+        );
+        const totalKB = books.reduce((a, b) => a + b.totalSizeKB, 0);
+
+        const fmtSize = (kb: number) =>
+          kb >= 1024 ? `${(kb / 1024).toFixed(1)} MB` : `${kb} KB`;
+        const fmtTime = (ms: number) => {
+          const dt = Date.now() - ms;
+          if (dt < 60_000) return '刚刚';
+          if (dt < 3_600_000) return `${Math.floor(dt / 60_000)} 分钟前`;
+          if (dt < 86_400_000) return `${Math.floor(dt / 3_600_000)} 小时前`;
+          return `${Math.floor(dt / 86_400_000)} 天前`;
+        };
+
+        // ===== Level 1: 选书 =====
+        // 顶部内联两个常用操作 (清空 / 配置预缓存), 让 "看缓存 → 立刻动手调" 形成短闭环;
+        // 用户不必再去命令面板搜或 settings.json 改。
+        type BookItem = vscode.QuickPickItem & {
+          __bookIdx?: number;
+          __action?: 'clearAll' | 'configurePrefetch';
+        };
+        // 当前预缓存档位摘要 — 列在 "调整预缓存" 项的 description 里, 一眼看现状
+        const prefetchCfg = vscode.workspace.getConfiguration('weread.chapterPrefetch');
+        const pfEnabled = prefetchCfg.get<boolean>('enabled', true);
+        const pfAhead = prefetchCfg.get<number>('ahead', 10);
+        const pfBehind = prefetchCfg.get<number>('behind', 1);
+        const pfSummary = pfEnabled
+          ? `当前: 后 ${pfAhead} / 前 ${pfBehind} 章`
+          : '当前: 已关闭';
+
+        const items: BookItem[] = [
+          {
+            label: '$(gear) 调整预缓存设置...',
+            description: pfSummary,
+            detail: '直接填章数: 后 (0–50) · 前 (0–10), 两端都填 0 即关闭',
+            __action: 'configurePrefetch',
+          },
+          {
+            label: '$(trash) 清空全部缓存',
+            description: `${books.length} 本 · ${totalChapters} 章 · ${fmtSize(totalKB)}`,
+            __action: 'clearAll',
+          },
+          {
+            kind: vscode.QuickPickItemKind.Separator,
+            label: `已缓存书籍 (${books.length})`,
+          } as BookItem,
+          ...books.map<BookItem>((b, idx) => ({
+            label: b.bookTitle
+              ? `$(book) ${b.bookTitle}`
+              : `$(book) (未命名 · id ${b.bookId.slice(0, 10)})`,
+            description: b.author ?? '',
+            detail: `${b.chapters.length} 章 · ${fmtSize(b.totalSizeKB)} · id ${b.bookId}`,
+            __bookIdx: idx,
+          })),
+        ];
+
+        const picked = await vscode.window.showQuickPick(items, {
+          title: `章节缓存 — ${books.length} 本书 · ${totalChapters} 章 · ${fmtSize(totalKB)} · 内存层 ${memEntries} 条`,
+          placeHolder: '选择一本书查看已缓存章节, 或选择上方操作',
+          matchOnDescription: true,
+          matchOnDetail: true,
+        });
+        if (!picked) return;
+
+        if (picked.__action === 'configurePrefetch') {
+          // 转发到 configurePrefetch 命令 — 单一实现, 避免逻辑分叉
+          await vscode.commands.executeCommand('weread.configurePrefetch');
+          return;
+        }
+
+        if (picked.__action === 'clearAll') {
+          const choice = await vscode.window.showWarningMessage(
+            `确定清空全部 ${books.length} 本书 / ${totalChapters} 章 (${fmtSize(totalKB)}) 缓存吗? 下次翻章节会重新走网络.`,
+            { modal: true },
+            '清空',
+          );
+          if (choice === '清空') {
+            const cleared = await chapterCache.clearAll();
+            vscode.window.showInformationMessage(
+              `章节缓存已清空 (${cleared.chapters} 章 / ${fmtSize(cleared.sizeKB)})`,
+            );
+          }
+          return;
+        }
+
+        // ===== Level 2: 选章节 =====
+        const book = books[picked.__bookIdx!];
+        // 章节排序 — 三层 fallback, 按"书中真实目录顺序"升序排列:
+        //   1) idx 优先 (来自 _meta.json.chapterOrder 快照, 最稳)
+        //   2) 都无 idx 时退到 chapterUid 数字升序 (一般 EPUB 大致按目录递增, 但可能有间隙)
+        //   3) 仍打平时按字典序 — 至少保证稳定排序, 不会忽前忽后
+        // mtime 不再参与排序, 但保留在 description 里供"我最近读了哪章"参考.
+        const sortedChapters = [...book.chapters].sort((a, b) => {
+          if (a.idx !== undefined && b.idx !== undefined) return a.idx - b.idx;
+          if (a.idx !== undefined) return -1;
+          if (b.idx !== undefined) return 1;
+          const na = Number(a.chapterUid);
+          const nb = Number(b.chapterUid);
+          if (Number.isFinite(na) && Number.isFinite(nb)) return na - nb;
+          return a.chapterUid.localeCompare(b.chapterUid);
+        });
+        // 用于判断"是否还有老缓存没带 chapterOrder" — 全无 idx 时给个温和提示, 解释为什么可能不准
+        const hasOrderInfo = sortedChapters.some((ch) => ch.idx !== undefined);
+        type ChItem = vscode.QuickPickItem & { __action?: 'clearBook' };
+        const chItems: ChItem[] = [
+          {
+            label: '$(trash) 清空本书的所有缓存',
+            description: `${sortedChapters.length} 章 · ${fmtSize(book.totalSizeKB)}`,
+            __action: 'clearBook',
+          },
+          {
+            kind: vscode.QuickPickItemKind.Separator,
+            label: hasOrderInfo
+              ? `已缓存章节 (按书中目录顺序, 共 ${sortedChapters.length} 章)`
+              : `已缓存章节 (按 uid 数字升序 — 翻一章后会自动按真实目录顺序排, 共 ${sortedChapters.length} 章)`,
+          } as ChItem,
+          ...sortedChapters.map<ChItem>((ch) => ({
+            // idx 存在时在标题前打一个"第 N 章 (1-based)"前缀, 让目录顺序更直观
+            label:
+              (ch.idx !== undefined ? `${ch.idx + 1}. ` : '') +
+              (ch.chapterTitle
+                ? `$(file) ${ch.chapterTitle}`
+                : `$(file) chapter ${ch.chapterUid}`),
+            description: `${fmtSize(ch.sizeKB)} · ${fmtTime(ch.mtimeMs)}`,
+            detail: `uid ${ch.chapterUid}`,
+          })),
+        ];
+
+        const pickedCh = await vscode.window.showQuickPick(chItems, {
+          title: `${book.bookTitle ?? `id ${book.bookId}`} — 已缓存 ${sortedChapters.length} 章 · ${fmtSize(book.totalSizeKB)}`,
+          placeHolder: '查看章节或就地清理本书',
+          matchOnDescription: true,
+          matchOnDetail: true,
+        });
+        if (!pickedCh) return;
+
+        if (pickedCh.__action === 'clearBook') {
+          const choice = await vscode.window.showWarningMessage(
+            `确定清空《${book.bookTitle ?? book.bookId}》的 ${sortedChapters.length} 章缓存吗?`,
+            { modal: true },
+            '清空',
+          );
+          if (choice === '清空') {
+            const cleared = await chapterCache.clearBook(book.bookId);
+            vscode.window.showInformationMessage(
+              `已清空《${book.bookTitle ?? book.bookId}》${cleared.chapters} 章 / ${fmtSize(cleared.sizeKB)}`,
+            );
+          }
+          return;
+        }
+
+        // 用户点击了一个具体章节 → 尝试打开这本书并跳到该章 (离线模式兜底),
+        // cookie 有效时会走完整的在线路径, cookie 失效时走离线模式读缓存.
+        // 书信息来自 _meta.json 的章节快照, 没有完整的 WereadBook 那些字段,
+        // 但 `openBook` 只依赖 bookId + title, 其余填充空值即可.
+        if (pickedCh) {
+          const chapterItem = sortedChapters.find((ch) => {
+            const label = (ch.idx !== undefined ? `${ch.idx + 1}. ` : '') +
+              (ch.chapterTitle ? `$(file) ${ch.chapterTitle}` : `$(file) chapter ${ch.chapterUid}`);
+            return label === pickedCh.label;
+          });
+          if (chapterItem) {
+            const chUid = Number(chapterItem.chapterUid);
+            const bookSnap: WereadBook = {
+              bookId: book.bookId,
+              title: book.bookTitle ?? book.bookId,
+              author: book.author,
+            };
+            // 把章节 uid 预先塞进 pendingRestoreChapterUid, loadBookInternal 会用来定位
+            mainView.setPendingChapterUid(Number.isFinite(chUid) ? chUid : undefined);
+            await mainView.openBook(bookSnap);
+          }
+        }
+      }),
+
+      // 章节预缓存设置 UI — 替代直接编辑 settings.json:
+      //   连续两个 InputBox 分别问 ahead / behind, 范围说明 + 占用估算写在 prompt 里;
+      //   两端都填 0 自动判定为"关闭", 不再额外暴露 enabled toggle (语义等价更简洁).
+      // 入口: ① 命令面板  ② 侧栏标题栏 ⋯ 菜单  ③ "查看已缓存章节"下钻面板顶部内联项
+      vscode.commands.registerCommand('weread.configurePrefetch', async () => {
+        const cfg = vscode.workspace.getConfiguration('weread.chapterPrefetch');
+        const curEnabled = cfg.get<boolean>('enabled', true);
+        const curAhead = cfg.get<number>('ahead', 10);
+        const curBehind = cfg.get<number>('behind', 1);
+        // 关闭状态时输入框默认填 0, 让"关闭→重新开启"的路径更顺;
+        // 否则保留用户上次的设定值
+        const initAhead = curEnabled ? curAhead : 0;
+        const initBehind = curEnabled ? curBehind : 0;
+
+        const aheadStr = await vscode.window.showInputBox({
+          title: '章节预缓存 — 1/2 · 向后预缓存章数',
+          value: String(initAhead),
+          prompt:
+            '阅读时后台静默预拉接下来的 N 章, 翻"下一章"直接命中本地缓存 + 抗 cookie 突然过期. ' +
+            '0 表示关闭. 范围 0–50, 每章约 50–300KB. 推荐 10.',
+          placeHolder: '0 ~ 50 的整数',
+          validateInput: (v) => {
+            const n = Number(v);
+            if (!Number.isInteger(n) || n < 0 || n > 50) {
+              return '请输入 0 ~ 50 之间的整数';
+            }
+            return null;
+          },
+        });
+        if (aheadStr === undefined) return; // ESC 取消
+
+        const behindStr = await vscode.window.showInputBox({
+          title: '章节预缓存 — 2/2 · 向前预缓存章数',
+          value: String(initBehind),
+          prompt: '前面 M 章, 方便回看上一章. 范围 0–10. 推荐 1.',
+          placeHolder: '0 ~ 10 的整数',
+          validateInput: (v) => {
+            const n = Number(v);
+            if (!Number.isInteger(n) || n < 0 || n > 10) {
+              return '请输入 0 ~ 10 之间的整数';
+            }
+            return null;
+          },
+        });
+        if (behindStr === undefined) return;
+
+        const ahead = Number(aheadStr);
+        const behind = Number(behindStr);
+        // 两端都 0 → 自动判定为"关闭", 避免"开着但啥也不拉"的诡异中间态
+        const enabled = ahead > 0 || behind > 0;
+
+        // 写入 Global 而非 Workspace — 阅读偏好天然是用户级, 不该跟着工作区走.
+        // 三个字段分别 update; vscode 内部会合并触发 onDidChangeConfiguration.
+        try {
+          await cfg.update('enabled', enabled, vscode.ConfigurationTarget.Global);
+          await cfg.update('ahead', ahead, vscode.ConfigurationTarget.Global);
+          await cfg.update('behind', behind, vscode.ConfigurationTarget.Global);
+          vscode.window.showInformationMessage(
+            enabled
+              ? `预缓存已设为: 后 ${ahead} 章 / 前 ${behind} 章 (下次切章立即生效)`
+              : '预缓存已关闭 (仅缓存当前在读章节)',
+          );
+        } catch (e) {
+          vscode.window.showErrorMessage(
+            `预缓存设置写入失败: ${(e as Error)?.message ?? 'unknown'}`,
+          );
+        }
+      }),
+
+      // 一键清空所有章节缓存 — 跟 chapterCacheStats 的"清空全部"等价, 留个独立入口
+      // 方便快捷键/命令直接调用 (不必先打开下钻).
+      vscode.commands.registerCommand('weread.clearChapterCache', async () => {
+        const choice = await vscode.window.showWarningMessage(
+          '确定清空所有已缓存的章节内容吗? 下次翻章节会重新走网络.',
+          { modal: true },
+          '清空',
+        );
+        if (choice !== '清空') return;
+        const cleared = await chapterCache.clearAll();
+        vscode.window.showInformationMessage(
+          `章节缓存已清空 (${cleared.chapters} 章 / ${cleared.sizeKB} KB)`,
+        );
       }),
     );
 

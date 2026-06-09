@@ -2,6 +2,51 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)，所有重要变更都会记录在这里。
 
+## [2.0.0] - 2026-06-09
+
+> **重大版本：模块化架构重构 + 新增知乎摸鱼模块 + 微信读书章节预缓存。**
+
+### Added
+
+#### 知乎摸鱼模块 (Curio)
+- 🆕 **全新知乎推荐流** —— 独立的 Activity Bar 图标 `Curio`，在 VSCode 侧边栏刷知乎推荐流
+- 🔐 **知乎 Cookie 登录** —— 粘贴知乎 Cookie（`z_c0` 长期令牌），通过 SecretStorage 安全存储
+- 📋 **推荐流卡片** —— 可展开/折叠的卡片式布局，显示标题、摘要、作者，点击展开正文
+- 📖 **分段阅读** —— `zhihu.readChunkSize` 配置，长回答每次显示 N 字符，看完再点"继续阅读"加载下一段
+- 🎬 **视频/专栏链接** —— 点击自动跳浏览器；纯文本/图片类回答就地展开
+- 🚫 **四层去重** —— session_token轮替 + read 上报 + 会话内 Set + 持久化 targetKey，翻页不重不漏
+- 🧹 **已读历史管理** —— `zhihu.clearReadHistory` 命令，清空跨重启的去重记录，推荐流从头来过
+- ⚙️ **知乎专属配置** —— `zhihu.requestTimeout` / `zhihu.userAgent` / `zhihu.pageSize` / `zhihu.reportRead` / `zhihu.readChunkSize`
+
+#### 微信读书章节预缓存 (Folio)
+- 💾 **本地章节缓存** —— `ChapterCache` 层 (内存 LRU + 磁盘持久化)，趁 cookie 有效时后台静默预拉后续章节，cookie 过期/断网后仍能继续阅读
+- ⚡ **智能预缓存策略** —— 翻到某一章时自动 `prefetchAround`：向后预拉 N 章 + 向前预拉 M 章（离散输入框配置），串行拉取不压服务器，切书自动 cancel
+- 📊 **缓存可视化** —— `weread.chapterCacheStats` 命令，两级 QuickPick 下钻浏览：Level 1 按占用倒序列所有缓存书，Level 2 按目录顺序展示每本书的各章节（标题/大小/时间），支持就地清理整本
+- ⚙️ **预缓存配置 UI** —— `weread.configurePrefetch` 命令，连续两个 InputBox 分别设 ahead/behind 章数，两端填 0 自动判定关闭；也嵌入「查看缓存」面板顶部快捷入口
+- 🗑️ **缓存清理** —— `weread.clearChapterCache` 清空全部；`chapterCacheStats` 下钻面板内可清空单本
+- 📁 **离线章节目录** —— `ChapterCache.loadOfflineChapters()` 仅在 _meta.json 快照重建目录，cookie 失效时 reader 仍能展示章节抽屉、翻已缓存章节
+- 📝 **缓存元信息** —— 每本缓存书自动维护 `_meta.json`（书名/作者/章节标题/目录顺序），即使缓存了百来章也能按真实书中目录顺序展示
+
+#### 阅读偏好设置 (Folio)
+- 🎨 **排版偏好** —— 字号(7档)、行距(3档)、段距(3档)、页宽(4档)、字体(黑体/宋体/等宽/编辑器) 五个维度，全部离散档位，CSS 变量驱动实时更新，零闪烁
+
+#### 微信读书诊断工具增强
+- 🏥 **Cookie 健康诊断** —— `weread.diagnoseCookie` 新增现场实测 `/web/login/renewal`，一次诊断能力项完整性检测（wr_vid/wr_skey/wr_rt）+ 续命实测
+- 🩺 **renewal 死锁检测** —— `client.isRenewalDead()` 检测到 cookie 被 server 彻底判死后自动停止心跳，跳提示引导用户重新导入
+
+### Changed
+- 🏗️ **模块化架构重构** —— 引入 `src/core/` 框架层 (`Module` / `ModuleContext` / `ModuleRegistry`)，把微信读书从单块 `extension.ts` 拆到 `src/modules/weread/`，知乎新增到 `src/modules/zhihu/`；`extension.ts` 精简为启动器 (10 行)。新增模块只需实现 `Module` 接口 → 注册到 `ALL_MODULES` → 在 `package.json` 里贡献视图/命令/配置
+- 🔄 **扩展重命名** —— 从 `weread-vscode` / `TouchPlus for VSCode` 升级为双模块套件：Activity Bar 分图标 `Folio`(微信读书) + `Curio`(知乎)
+- ♻️ **文件结构重组** —— 微信读书所有代码从 `src/api/` / `src/auth/` / `src/services/` / `src/views/` 统一搬入 `src/modules/weread/` 同名子目录下
+- 🔧 **Cookie 保活增强** —— 从纯 HEAD / 兜底升级为 `POST /web/login/renewal` 主力 + HEAD / 兜底的双路径策略，聚焦续+定时续(5min)双重触发，节流阈值 2min
+- 🧹 **知乎去重持久化** —— 跨 VSCode 重启的去重集合存到 `globalState`，不再每次重启都重新刷一遍已经看过的内容
+
+### Fixed
+- 🩹 知乎推荐流翻页大量重复 —— 新增 session_token 轮替 + read 上报 + 双重 Set 去重
+
+### Removed
+- ❌ 旧 `src/auth/AuthService.ts` 顶部单文件（已迁移到 `src/modules/weread/auth/AuthService.ts`），无功能删除
+
 ## [1.0.2] - 2026-06-05
 
 ### Added

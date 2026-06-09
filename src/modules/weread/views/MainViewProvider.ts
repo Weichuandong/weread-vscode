@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { WereadClient, ChapterFetchResult } from '../api/WereadClient';
 import { AuthService } from '../auth/AuthService';
+import { ChapterCache } from '../services/ChapterCache';
 import {
   BestBookmark,
   BookProgress,
@@ -92,6 +93,25 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   private chapterFetch: ChapterFetchResult | null = null;
   private chapterLoading = false;
   /**
+   * 离线模式标记: 当 loadBookInternal 拉接口失败 (cookie 失效 / 断网) 但本地
+   * _meta.json 重建出了章节列表时为 true. UI 在 reader 顶部展示 banner,
+   * 提示"已切换离线模式, 仅可读已缓存章节". 用户翻到没缓存的章节会回到 fetch
+   * 报错的常规卡片 (附带"在浏览器打开"按钮).
+   */
+  private isOfflineMode = false;
+  /**
+   * 离线模式下已缓存的 chapterUid 集合 (字符串形态, 与文件名一致).
+   * 用于目录抽屉里给每章打 "✓ 已缓存" / "○ 未缓存" 标记.
+   * 仅在 isOfflineMode=true 时填充, 在线时为空集.
+   */
+  private cachedChapterUids = new Set<string>();
+  /**
+   * cookie 失效时, 书架接口拿不到正常书架列表, 但从 ChapterCache.listAll()
+   * 可以重建一份"本地有章节缓存"的书单, 让用户仍能点进去离线阅读.
+   * 非离线模式时为 null (不显示).
+   */
+  private localCachedBooks: WereadBook[] | null = null;
+  /**
    * v0.0.6 异步流水线 cache: 完整处理过的章节 HTML
    *   (decode entity → injectUnderlines → sanitize → transformFootnotes → rewriteImage)
    *
@@ -154,6 +174,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     private readonly context: vscode.ExtensionContext,
     private readonly client: WereadClient,
     private readonly auth: AuthService,
+    private readonly chapterCache: ChapterCache,
   ) {
     // ---- 从本地 globalState 恢复最近在读快照 (云端慢, 先有个占位) ----
     const snap = context.globalState.get<LastReadSnapshot>(KEY_LAST_READ);
@@ -316,6 +337,11 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   }
 
   /** 命令: 打开某本书并切到阅读 tab */
+  /** QuickPick 下钻点击章节时, 外部可预埋待定位的 chapterUid, 打开书后 loadBookInternal 消费它 */
+  public setPendingChapterUid(uid: number | undefined): void {
+    this.pendingRestoreChapterUid = uid;
+  }
+
   public async openBook(book: WereadBook): Promise<void> {
     if (!book?.bookId) return;
     if (!this.view) {
@@ -331,9 +357,10 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     void this.context.globalState.update(KEY_TAB, this.tab);
 
     // 打开新书时:
+    //   - 如果外部通过 setPendingChapterUid 指定了目标章节 → 保留它
     //   - 如果是本地快照里的同一本书 → 用快照 chapterUid 定位
     //   - 否则 → 从云端 getProgress 拉真实进度定位
-    if (this.currentBook?.bookId !== book.bookId) {
+    if (this.currentBook?.bookId !== book.bookId && this.pendingRestoreChapterUid === undefined) {
       this.pendingRestoreChapterUid = undefined;
     }
     await this.loadBookInternal(book);
@@ -355,6 +382,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     this.pendingShelfLoad = false;
     this.shelfLoading = true;
     this.shelfError = null;
+    this.localCachedBooks = null;
     this.render();
     try {
       const shelf = await this.client.getBookshelf();
@@ -376,6 +404,27 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       this.shelfError = e instanceof Error ? e.message : String(e);
       this.books = [];
       this.archives = [];
+
+      // cookie 失效时书架接口拿不到数据, 但本地可能有章节缓存 — 从 ChapterCache
+      // 重建一份"能离线读"的书单, 让用户不至于连入口都找不到.
+      console.log(`[weread-vscode] 书架加载失败, 尝试从本地缓存重建书单: ${this.shelfError}`);
+      try {
+        const cachedList = await this.chapterCache.listAll();
+        if (cachedList.length > 0) {
+          this.localCachedBooks = cachedList
+            .filter((c) => c.chapters.length > 0)
+            .map((c) => ({
+              bookId: c.bookId,
+              title: c.bookTitle ?? c.bookId,
+              author: c.author,
+            }));
+          console.log(
+            `[weread-vscode] 本地缓存重建书单: ${this.localCachedBooks.length} 本`,
+          );
+        }
+      } catch {
+        this.localCachedBooks = null;
+      }
     } finally {
       this.shelfLoading = false;
       this.render();
@@ -386,11 +435,21 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     if (!this.view) return;
     const token = ++this.loadToken;
     const isBookSwitch = this.currentBook?.bookId !== book.bookId;
+    // 切书时取消上一本书的后台预拉 — 避免新书加载和老书 prefetch 抢同一个 cookie 通道,
+    // 后者还可能因 cookie 续命被并发挤崩, 在主流程里制造假性失败.
+    if (isBookSwitch) {
+      this.chapterCache.cancelAll();
+    }
     this.currentBook = book;
     this.currentChapters = [];
     this.currentChapterIdx = -1;
     this.chapterFetch = null;
     this.chapterLoading = true;
+    // 进入一本新书时, 默认假设在线; 真正失败再切回 offline
+    if (isBookSwitch) {
+      this.isOfflineMode = false;
+      this.cachedChapterUids = new Set();
+    }
     // 切到一本新书时, 旧的社交内容也要立刻清空, 避免抽屉里露出上一本书的内容
     if (isBookSwitch) {
       this.currentChapterReviews = [];
@@ -405,48 +464,123 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     const localChapterUid = this.pendingRestoreChapterUid;
     this.pendingRestoreChapterUid = undefined;
 
-    try {
-      // 并行拉: 详情、章节目录、云端进度。三者无依赖, 并行最快。
-      const [info, chapters, cloudProgress] = await Promise.all([
-        this.client.getBookInfo(book.bookId).catch(() => null),
-        this.client.getChapters(book.bookId),
-        this.client.getBookProgress(book.bookId),
-      ]);
-      if (token !== this.loadToken) return;
-      if (info) {
-        this.currentBook = { ...this.currentBook, ...info };
-      }
-      this.currentChapters = chapters;
+    // 三个接口各自 catch, 而不是统一一个 try — 这样 cookie 失效时只要 getChapters 拿到了
+    // (或能离线兜底), info/progress 失败都不影响阅读. 之前的做法是 await Promise.all,
+    // 任一 reject 整个 try 抛错, 用户即使有本地缓存也看不了, 这是离线模式的核心缺陷.
+    const [info, chaptersOrErr, cloudProgress] = await Promise.all([
+      this.client.getBookInfo(book.bookId).catch(() => null),
+      this.client.getChapters(book.bookId).catch((e: unknown) => e as Error),
+      this.client.getBookProgress(book.bookId).catch(() => null),
+    ]);
+    if (token !== this.loadToken) return;
+    if (info) {
+      this.currentBook = { ...this.currentBook, ...info };
+    }
 
-      // 章节定位优先级: 云端 getProgress > 本地快照 > 第一章
-      // (云端优先以保证多端互通: 在手机/网页阅读后, VSCode 打开能跳到最新位置)
-      const targetUid = cloudProgress?.chapterUid ?? localChapterUid;
-      let idx = 0;
-      if (targetUid !== undefined) {
-        const found = chapters.findIndex((c) => c.chapterUid === targetUid);
+    let chapters: WereadChapter[] | null = null;
+    let chaptersErr: Error | null = null;
+    if (Array.isArray(chaptersOrErr)) {
+      chapters = chaptersOrErr;
+    } else {
+      chaptersErr = chaptersOrErr as Error;
+    }
+
+    // ===== 在线路径: getChapters 成功 =====
+    if (chapters) {
+      try {
+        this.currentChapters = chapters;
+        this.isOfflineMode = false;
+        this.cachedChapterUids = new Set();
+
+        // 章节定位优先级: 云端 getProgress > 本地快照 > 第一章
+        // (云端优先以保证多端互通: 在手机/网页阅读后, VSCode 打开能跳到最新位置)
+        const targetUid = cloudProgress?.chapterUid ?? localChapterUid;
+        let idx = 0;
+        if (targetUid !== undefined) {
+          const found = chapters.findIndex((c) => c.chapterUid === targetUid);
+          if (found >= 0) idx = found;
+        }
+        this.currentChapterIdx = chapters.length > 0 ? idx : -1;
+
+        this.persistLastReadSnapshot();
+        // 全书书评只跟 bookId 走, 不跟着章节切换, 这里 fire-and-forget
+        if (isBookSwitch) {
+          void this.loadBookReviews(book.bookId);
+        }
+        await this.loadCurrentChapter(token);
+      } catch (e) {
+        if (token !== this.loadToken) return;
+        this.chapterLoading = false;
+        this.chapterFetch = {
+          html: null,
+          style: null,
+          content: null,
+          format: null,
+          diagnostics: e instanceof Error ? e.message : String(e),
+          fallbackUrl: getBookReaderUrl(book.bookId),
+        };
+        this.render();
+      }
+      return;
+    }
+
+    // ===== 离线路径: getChapters 失败, 尝试从 ChapterCache 重建章节列表 =====
+    // 多发于 cookie 过期 / wr_rt 已死的场景. 只要本书 _meta.json 里有 chapterOrder
+    // 快照 (≥ 一次成功 put 过), 就能离线读已缓存的章节.
+    console.log(
+      `[weread-vscode] getChapters 失败, 尝试离线模式: ${chaptersErr?.message ?? 'unknown'}`,
+    );
+    const offline = await this.chapterCache
+      .loadOfflineChapters(book.bookId)
+      .catch(() => null);
+    if (token !== this.loadToken) return;
+
+    if (offline && offline.length > 0) {
+      this.currentChapters = offline;
+      this.isOfflineMode = true;
+      this.cachedChapterUids = await this.chapterCache
+        .listCachedChapterUids(book.bookId)
+        .catch(() => new Set<string>());
+      if (token !== this.loadToken) return;
+
+      // 定位: 本地快照 uid → 第一个有缓存的章节 → 0
+      let idx = -1;
+      if (localChapterUid !== undefined) {
+        const found = offline.findIndex(
+          (c) => String(c.chapterUid) === String(localChapterUid),
+        );
         if (found >= 0) idx = found;
       }
-      this.currentChapterIdx = chapters.length > 0 ? idx : -1;
-
-      this.persistLastReadSnapshot();
-      // 全书书评只跟 bookId 走, 不跟着章节切换, 这里 fire-and-forget
-      if (isBookSwitch) {
-        void this.loadBookReviews(book.bookId);
+      if (idx < 0) {
+        // 找不到上次读的章节 → 跳到第一个有缓存的章节, 避免开门就报"未缓存"
+        idx = offline.findIndex((c) =>
+          this.cachedChapterUids.has(String(c.chapterUid)),
+        );
+        if (idx < 0) idx = 0;
       }
+      this.currentChapterIdx = idx;
+
+      console.log(
+        `[weread-vscode] 已进入离线模式: book=${book.bookId} 章节总数=${offline.length} 已缓存=${this.cachedChapterUids.size} 起始 idx=${idx}`,
+      );
+      // 离线模式下: 不持久化进度 (避免污染), 不拉社交内容 (反正也拉不到), 直接进章节
       await this.loadCurrentChapter(token);
-    } catch (e) {
-      if (token !== this.loadToken) return;
-      this.chapterLoading = false;
-      this.chapterFetch = {
-        html: null,
-        style: null,
-        content: null,
-        format: null,
-        diagnostics: e instanceof Error ? e.message : String(e),
-        fallbackUrl: getBookReaderUrl(book.bookId),
-      };
-      this.render();
+      return;
     }
+
+    // ===== 兜底: 拿不到目录, 也没离线缓存 — 显示原报错卡片 =====
+    this.chapterLoading = false;
+    this.chapterFetch = {
+      html: null,
+      style: null,
+      content: null,
+      format: null,
+      diagnostics: chaptersErr
+        ? chaptersErr.message
+        : '获取章节目录失败 (无错误详情)',
+      fallbackUrl: getBookReaderUrl(book.bookId),
+    };
+    this.render();
   }
 
   private async loadCurrentChapter(externalToken?: number): Promise<void> {
@@ -469,8 +603,52 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     this.preparedChapterHtml = null;
     this.preparedChapterUid = null;
     this.render();
+
+    const bookId = this.currentBook.bookId;
+    const chapterUid = chapter.chapterUid;
+
     try {
-      const res = await this.client.fetchChapterContent(this.currentBook.bookId, chapter.chapterUid);
+      // 1. 先查本地缓存. 命中后跳过 fetch, 直接渲染 — 这是预缓存机制的核心收益:
+      //    即便 cookie 已过期, 只要章节之前 prefetch 过, 用户依然能正常往下看.
+      const cached = await this.chapterCache.get(bookId, chapterUid).catch(() => null);
+      if (token !== this.loadToken) return;
+      if (cached) {
+        console.log(
+          `[weread-vscode] 章节命中缓存: book=${bookId} ch=${chapterUid} (${(chapter.title ?? '').slice(0, 24)})`,
+        );
+        // 缓存里存的是原始 html, 走与网络路径一致的预处理: 反解 entity escape.
+        // 注意 fallbackUrl 没存, 重新拼一个 (开浏览器看时用).
+        if (cached.html) {
+          cached.html = decodeEntityEscapedHtmlIfNeeded(cached.html);
+        }
+        if (!cached.fallbackUrl) {
+          cached.fallbackUrl = getBookReaderUrl(bookId);
+        }
+        this.chapterFetch = cached;
+        return;
+      }
+
+      // 1.5. 离线模式 + 缓存未命中: 直接给"本章未缓存"友好提示, 不打 fetchChapterContent —
+      //      此时 cookie 必失效, fetch 只会再卡几秒 timeout 又走到同样的报错卡片, 没意义.
+      if (this.isOfflineMode) {
+        console.log(
+          `[weread-vscode] 离线模式下章节未缓存: book=${bookId} ch=${chapterUid} — 跳过 fetch`,
+        );
+        this.chapterFetch = {
+          html: null,
+          style: null,
+          content: null,
+          format: null,
+          diagnostics:
+            '当前处于离线模式 (Cookie 已失效), 本章未预缓存到本地. ' +
+            '请重新导入 Cookie 后再试, 或在浏览器中打开.',
+          fallbackUrl: getBookReaderUrl(bookId),
+        };
+        return;
+      }
+
+      // 2. 缓存未命中: 走网络
+      const res = await this.client.fetchChapterContent(bookId, chapterUid);
       if (token !== this.loadToken) return;
       // 章节 HTML 预处理:
       //   1) entity-escape 反解: 某些章节 HTML 是整段 `&lt;p&gt;...` 包成一坨,
@@ -487,6 +665,17 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
         res.html = decodeEntityEscapedHtmlIfNeeded(res.html);
       }
       this.chapterFetch = res;
+
+      // 3. 写回缓存 (fire-and-forget, 空内容会被 ChapterCache silently 拒绝)
+      //    带上 meta — 让命令面板下钻可视化时显示书名/作者/章节标题
+      void this.chapterCache.put(bookId, chapterUid, res, {
+        bookTitle: this.currentBook?.title,
+        author: this.currentBook?.author,
+        chapterTitle: chapter.title,
+        // 顺手把"全书目录顺序快照"同步到 _meta.json — 命令面板下钻就能按真实章节顺序展示,
+        // 而不是 mtime 倒序 / chapterUid 数字排序 (后者在 EPUB 场景常乱号)
+        chapterOrder: this.currentChapters.map((c) => String(c.chapterUid)),
+      });
     } catch (e) {
       if (token !== this.loadToken) return;
       this.chapterFetch = {
@@ -495,16 +684,55 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
         content: null,
         format: null,
         diagnostics: e instanceof Error ? e.message : String(e),
-        fallbackUrl: getBookReaderUrl(this.currentBook.bookId),
+        fallbackUrl: getBookReaderUrl(bookId),
       };
     } finally {
       if (token === this.loadToken) {
         this.chapterLoading = false;
         this.render();
-        // 正文渲染完后再异步拉社交内容, 不阻塞主流程
-        void this.loadChapterReviews(this.currentBook.bookId, chapter.chapterUid);
+        // 离线模式: cookie 已死, 拉社交 / 预拉都是徒劳, 全部跳过避免无意义的请求噪音
+        if (!this.isOfflineMode) {
+          // 正文渲染完后再异步拉社交内容, 不阻塞主流程
+          void this.loadChapterReviews(bookId, chapterUid);
+          // 触发后台预拉: 让用户翻下一章时直接命中缓存, 也抗 cookie 突然过期.
+          // 只有当前章拿到了正文才预拉 — 否则说明此时 cookie 可能已死, 再拉只是徒劳.
+          if (this.chapterFetch && (this.chapterFetch.html || this.chapterFetch.content)) {
+            this.schedulePrefetchAround(bookId, this.currentChapterIdx);
+          }
+        }
       }
     }
+  }
+
+  /**
+   * 计算预拉数量并 fire-and-forget 启动 ChapterCache.prefetchAround.
+   *
+   * 范围从 vscode 配置读, clamp 到合理上限避免用户误配 999 把磁盘塞满.
+   * 关闭开关 (weread.chapterPrefetch.enabled = false) 时直接跳过.
+   */
+  private schedulePrefetchAround(bookId: string, currentIdx: number): void {
+    const cfg = vscode.workspace.getConfiguration('weread.chapterPrefetch');
+    const enabled = cfg.get<boolean>('enabled', true);
+    if (!enabled) return;
+    // ahead: 默认 10, 上限 50. behind: 默认 1, 上限 10. 都至少 0.
+    const ahead = Math.max(0, Math.min(50, cfg.get<number>('ahead', 10) | 0));
+    const behind = Math.max(0, Math.min(10, cfg.get<number>('behind', 1) | 0));
+    if (ahead === 0 && behind === 0) return;
+    // 不 await, 失败 silent (内部已经 console.log)
+    void this.chapterCache.prefetchAround(
+      this.client,
+      bookId,
+      this.currentChapters,
+      currentIdx,
+      ahead,
+      behind,
+      // 带上 meta — prefetch 写章节时同步刷新 _meta.json, 可视化命令能显示书名/章节标题
+      {
+        bookTitle: this.currentBook?.title,
+        author: this.currentBook?.author,
+        chapterOrder: this.currentChapters.map((c) => String(c.chapterUid)),
+      },
+    );
   }
 
   /**
@@ -746,7 +974,13 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       }
       case 'openBook': {
         const bookId = (msg.payload as { bookId?: string })?.bookId;
-        const book = this.books.find((b) => b.bookId === bookId);
+        if (!bookId) break;
+        // 优先在线书架搜索, 找不到再从本地缓存书单兜底 — 这样 cookie 失效时
+        // 用户也能从"本地缓存"区域点开书进入离线模式.
+        let book = this.books.find((b) => b.bookId === bookId);
+        if (!book && this.localCachedBooks) {
+          book = this.localCachedBooks.find((b) => b.bookId === bookId);
+        }
         if (book) {
           void this.openBook(book);
         }
@@ -774,6 +1008,12 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       }
       case 'retry':
         void this.loadCurrentChapter();
+        break;
+      case 'showChapterCache':
+        // footer 缓存按钮 → 转发到命令面板下钻 QuickPick.
+        // 用 executeCommand 而非直接 inline 实现, 是为了与命令面板 / 视图标题栏入口走完全同一份代码,
+        // 命令逻辑改动时不必担心 webview 这边漏改.
+        void vscode.commands.executeCommand('weread.chapterCacheStats');
         break;
       case 'refreshShelf':
         void this.refreshShelf();
@@ -998,6 +1238,30 @@ ${prefsBlock}
       return `<main class="content shelf"><div class="hint">${this.skeletonHtml()}</div></main>`;
     }
     if (this.shelfError) {
+      // cookie 失效时, 书架接口失败但本地有章节缓存 — 展示一个"本地缓存"书单入口,
+      // 让用户能直接点进去离线阅读, 而不是看到一个"加载失败"卡片就放弃.
+      const localBooks = this.localCachedBooks;
+      if (localBooks && localBooks.length > 0) {
+        const localSection = `
+          <section class="shelf-section open">
+            <button class="shelf-section-title" data-toggle="local-cache">
+              <span class="arrow">▾</span>
+              <span class="name">本地缓存 (${localBooks.length} 本)</span>
+              <span class="count">${localBooks.length}</span>
+            </button>
+            <div class="book-list">
+              ${localBooks.map((b) => this.bookCardHtml(b)).join('')}
+            </div>
+          </section>`;
+        return `<main class="content shelf">
+          <div class="offline-shelf-notice">
+            <span class="osn-icon">⚠️</span>
+            <span class="osn-text">Cookie 可能已失效, 书架无法刷新. 以下为本地已缓存的书籍, 点击可离线阅读.</span>
+            <button class="ghost" data-act="refreshShelf">重试刷新</button>
+          </div>
+          ${localSection}
+        </main>`;
+      }
       return `<main class="content shelf">
         <div class="error-card">
           <h4>加载失败</h4>
@@ -1197,13 +1461,26 @@ ${prefsBlock}
         : '';
       articleHtml = `<article class="reading">${titleBlock}${paragraphs}</article>`;
     } else if (this.chapterFetch) {
+      // 区分两种"看不了": 离线模式下文案要明确指引到"重新登录", 不要让用户以为是付费/接口挂了.
+      // 在线模式还是原文案 (付费/试读/接口) — 这层判断比加 if/else 嵌套更紧凑.
+      const isOffline = this.isOfflineMode;
+      const title = isOffline ? '本章未缓存到本地' : '未能在 VSCode 内获取本章内容';
+      const subtitle = isOffline
+        ? '当前处于离线模式 (Cookie 已失效), 仅可读已预缓存的章节. 请重新导入 Cookie, 或在浏览器中打开.'
+        : '可能是付费章节、试读限制或接口变更, 您可以在浏览器中阅读。';
+      const primaryBtn = isOffline
+        ? `<button class="primary" data-act="login">重新登录</button>`
+        : `<button class="primary" data-act="openInBrowser">在浏览器打开</button>`;
+      const secondaryBtn = isOffline
+        ? `<button class="ghost" data-act="openInBrowser">在浏览器打开</button>`
+        : `<button class="ghost" data-act="retry">重试</button>`;
       articleHtml = `
         <div class="reading unavailable">
-          <h4>未能在 VSCode 内获取本章内容</h4>
-          <p class="muted">可能是付费章节、试读限制或接口变更, 您可以在浏览器中阅读。</p>
+          <h4>${escapeHtml(title)}</h4>
+          <p class="muted">${escapeHtml(subtitle)}</p>
           <div class="actions">
-            <button class="primary" data-act="openInBrowser">在浏览器打开</button>
-            <button class="ghost" data-act="retry">重试</button>
+            ${primaryBtn}
+            ${secondaryBtn}
           </div>
           <details class="diag">
             <summary>诊断信息</summary>
@@ -1253,12 +1530,20 @@ ${prefsBlock}
           <span class="ft-icon">Aa</span>
         </button>`;
 
+    // 章节缓存浏览触发器: 走 data-act 让 webview 顶部那段 "icon-btn 通用动作分发" 自动 post,
+    // extension 端 handleMessage case 'showChapterCache' 转发到 weread.chapterCacheStats 命令.
+    // 这样阅读时不必抬头到侧栏标题栏, footer 这一行就能进缓存可视化面板.
+    const cacheFooterBtn = `<button class="toc-trigger footer-mini" data-act="showChapterCache" title="查看已缓存章节 (按书/章节下钻浏览, 可就地清理)">
+          <span class="ft-icon">🗂</span>
+        </button>`;
+
     const footer = `
       <footer class="reader-footer">
         <button class="ghost" data-act="prev" ${prevDisabled ? 'disabled' : ''}>◀ 上一章</button>
         <div class="footer-mid-group">
           ${tocFooterBtn}
           ${settingsFooterBtn}
+          ${cacheFooterBtn}
           ${reviewsFooterBtn}
         </div>
         <button class="ghost" data-act="next" ${nextDisabled ? 'disabled' : ''}>下一章 ▶</button>
@@ -1299,7 +1584,17 @@ ${prefsBlock}
     const prefsMetaJson = JSON.stringify(prefsMeta).replace(/</g, '\\u003c');
     const prefsMetaScript = `<script id="weread-reading-prefs-meta" type="application/json">${prefsMetaJson}</script>`;
 
-    return `<main class="content reader"><div class="reader-body">${articleHtml}</div>${footer}${tocDrawer}${reviewsDrawer}${inlinePopover}${settingsPopover}${reviewsDataScript}${prefsMetaScript}</main>`;
+    // 离线模式 banner — 顶部一行黄色提示, 让用户清楚知道当前是 offline + 解决路径.
+    // 不用模态弹窗 (太打断), 也不用 toast (会消失), 常驻一条 banner 最合适.
+    const offlineBanner = this.isOfflineMode
+      ? `<div class="reader-offline-banner" role="alert">
+          <span class="ob-icon">⚠️</span>
+          <span class="ob-text">已切换到<b>离线模式</b> (Cookie 已失效) — 仅可读已缓存的章节</span>
+          <button class="ob-btn" data-act="login" title="重新导入 Cookie">重新登录</button>
+        </div>`
+      : '';
+
+    return `<main class="content reader">${offlineBanner}<div class="reader-body">${articleHtml}</div>${footer}${tocDrawer}${reviewsDrawer}${inlinePopover}${settingsPopover}${reviewsDataScript}${prefsMetaScript}</main>`;
   }
 
   /**
@@ -1392,12 +1687,29 @@ ${prefsBlock}
    * - 顶部输入框做即时过滤(纯 client-side)
    */
   private buildTocDrawerHtml(chapters: WereadChapter[], activeIdx: number): string {
+    const cacheSet = this.cachedChapterUids;
+    // 只在有缓存数据时才显示缓存标记: 在线模式只显示 ✓ (已缓存), 离线模式 ✓/○ 都显示.
+    const showCache = cacheSet.size > 0;
+    const isOffline = this.isOfflineMode;
+
     const items = chapters
       .map((c, i) => {
         const lvl = Math.max(0, Math.min(4, (c.level ?? 1) - 1));
         const isActive = i === activeIdx;
         const title = c.title || `第 ${i + 1} 章`;
-        const subBadge = c.paid ? `<span class="toc-badge paid">付费</span>` : '';
+        const uid = String(c.chapterUid);
+        const cached = cacheSet.has(uid);
+
+        let subBadge = '';
+        if (c.paid) subBadge += `<span class="toc-badge paid">付费</span>`;
+        if (showCache) {
+          if (cached) {
+            subBadge += `<span class="toc-cache-badge cached" title="已缓存本机">✓</span>`;
+          } else if (isOffline) {
+            subBadge += `<span class="toc-cache-badge uncached" title="未缓存 — 离线模式不可读">○</span>`;
+          }
+        }
+
         return `
           <li class="toc-item ${isActive ? 'active' : ''}" data-toc-idx="${i}" data-toc-key="${escapeAttr(
           title.toLowerCase(),
@@ -1718,6 +2030,28 @@ ${prefsBlock}
         background: rgba(60, 180, 120, .25); color: rgb(60,180,120);
       }
 
+      /* 书架离线兜底提示: cookie 失效时, 书架接口失败但本地有章节缓存,
+       * 展示一条 warning banner + 可点击的本地书单, 让用户仍能进入离线阅读. */
+      .offline-shelf-notice {
+        display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+        margin: 8px 6px 2px; padding: 8px 10px;
+        background: var(--vscode-inputValidation-warningBackground, rgba(220, 165, 60, .12));
+        color: var(--vscode-inputValidation-warningForeground, var(--vscode-foreground));
+        border: 1px solid var(--vscode-inputValidation-warningBorder, rgba(220, 165, 60, .35));
+        border-radius: 6px;
+        font-size: 11.5px; line-height: 1.4;
+      }
+      .offline-shelf-notice .osn-icon {
+        flex-shrink: 0; font-size: 14px;
+      }
+      .offline-shelf-notice .osn-text {
+        flex: 1; min-width: 0;
+      }
+      .offline-shelf-notice button {
+        flex-shrink: 0;
+        font-size: 11px; padding: 3px 10px;
+      }
+
       /* ====== 阅读器 ====== */
       .reader {
         display: flex; flex-direction: column;
@@ -1862,6 +2196,25 @@ ${prefsBlock}
         flex-shrink: 0;
         font-size: 9.5px; padding: 0 5px; border-radius: 6px;
         background: rgba(220, 165, 60, .25); color: rgb(210, 140, 30);
+      }
+      /* 缓存标记徽章: 在线模式只显示 ✓ (提示哪些已缓存),
+       * 离线模式 ✓/○ 都显示 (告诉用户哪些能翻、哪些会"未缓存").
+       * 颜色: ✓=绿色(可读), ○=灰色(不可读) — 不用红色避免吓到用户 */
+      .toc-cache-badge {
+        flex-shrink: 0;
+        display: inline-flex; align-items: center; justify-content: center;
+        width: 15px; height: 15px;
+        font-size: 10px; line-height: 1;
+        border-radius: 50%;
+        font-weight: 600;
+      }
+      .toc-cache-badge.cached {
+        background: rgba(60, 180, 120, .22);
+        color: rgb(60, 180, 120);
+      }
+      .toc-cache-badge.uncached {
+        background: rgba(127, 127, 127, .18);
+        color: var(--vscode-descriptionForeground);
       }
       .toc-item[data-level="0"] .toc-name { font-weight: 600; }
       .toc-item:hover { background: var(--vscode-list-hoverBackground); }
@@ -2115,6 +2468,45 @@ ${prefsBlock}
         gap: 8px; padding: 6px 8px;
         border-top: 1px solid var(--vscode-panel-border);
         background: var(--vscode-sideBarSectionHeader-background, transparent);
+      }
+
+      /* ====== 离线模式 banner ======
+       * cookie 失效时 loadBookInternal 走 ChapterCache.loadOfflineChapters 兜底,
+       * 用户能继续读已缓存的章节. 顶部加一条 warning banner 让用户清楚状态 + 给"重新登录"按钮.
+       * 用 vscode 内置的 inputValidation.warning 色彩, 跨主题都协调; flex 一行不换行, 不挤正文.
+       */
+      .reader-offline-banner {
+        flex-shrink: 0;
+        display: flex; align-items: center; gap: 8px;
+        padding: 6px 10px;
+        background: var(--vscode-inputValidation-warningBackground, rgba(220, 165, 60, .15));
+        color: var(--vscode-inputValidation-warningForeground, var(--vscode-foreground));
+        border-bottom: 1px solid var(--vscode-inputValidation-warningBorder, rgba(220, 165, 60, .5));
+        font-size: 11.5px; line-height: 1.4;
+      }
+      .reader-offline-banner .ob-icon {
+        flex-shrink: 0; font-size: 13px;
+      }
+      .reader-offline-banner .ob-text {
+        flex: 1; min-width: 0;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }
+      .reader-offline-banner .ob-text b {
+        font-weight: 600;
+      }
+      .reader-offline-banner .ob-btn {
+        flex-shrink: 0;
+        padding: 2px 10px;
+        font-size: 11px;
+        background: var(--vscode-button-background);
+        color: var(--vscode-button-foreground);
+        border: 1px solid transparent;
+        border-radius: 3px;
+        cursor: pointer;
+        transition: background .12s ease;
+      }
+      .reader-offline-banner .ob-btn:hover {
+        background: var(--vscode-button-hoverBackground, var(--vscode-button-background));
       }
       .reader-footer .footer-mid {
         flex: 1; text-align: center; font-size: 10.5px;
@@ -3127,6 +3519,106 @@ ${prefsBlock}
             // 让 extension 回包后 render 整页刷新拿默认值 (popover 自身的 .active / 数值显示也会刷)
             closePopover();
             return;
+          }
+        });
+      })();
+
+      // ===== 阅读 tab 键盘快捷键 =====
+      //
+      // 用键盘当 "翻书手", 视觉焦点不离正文:
+      //   ↓ / PageDown / Space  — 向下翻一页 (留 60px 余量, 让上一屏底部 ~3 行内容
+      //                            继续出现在新视窗顶部, 类似纸书 "上一页底过渡到这页头"
+      //                            的承接感, 避免读者刚看到关键句结尾就被翻走)
+      //   ↑ / PageUp            — 向上翻一页
+      //   ←                     — 上一章 (复用现有 post('prev'))
+      //   →                     — 下一章 (复用现有 post('next'))
+      //   Home / End            — 跳到本章首 / 尾
+      //
+      // 不接管的场景 (避免劫持用户其它意图):
+      //   1) 焦点在 input / textarea / contenteditable (如 toc 搜索框) — 不能截方向键
+      //   2) toc / reviews 抽屉 或 settings / inline popover 打开中 — 浮层操作优先
+      //   3) 带 Cmd/Ctrl/Alt 修饰键 — 留给系统快捷键 (例如 Cmd+← 跳行首, Alt+→ 浏览器前进)
+      //   4) reader-body 不存在 — 即不在 "在读" tab. 整段 setup 直接 return 不绑监听
+      //
+      // 焦点说明:
+      //   webview 的 keydown 只有在 "webview 整体获得焦点" 后才会触发 (用户点击侧栏
+      //   任意位置即可, 不必专门点正文). 这是 VSCode webview 的标准行为, 不强制 focus
+      //   是为了不抢走用户在编辑器/终端的焦点.
+      (function setupReaderShortcuts() {
+        const readerBody = document.querySelector('.reader-body');
+        if (!readerBody) return; // 非 reader tab: 不绑
+
+        const PAGE_OVERLAP_PX = 60; // 留余量, 上一屏底部 ~3 行还能瞄到
+
+        // 让 .reader-body 可被键盘 focus (用户点正文区域可获得焦点, 体验更顺;
+        // 不主动 focus 以免抢用户编辑器/终端的焦点)
+        if (!readerBody.hasAttribute('tabindex')) {
+          readerBody.setAttribute('tabindex', '-1');
+        }
+
+        function isTypingTarget(t) {
+          if (!t) return false;
+          const tag = (t.tagName || '').toLowerCase();
+          if (tag === 'input' || tag === 'textarea' || tag === 'select') return true;
+          if (t.isContentEditable) return true;
+          return false;
+        }
+        function anyDrawerOpen() {
+          return !!document.querySelector('#toc-drawer.open, #reviews-drawer.open');
+        }
+        function anyPopoverOpen() {
+          const sp = document.getElementById('settings-popover');
+          const ip = document.getElementById('weread-popover');
+          return !!((sp && !sp.hidden) || (ip && !ip.hidden));
+        }
+
+        function pageBy(direction) {
+          const h = readerBody.clientHeight;
+          if (h <= 0) return;
+          // 余量后步长; 兜底: 防止窗口被压得极矮时步长接近 0 (取 70% 高度作为下限)
+          const step = Math.max(h - PAGE_OVERLAP_PX, Math.floor(h * 0.7));
+          try {
+            readerBody.scrollBy({ top: direction * step, behavior: 'smooth' });
+          } catch (e) {
+            readerBody.scrollBy(0, direction * step);
+          }
+        }
+
+        document.addEventListener('keydown', function(e) {
+          if (e.ctrlKey || e.metaKey || e.altKey) return;
+          if (isTypingTarget(e.target)) return;
+          if (anyDrawerOpen() || anyPopoverOpen()) return;
+
+          switch (e.key) {
+            case 'ArrowDown':
+            case 'PageDown':
+            case ' ': // Space 翻页 — 跟纸书 "按一下空格往下翻" 的肌肉记忆一致
+              e.preventDefault();
+              pageBy(1);
+              break;
+            case 'ArrowUp':
+            case 'PageUp':
+              e.preventDefault();
+              pageBy(-1);
+              break;
+            case 'ArrowLeft':
+              e.preventDefault();
+              post('prev');
+              break;
+            case 'ArrowRight':
+              e.preventDefault();
+              post('next');
+              break;
+            case 'Home':
+              e.preventDefault();
+              try { readerBody.scrollTo({ top: 0, behavior: 'smooth' }); }
+              catch (err) { readerBody.scrollTop = 0; }
+              break;
+            case 'End':
+              e.preventDefault();
+              try { readerBody.scrollTo({ top: readerBody.scrollHeight, behavior: 'smooth' }); }
+              catch (err) { readerBody.scrollTop = readerBody.scrollHeight; }
+              break;
           }
         });
       })();
