@@ -21,13 +21,27 @@ export class AuthService {
   private readonly _onDidChangeLoginState = new vscode.EventEmitter<boolean>();
   public readonly onDidChangeLoginState = this._onDidChangeLoginState.event;
 
-  /** "登录已失效"通知节流：避免一次会话里同时多个 401 弹多个气泡 */
-  private expiredPromptInFlight = false;
-  private lastExpiredPromptAt = 0;
+  /** "登录失效" 日志节流: 避免接口连环失败时 console 刷屏 */
+  private lastExpiredLogAt = 0;
 
-  /** "renewal 彻底失效"通知节流, 独立于 notifyExpired (因为文案/动作不同) */
-  private renewalDeadPromptInFlight = false;
-  private lastRenewalDeadPromptAt = 0;
+  /** "renewal 彻底失效" 日志节流, 独立于 lastExpiredLogAt (失效语义不同, 排障时分开看更清晰) */
+  private lastRenewalDeadLogAt = 0;
+
+  /**
+   * 已观察到 cookie 失效 (服务器返回 401/403/errcode -2010/-2012/-2013,
+   * 或 renewal 接口被判定 dead).
+   *
+   * 用于在 webview 内被动展示一条 "cookie 已失效, 点这里重新导入" 的横幅 —
+   * 走 "被动告示", 不再弹 toast/modal (用户明确说过弹窗太烦)。
+   *
+   * 这个标记代表 "上一次请求时服务器拒绝了我", 不能 100% 等价 "现在 cookie 一定无效"
+   * (server 可能临时抖动). 用户重新导入或主动 logout 时会清除。
+   */
+  private cookieKnownInvalid = false;
+
+  /** cookie 有效性变化事件 (true = 失效, false = 已恢复, 给视图刷新 banner 用) */
+  private readonly _onDidChangeCookieValidity = new vscode.EventEmitter<boolean>();
+  public readonly onDidChangeCookieValidity = this._onDidChangeCookieValidity.event;
 
   constructor(private readonly context: vscode.ExtensionContext) {}
 
@@ -39,6 +53,14 @@ export class AuthService {
   /** 当前是否已登录（仅判断是否存在 Cookie，不验证有效性） */
   public isLoggedIn(): boolean {
     return Boolean(this.cachedCookie && this.cachedCookie.trim().length > 0);
+  }
+
+  /**
+   * 是否处于 "已登录但 cookie 被 server 拒" 的状态。
+   * 未登录时永远返回 false (没登录就没"失效"一说, 走未登录态 UI 即可)。
+   */
+  public isCookieKnownInvalid(): boolean {
+    return this.cookieKnownInvalid && this.isLoggedIn();
   }
 
   /** 获取原始 Cookie 字符串（用于 HTTP 请求头） */
@@ -105,6 +127,9 @@ export class AuthService {
 
     await this.context.secrets.store(AuthService.SECRET_KEY, trimmed);
     this.cachedCookie = trimmed;
+    // 新导入 cookie 默认认为有效, 让 banner 立刻消失;
+    // 如果新 cookie 其实也无效, interceptor / renewal 下次失败时会再标记回来。
+    this.markCookieValid();
     this._onDidChangeLoginState.fire(true);
     const hint = jar['wr_rt'] ? '登录成功' : '已保存（但缺 wr_rt，预计几分钟后失效）';
     vscode.window.showInformationMessage(`微信读书：Cookie 已保存，${hint}`);
@@ -115,6 +140,7 @@ export class AuthService {
   public async logout(): Promise<void> {
     await this.context.secrets.delete(AuthService.SECRET_KEY);
     this.cachedCookie = undefined;
+    this.markCookieValid();
     this._onDidChangeLoginState.fire(false);
     vscode.window.showInformationMessage('微信读书：已退出登录');
   }
@@ -195,47 +221,40 @@ export class AuthService {
   }
 
   /**
-   * 检测到 Cookie 失效(401/403/errcode -2010/-2012/-2013)时调用,
-   * 给一个非阻塞的提示让用户重新粘贴。
+   * 检测到 Cookie 失效 (401/403/errcode -2010/-2012/-2013) 时调用。
    *
-   * 节流: 5 分钟内最多弹一次, 且并发的多个 401 共享同一个 prompt,
-   * 避免一次性多个请求集中失败时弹一堆相同的气泡。
+   * **完全静默** — 之前会弹 showWarningMessage 让用户重导, 但用户反馈每次都要
+   * 点关闭很烦. 现在改为仅打一条节流日志: 视图层拉不到书架/章节时会显示空态/
+   * 错误态, 用户感知到了再自行通过命令 "微信读书: 导入 Cookie" 重导。
+   *
+   * 接口签名保留 (返回 Promise<void>), 方便 interceptor 继续 `void this.auth.notifyExpired()`
+   * 调用而不需要全局改造。
    */
   public async notifyExpired(): Promise<void> {
-    if (this.expiredPromptInFlight) {
-      return;
+    // 不管节流如何, 状态标记都要打 (banner 不能因为日志节流就漏掉)
+    if (this.isLoggedIn()) {
+      this.markCookieInvalid();
     }
     const now = Date.now();
-    if (now - this.lastExpiredPromptAt < 5 * 60 * 1000) {
+    if (now - this.lastExpiredLogAt < 5 * 60 * 1000) {
       return;
     }
-    this.expiredPromptInFlight = true;
-    this.lastExpiredPromptAt = now;
-    try {
-      const choice = await vscode.window.showWarningMessage(
-        '微信读书：登录已失效，是否重新导入 Cookie？',
-        '重新导入',
-        '稍后',
-      );
-      if (choice === '重新导入') {
-        await vscode.commands.executeCommand('weread.importCookie');
-      }
-    } finally {
-      this.expiredPromptInFlight = false;
-    }
+    this.lastExpiredLogAt = now;
+    console.warn(
+      '[weread-vscode] 检测到 Cookie 失效信号 ' +
+        (this.isLoggedIn()
+          ? '(已登录 cookie 失效, 请通过命令 "微信读书: 导入 Cookie" 重新导入)'
+          : '(未登录)'),
+    );
   }
 
   /**
-   * renewal 接口被 server 判定彻底失效 (errCode=-2013/-12013, 或本地缺 wr_rt)
-   * 时调用。区别于 `notifyExpired`：
+   * renewal 接口被 server 判定彻底失效 (errCode=-2013/-12013, 或本地缺 wr_rt) 时调用。
    *
-   *   - notifyExpired 适用于"wr_skey 暂时性过期"——重新粘贴当前 cookie 可能还能用
-   *   - notifyRenewalDead 适用于"wr_rt 在 server 端被废弃 / 缺失"——
-   *     **必须用户先到浏览器里重新登录** weread.qq.com, 再复制新的 cookie,
-   *     否则即使再复制 100 遍同样的 cookie 也救不回来
-   *
-   * 用 modal 阻塞式弹窗 (而不是 notifyExpired 的非阻塞), 因为这是彻底失效,
-   * 用户不处理的话整个微信读书功能完全不可用, 让消息更醒目一点。
+   * 历史上这里会弹 modal 警告 + 详尽的修复步骤. 但和 notifyExpired 一起被用户反馈
+   * "每次都要点关闭很麻烦", 一律改为静默日志。"续命彻底失败" 的状态会被 client 端
+   * 的 renewalDead 锁记住, 后续不再发徒劳的心跳请求, 视图层也会自然停在错误态,
+   * 用户感知到了再自行重导新 cookie。
    *
    * @param reason
    *   - `missing_wr_rt`  当前 cookie 里就没有 wr_rt
@@ -245,52 +264,36 @@ export class AuthService {
   public async notifyRenewalDead(
     reason: 'missing_wr_rt' | 'auth_failed' | 'auth_expired',
   ): Promise<void> {
-    if (this.renewalDeadPromptInFlight) {
-      return;
+    // 状态标记不走节流, 保证 banner 一旦发现就立刻显示
+    if (this.isLoggedIn()) {
+      this.markCookieInvalid();
     }
     const now = Date.now();
-    if (now - this.lastRenewalDeadPromptAt < 5 * 60 * 1000) {
+    if (now - this.lastRenewalDeadLogAt < 5 * 60 * 1000) {
       return;
     }
-    this.renewalDeadPromptInFlight = true;
-    this.lastRenewalDeadPromptAt = now;
-
-    const headline =
+    this.lastRenewalDeadLogAt = now;
+    const desc =
       reason === 'missing_wr_rt'
-        ? '微信读书 Cookie 缺少 wr_rt（续命凭证）'
+        ? 'Cookie 缺少 wr_rt (续命凭证), 续命接口必败 — 请重新从 Network → Request Headers 复制完整 Cookie 后通过命令 "微信读书: 导入 Cookie" 重导'
         : reason === 'auth_expired'
-          ? '微信读书登录授权已过期 (server 端 wr_rt 失效)'
-          : '微信读书登录已被服务器废弃 (renewal 鉴权失败)';
+          ? '服务器端授权已过期 (errCode=-12013), 当前 cookie 已被 weread 清退 — 请先在浏览器 weread.qq.com 重新登录, 再复制新 cookie 重导'
+          : '服务器拒绝续命请求 (errCode=-2013), 当前 cookie 已被 weread 清退 — 请先在浏览器 weread.qq.com 重新登录, 再复制新 cookie 重导';
+    console.warn(`[weread-vscode] renewal 彻底失效 (${reason}): ${desc}`);
+  }
 
-    const body =
-      reason === 'missing_wr_rt'
-        ? '当前 Cookie 不包含 wr_rt, 续命接口必败 — 几分钟后就完全不可用。\n\n' +
-          '【正确复制方法】\n' +
-          '1. 浏览器登录 weread.qq.com\n' +
-          '2. F12 → Network → 刷新页面 → 点任意 weread 请求\n' +
-          '3. 右侧 Request Headers → Cookie 整条复制\n' +
-          '   (注意: 不要从 Application 面板复制, 那里看不到 HttpOnly 的 wr_rt)'
-        : '服务器拒绝了续命请求 — 说明你的会话已被 weread 主动清退\n' +
-          '(常见原因: 浏览器里点了退出 / 异地登录被踢 / 长期未活跃被回收)。\n\n' +
-          '【必须的操作】\n' +
-          '1. 打开浏览器, 在 weread.qq.com **先退出再重新登录** (重要!)\n' +
-          '2. F12 → Network → 刷新页面 → 点任意 weread 请求\n' +
-          '3. 右侧 Request Headers → Cookie 整条复制\n\n' +
-          '⚠️ 直接再粘贴一遍当前 cookie 是无效的, 因为 server 端已经把这份会话注销了。';
+  /** 内部: 标记 cookie 已失效, 触发 banner 显示 (带变化检测, 避免无谓 fire) */
+  private markCookieInvalid(): void {
+    if (this.cookieKnownInvalid) return;
+    this.cookieKnownInvalid = true;
+    this._onDidChangeCookieValidity.fire(true);
+  }
 
-    try {
-      const choice = await vscode.window.showWarningMessage(
-        `${headline}\n\n${body}`,
-        { modal: true },
-        '我已重登, 导入新 Cookie',
-        '稍后',
-      );
-      if (choice === '我已重登, 导入新 Cookie') {
-        await vscode.commands.executeCommand('weread.importCookie');
-      }
-    } finally {
-      this.renewalDeadPromptInFlight = false;
-    }
+  /** 内部: 清掉 cookie 失效状态, 触发 banner 隐藏 (带变化检测) */
+  private markCookieValid(): void {
+    if (!this.cookieKnownInvalid) return;
+    this.cookieKnownInvalid = false;
+    this._onDidChangeCookieValidity.fire(false);
   }
 
   /** 解析 "k1=v1; k2=v2" 形式的 Cookie 字符串 */
@@ -315,5 +318,6 @@ export class AuthService {
 
   public dispose(): void {
     this._onDidChangeLoginState.dispose();
+    this._onDidChangeCookieValidity.dispose();
   }
 }

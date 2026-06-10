@@ -1,9 +1,30 @@
 # TouchPlus for VSCode
 
-> VSCode 摸鱼套件 — 微信读书 / 知乎推荐流，统一侧边栏，通过粘贴 Cookie 登录。
+> 在 VSCode 侧边栏看书 + 刷推荐流的双模块"摸鱼"套件。微信读书、知乎一个插件搞定，**零跳转、零打扰、零上传**。
 
-[![Version](https://img.shields.io/badge/version-2.0.0-blue.svg)](https://github.com/Weichuandong/weread-vscode/releases)
+[![Version](https://img.shields.io/badge/version-2.0.1-blue.svg)](https://github.com/Weichuandong/weread-vscode/releases)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
+---
+
+## 🌟 为什么选 TouchPlus
+
+> 市面上同类插件不少，但下面这些是 TouchPlus 真正不同的地方。
+
+| 亮点 | 一句话 |
+|---|---|
+| 🧩 **一插双模块** | 微信读书 (Folio) + 知乎 (Curio) 共享同一份代码框架，Activity Bar 一边一个图标，不用装两个插件 |
+| 🪟 **原生侧栏 inline 阅读** | 章节正文直接在 VSCode webview 里渲染，**不开 iframe、不跳浏览器**，看着像在读文档，老板路过零破绽 |
+| 🤫 **零打扰静默 UX** | Cookie 失效不弹 toast / modal，只在 view 顶部挂一条被动 banner，点"重新导入"即可，再也不用一直点关闭弹窗 |
+| 📡 **完整离线能力** | 微信读书章节预缓存层（内存 LRU + 磁盘持久化），翻章自动后台静默预拉后续 N 章，**cookie 过期/断网/飞机上仍能继续看** |
+| ☁️ **真实云端进度同步** | 翻章 / 进度直走微信读书官方接口，与手机端 / 网页端**实时互通**，换设备无缝接续 |
+| 🔐 **隐私优先** | Cookie 通过 VSCode `SecretStorage` 加密存储到系统钥匙串，**从不上传任何第三方服务器**，所有 HTTP 直连原站 |
+| 🎨 **5 维排版自定义** | 字号 / 行距 / 段距 / 页宽 / 字体五个维度共 20 档，CSS 变量驱动**零闪烁**实时切换，每个人都能找到自己的阅读舒适区 |
+| 🚫 **智能四层去重（知乎）** | session_token 轮替 + read 上报 + 会话内 Set + 持久化 targetKey，刷推荐流**不重不漏**，跨重启都不会刷到看过的 |
+| 💡 **精准想法 popover** | 微信读书正文 inline 划线点击后，按 weread 字符 offset range 精准拉对应想法（而非全章 markText 模糊匹配），命中率显著提升 |
+| ⌨️ **键盘党友好** | 阅读页 ↑/↓/PgUp/PgDn/Space 翻页，←/→ 切章，Home/End 跳本章首尾，**视线不离正文** |
+| 🍃 **摸鱼细节** | 图片默认关闭（同事路过看不到知乎封面图），A-/A+ 调字号，分段加载长回答，开关一律持久到 workspaceState 不同项目可不同 |
+| 🩺 **诊断工具齐全** | `weread.diagnoseCookie` 现场实测 Cookie 续命健康度，`weread.chapterCacheStats` 下钻浏览缓存，排障不靠猜 |
 
 ---
 

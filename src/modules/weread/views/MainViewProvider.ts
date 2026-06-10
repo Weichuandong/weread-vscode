@@ -202,6 +202,16 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       this.pendingShelfLoad = true;
       void this.loadShelfIfNeeded();
     });
+
+    // Cookie 失效状态变化时只需 render() 重画一次 —
+    // weread 这边是整页重建模式 (buildHtml 每次都生成全 HTML), buildHtml 内会读
+    // auth.isCookieKnownInvalid() 决定要不要插 banner, 不需要 postMessage 增量更新.
+    //
+    // 用事件驱动而不是仅在 resolveWebviewView 推一次, 是因为 retainContextWhenHidden=true
+    // 时切走切回不会重新 resolve, 而 cookie 期间可能从有效跌到失效, 必须收到事件实时刷.
+    auth.onDidChangeCookieValidity(() => {
+      this.render();
+    });
   }
 
   public resolveWebviewView(view: vscode.WebviewView): void {
@@ -1134,9 +1144,15 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     const csp = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src https: http: data: ${cspSource}; style-src 'unsafe-inline' ${cspSource}; script-src 'unsafe-inline' ${cspSource};" />`;
 
     const loggedIn = this.auth.isLoggedIn();
+    // cookie 已知失效时, 在 tabbar 上方插一条被动提示横幅.
+    // isCookieKnownInvalid() 内部已 && isLoggedIn(), 未登录时永远返回 false,
+    // 所以这里不会出现"未登录态也挂个 banner"的尴尬情况.
+    const bannerHtml = this.auth.isCookieKnownInvalid()
+      ? this.buildInvalidBannerHtml()
+      : '';
     const body = !loggedIn
       ? this.buildLoginCardHtml()
-      : `${this.buildTabBarHtml()}${this.buildContentHtml()}`;
+      : `${bannerHtml}${this.buildTabBarHtml()}${this.buildContentHtml()}`;
 
     // :root 上注入用户阅读偏好对应的 CSS 变量。
     // 放在主 <style> 之后, 让 .reading { font-size: var(--rd-font-size, 15px) } 能拿到值,
@@ -1187,6 +1203,28 @@ ${prefsBlock}
             <li>点上面的「导入 Cookie」按钮, 在弹出的输入框中粘贴</li>
           </ol>
         </details>
+      </div>
+    `;
+  }
+
+  /**
+   * Cookie 失效提示横幅 — 当 server 返回 401/403/errcode -2010/-2012/-2013 或 renewal 接口
+   * 被判 dead 后, AuthService 会触发 onDidChangeCookieValidity 事件, render() 重画时
+   * buildHtml 会把这块挂到 tabbar 之上.
+   *
+   * 设计:
+   *   - 被动告示, 不弹 modal/toast (用户明确说过弹窗太烦).
+   *   - 不 sticky — 用户首次打开 view 就看到, 滚走也无所谓 (cookie 没修就一直 render 出来,
+   *     下次打开 view 还会看到; 不 sticky 避免侵占阅读区的可视高度).
+   *   - "重新导入" 按钮复用 `data-act="login"` — buildScript 里的通用动作分发会
+   *     post('login') → handleMessage `case 'login'` → executeCommand('weread.importCookie').
+   */
+  private buildInvalidBannerHtml(): string {
+    return /* html */ `
+      <div class="invalid-banner" role="alert">
+        <span class="invalid-banner-icon" aria-hidden="true">⚠️</span>
+        <span class="invalid-banner-text">微信读书 Cookie 已失效或被服务器拒绝, 部分内容可能加载失败</span>
+        <button class="invalid-banner-btn" type="button" data-act="login">重新导入</button>
       </div>
     `;
   }
@@ -2962,6 +3000,43 @@ ${prefsBlock}
       .settings-popover .sp-reset:hover {
         background: var(--vscode-list-hoverBackground);
         color: var(--vscode-foreground);
+      }
+
+      /* ---------- Cookie 失效提示 banner ----------
+         配套 buildInvalidBannerHtml(): 仅在 auth.isCookieKnownInvalid() 时挂到 body 顶部,
+         tabbar 之上. 不 sticky, 视觉上用 vscode 的 inputValidation.warning 主题色调,
+         跟 vscode 自带的警告条更搭. */
+      .invalid-banner {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 10px;
+        background: var(--vscode-inputValidation-warningBackground, rgba(244, 130, 31, 0.12));
+        color: var(--vscode-inputValidation-warningForeground, var(--vscode-foreground));
+        border-bottom: 1px solid var(--vscode-inputValidation-warningBorder, rgba(244, 130, 31, 0.35));
+        font-size: 12px;
+        line-height: 1.4;
+      }
+      .invalid-banner-icon {
+        flex: 0 0 auto;
+      }
+      .invalid-banner-text {
+        flex: 1 1 auto;
+        min-width: 0;
+      }
+      .invalid-banner-btn {
+        flex: 0 0 auto;
+        padding: 2px 8px;
+        background: var(--vscode-button-secondaryBackground, transparent);
+        color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
+        border: 1px solid var(--vscode-button-border, var(--vscode-contrastBorder, transparent));
+        border-radius: 2px;
+        cursor: pointer;
+        font-size: 11px;
+        font-family: inherit;
+      }
+      .invalid-banner-btn:hover {
+        background: var(--vscode-button-secondaryHoverBackground, var(--vscode-list-hoverBackground));
       }
     `;
   }

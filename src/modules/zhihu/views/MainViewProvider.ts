@@ -97,6 +97,17 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     });
     this.context.subscriptions.push(sub);
 
+    // cookie 失效状态变化 → 通知前端切 banner 显隐.
+    // 之所以不复用 onDidChangeLoginState: 这里语义不同 — "cookie 失效" 指
+    // "server 拒绝当前请求 (401/403/code=ERR_USER_NEED_LOGIN)", 此时 cachedCookie
+    // 还在 (isLoggedIn() 仍返回 true), 视图不应该回到未登录态, 只需挂个提示.
+    // 必须用事件驱动而不是仅在 resolve 时推一次 — retainContextWhenHidden=true 时
+    // 切走切回不会重新 resolve, 但 cookie 期间可能从有效跌到失效, 必须收到事件实时推.
+    const subCookie = this.auth.onDidChangeCookieValidity((invalid) => {
+      this.post({ type: 'cookieValidity', invalid });
+    });
+    this.context.subscriptions.push(subCookie);
+
     // view 首次可见时, 如果已登录就直接拉一页
     if (this.auth.isLoggedIn()) {
       void this.refresh();
@@ -122,11 +133,16 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       case 'ready':
         // webview 初次挂载后通知一次登录态 + 同步分段大小配置 (前端切片用)
         //   + 当前点赞过滤器 + 当前图片显示开关 + 当前阅读字号缩放
+        //   + 当前 cookie 失效状态 (用户可能在打开 view 之前就已被服务器拒过)
         this.post({ type: 'loginState', loggedIn: this.auth.isLoggedIn() });
         this.post({ type: 'config', chunkSize: this.getChunkSize() });
         this.post({ type: 'filterState', filter: this.getFilter() });
         this.post({ type: 'imagesState', enabled: this.getImagesEnabled() });
         this.post({ type: 'readerFontScaleState', scale: this.getReaderFontScale() });
+        this.post({
+          type: 'cookieValidity',
+          invalid: this.auth.isCookieKnownInvalid(),
+        });
         if (this.auth.isLoggedIn()) {
           await this.fetchAndPush(true);
         }
@@ -839,6 +855,60 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     font-size: 10.5px;
     color: var(--vscode-descriptionForeground);
   }
+  /* 详情页 (问题详情) 状态下, 隐藏 filter-bar 里跟"推荐流过滤"绑定的元素 —
+     点赞 min/max 输入 + 应用/清除按钮 + 可见/总数统计;
+     图片开关 (🖼️) 与字号按钮 (A-/A+) 不属于"推荐流过滤", 保留可见,
+     这样用户在详情页阅读长答案时仍可一键开关图片 / 调字号 (之前是整条 bar
+     藏掉, 进了详情页就够不到这两个按钮, 体验断裂). */
+  .filter-bar.in-question .feed-only {
+    display: none !important;
+  }
+  /* ---------- Cookie 失效提示 banner ----------
+     被动告示, 不弹 modal/toast (用户明确说过弹窗太烦). 配套 ZhihuAuthService 的
+     onDidChangeCookieValidity 事件: server 返回 401/403/code=ERR_USER_NEED_LOGIN
+     时显示, 用户重新导入或 logout 后隐藏.
+
+     放在 filter-bar *上方* 且 *不* sticky:
+       - 不 sticky 避免破坏 filter-bar 原有的 top: 0 / --filter-bar-h 计算链
+         (展开卡片的 .card-header sticky top 依赖这个变量, 改动会牵连一大片).
+       - 用户首次打开 view / 切回 tab 都能在顶部一眼看到提醒, 滚走也无所谓
+         (反正状态没解决就一直在 DOM 里, 下次刷新还会看到).
+     视觉上用 vscode 的 inputValidation.warning 主题色调, 跟 vscode 自带的警告条更搭. */
+  .invalid-banner {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    background: var(--vscode-inputValidation-warningBackground, rgba(244, 130, 31, 0.12));
+    color: var(--vscode-inputValidation-warningForeground, var(--vscode-foreground));
+    border-bottom: 1px solid var(--vscode-inputValidation-warningBorder, rgba(244, 130, 31, 0.35));
+    font-size: 11.5px;
+    line-height: 1.4;
+  }
+  .invalid-banner[hidden] {
+    display: none;
+  }
+  .invalid-banner-icon {
+    flex: 0 0 auto;
+  }
+  .invalid-banner-text {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .invalid-banner-btn {
+    flex: 0 0 auto;
+    padding: 2px 8px;
+    background: var(--vscode-button-secondaryBackground, transparent);
+    color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
+    border: 1px solid var(--vscode-button-border, var(--vscode-contrastBorder, transparent));
+    border-radius: 2px;
+    cursor: pointer;
+    font-size: 11px;
+    font-family: inherit;
+  }
+  .invalid-banner-btn:hover {
+    background: var(--vscode-button-secondaryHoverBackground, var(--vscode-list-hoverBackground));
+  }
   /* 被过滤掉的卡片 — 完全 display:none, 不占布局空间 (相比 visibility:hidden 更省滚动距离).
      注意: 这只是 "前端视觉过滤", 后端依然推全量数据, 翻页 / 去重等状态机不变. */
   .card-wrap.filtered-out {
@@ -1045,28 +1115,45 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
         这反而起到反向提醒 "你阈值卡太死了" 的作用, 故意保留.
     约定: min=0 表示不限下界 (>=0 就是不限), max=-1 表示不限上界 (避开 0 这种合法值).
   -->
+  <!--
+    Cookie 失效提示 banner — 见 .invalid-banner CSS 注释:
+    放在 filter-bar 上方, 不 sticky, hidden 切显示. 状态由 extension 端
+    'cookieValidity' 消息驱动, "重新导入" 触发 vscode.postMessage({ type: 'login' }).
+  -->
+  <div id="invalidBanner" class="invalid-banner" hidden>
+    <span class="invalid-banner-icon" aria-hidden="true">⚠️</span>
+    <span class="invalid-banner-text">知乎 Cookie 已失效, 部分内容可能加载失败</span>
+    <button class="invalid-banner-btn" type="button" data-act="reimport">重新导入</button>
+  </div>
+  <!--
+    feed-only 类标记: 详情页 (.filter-bar.in-question) 状态下会被 display:none 隐藏.
+    凡是只对"推荐流"有意义的控件 (点赞过滤/统计) 都加 feed-only;
+    图片开关 / 字号按钮 不加, 详情页里也要能用.
+  -->
   <div id="filterBar" class="filter-bar" hidden>
-    <span>👍</span>
-    <input id="filterMin" type="number" min="0" placeholder="最少" title="最低赞数 (留空或 0 = 不限)" />
-    <span>~</span>
-    <input id="filterMax" type="number" min="0" placeholder="不限" title="最高赞数 (留空 = 不限)" />
-    <button id="filterApply" type="button" title="应用筛选 (回车也可)">应用</button>
-    <button id="filterClear" type="button" title="清除筛选, 恢复全部显示">清除</button>
+    <span class="feed-only">👍</span>
+    <input id="filterMin" class="feed-only" type="number" min="0" placeholder="最少" title="最低赞数 (留空或 0 = 不限)" />
+    <span class="feed-only">~</span>
+    <input id="filterMax" class="feed-only" type="number" min="0" placeholder="不限" title="最高赞数 (留空 = 不限)" />
+    <button id="filterApply" class="feed-only" type="button" title="应用筛选 (回车也可)">应用</button>
+    <button id="filterClear" class="feed-only" type="button" title="清除筛选, 恢复全部显示">清除</button>
     <!--
       图片开关 — 摸鱼场景默认关闭 (workspaceState 'zhihu.imagesEnabled' = false):
         - 关闭时正文里所有 [IMG:url] 渲染成纯占位符 "🖼️ 图片", 完全不发请求, 不出图;
         - 打开后已经展开的卡片里占位符立即就地变成 <img> (无需重新展开).
       放在 filter-bar 里跟过滤按钮同一行, sticky 顶部, 滚到哪都点得到.
+      详情页里也要能切, 故 *不* 加 feed-only.
     -->
     <button id="imagesToggle" type="button" class="images-toggle" title="开启/关闭正文图片显示 (默认关闭, 摸鱼伪装感)">🖼️ 图片</button>
     <!--
       阅读字号调整 — A- / A+ 一对按钮, 只影响 .detail-text 与 .comment-body
       (chrome 区域字号保持 vscode 默认, 避免按钮一起变大撑破布局).
       title 里 JS 会动态写入当前百分比, 让用户知道在哪一档.
+      详情页里读长答案场景更需要调字号, 故 *不* 加 feed-only.
     -->
     <button id="fontSmaller" type="button" class="font-zoom" title="缩小阅读字号">A-</button>
     <button id="fontLarger" type="button" class="font-zoom" title="放大阅读字号">A+</button>
-    <span id="filterStat" class="filter-stat"></span>
+    <span id="filterStat" class="filter-stat feed-only"></span>
   </div>
   <div id="root">
     <div class="empty">初始化中...</div>
@@ -1111,6 +1198,8 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   const fontSmallerBtn = document.getElementById('fontSmaller');
   const fontLargerBtn = document.getElementById('fontLarger');
   const filterStat = document.getElementById('filterStat');
+  // Cookie 失效 banner — 显隐由 'cookieValidity' 消息驱动, 内部按钮走 'login' 命令
+  const invalidBanner = document.getElementById('invalidBanner');
 
   let loggedIn = false;
   let reachedEnd = false;
@@ -1463,6 +1552,22 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       syncFilterBarHeight();
     }
     window.addEventListener('resize', syncFilterBarHeight);
+  }
+
+  // Cookie 失效 banner 内部按钮 — 走和登录卡片同一条路径
+  // (vscode.postMessage({ type: 'login' }) → extension 端执行 zhihu.importCookie 命令)
+  if (invalidBanner) {
+    invalidBanner.addEventListener('click', (e) => {
+      const target = e.target;
+      if (
+        target &&
+        target instanceof HTMLElement &&
+        target.dataset &&
+        target.dataset.act === 'reimport'
+      ) {
+        vscode.postMessage({ type: 'login' });
+      }
+    });
   }
 
   function renderLoginTip() {
@@ -2174,18 +2279,48 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   /** @type {{id:string,title:string,offset:number,isEnd:boolean,loading:boolean,reqId:string,rendered:number,totals:number}|null} */
   let currentQuestion = null;
 
+  /**
+   * 进入详情页前的 feed 流滚动位置, 返回时恢复.
+   *
+   * 为什么用外部变量而不是挂到 currentQuestion 上:
+   *   closeQuestionView 里会先把 currentQuestion 置 null 再恢复 scroll,
+   *   挂在对象上反而绕一圈. 直接全局 let 一个数字最简洁.
+   *
+   * 初值 0 — 用户首次进详情页时 feed 还没滚动, 0 也是对的.
+   */
+  let savedFeedScrollY = 0;
+
+  /**
+   * 统一管理 filter-bar 的可见性 + 详情页态:
+   *   - 未登录:       整条 hidden (root 是登录提示, 显示筛选条没意义)
+   *   - 已登录非详情: 整条显示, 移除 in-question class
+   *   - 已登录详情:   整条显示, 加 in-question class (CSS 隐藏 .feed-only 元素,
+   *                  保留 图片开关 / A- / A+ 三个跨场景按钮)
+   * 任何切换 currentQuestion 或 loggedIn 的地方都应只调这一个函数, 避免散落多处 hidden=...
+   * 出现状态不一致.
+   */
+  function syncFilterBarVisibility() {
+    if (!filterBar) return;
+    filterBar.hidden = !loggedIn;
+    filterBar.classList.toggle('in-question', !!currentQuestion);
+  }
+
   /** 打开问题详情页 — 由 card-title click 触发 */
   function openQuestionView(questionId, questionTitle) {
     if (!questionId) return;
-    // 隐藏 feed 流相关 (filterBar 在详情页里关掉, 语义不同)
-    if (filterBar) filterBar.hidden = true;
+    // 保存 feed 当前滚动位置, 关闭详情页时恢复 — 之前是直接 scrollTo(0,0)
+    // 导致用户从 feed 中段进详情页, 返回后回到最顶端要重新一直翻, 体验劝退.
+    savedFeedScrollY = window.scrollY || document.documentElement.scrollTop || 0;
     root.style.display = 'none';
     footer.style.display = 'none';
     questionView.hidden = false;
+    // filterBar 不再整条 hidden, 改为加 in-question class — 这样图片开关 / A- / A+
+    // 在详情页里仍然可见可点 (它们 *不* 带 feed-only class).
+    syncFilterBarVisibility();
     questionTitleEl.textContent = questionTitle || '问题';
     questionList.innerHTML = '<div class="empty">正在加载该问题下的回答...</div>';
     questionFooter.innerHTML = '';
-    // 滚到顶 — sidebar 太窄, 用户从 feed 中段进详情页时不希望已经被滚下去
+    // 详情页本身从顶部开始读 (sidebar 太窄, 用户从 feed 中段进详情页时不希望被滚下去)
     window.scrollTo(0, 0);
 
     const reqId = 'q' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
@@ -2207,14 +2342,23 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  /** 关闭详情页, 还原 feed 流视图 */
+  /** 关闭详情页, 还原 feed 流视图 + feed 滚动位置 */
   function closeQuestionView() {
     questionView.hidden = true;
     currentQuestion = null;
-    // 还原 feed 区: filterBar 仅在已登录时显示
-    if (filterBar) filterBar.hidden = !loggedIn;
     root.style.display = '';
     renderFooter();
+    // 同步 filterBar: 已登录时整条显示, 移除 in-question 让 feed-only 元素恢复可见.
+    syncFilterBarVisibility();
+    // 恢复 feed 滚动位置 — 必须等 root 从 display:none 切回来、布局算完, 才能
+    // scrollTo 到目标 Y (否则 documentElement 高度还没回来, scroll 会被 clamp 到 0).
+    // 双 rAF 比单层 rAF 更稳: 单层在某些 vscode webview 渲染节奏下会赶不上首帧 layout.
+    const target = savedFeedScrollY;
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        window.scrollTo(0, target);
+      });
+    });
   }
 
   if (questionBackBtn) {
@@ -2451,13 +2595,20 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
         // 同时如果在详情页里掉线, 强制关闭详情页 (登录提示需要回到 feed 流视图)
         if (!loggedIn) {
           if (currentQuestion) closeQuestionView();
-          if (filterBar) filterBar.hidden = true;
           renderLoginTip();
-        } else {
-          if (filterBar) filterBar.hidden = !!currentQuestion;
-          if (cardsRendered === 0) renderEmpty('加载中...');
+        } else if (cardsRendered === 0) {
+          renderEmpty('加载中...');
         }
+        // filterBar 可见性统一由 syncFilterBarVisibility 处理 (含未登录/详情页态),
+        // 避免散落多处 hidden=... 出现状态不一致 (例如忘了同步 in-question class).
+        syncFilterBarVisibility();
         renderFooter();
+        return;
+      case 'cookieValidity':
+        // Cookie 失效状态变化 → 切 banner 显隐. 未登录态下 extension 端
+        // 已通过 isCookieKnownInvalid() 的 isLoggedIn 守卫保证 invalid=false,
+        // 所以这里直接信 msg.invalid 即可, 不需要再叠 loggedIn 判断.
+        if (invalidBanner) invalidBanner.hidden = !msg.invalid;
         return;
       case 'loading':
         loading = !!msg.loading;

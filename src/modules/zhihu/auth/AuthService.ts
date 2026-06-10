@@ -24,9 +24,23 @@ export class ZhihuAuthService {
   private readonly _onDidChangeLoginState = new vscode.EventEmitter<boolean>();
   public readonly onDidChangeLoginState = this._onDidChangeLoginState.event;
 
-  /** "登录已失效" 弹窗节流, 5 分钟内最多一次 */
-  private expiredPromptInFlight = false;
-  private lastExpiredPromptAt = 0;
+  /** "登录失效" 日志节流, 5 分钟内最多打一条 (避免接口连环失败时刷屏 console) */
+  private lastExpiredLogAt = 0;
+
+  /**
+   * 已观察到 cookie 失效 (服务器返回 401/403 等鉴权失败信号).
+   *
+   * 用于在 webview 内被动展示一条"cookie 已失效, 点这里重新导入"的横幅 —
+   * 走"被动告示", 不弹任何 modal/toast (用户明确说过 toast 太烦)。
+   *
+   * 注意: 这个标记只代表"上一次请求时服务器拒绝了我", 不能 100% 等价"现在 cookie 就是无效的"
+   * (server 可能临时抖动). 用户重新导入或主动 logout 时会清除。
+   */
+  private cookieKnownInvalid = false;
+
+  /** cookie 有效性变化事件 (true = 失效, false = 已恢复, 给视图刷新 banner 用) */
+  private readonly _onDidChangeCookieValidity = new vscode.EventEmitter<boolean>();
+  public readonly onDidChangeCookieValidity = this._onDidChangeCookieValidity.event;
 
   constructor(private readonly ctx: ModuleContext) {}
 
@@ -38,6 +52,14 @@ export class ZhihuAuthService {
   /** 仅判断存在性, 不验证服务端是否还认 */
   public isLoggedIn(): boolean {
     return Boolean(this.cachedCookie && this.cachedCookie.trim().length > 0);
+  }
+
+  /**
+   * 是否处于"已登录但 cookie 被 server 拒"的状态。
+   * 未登录时永远返回 false (没登录就没"失效"一说, 走未登录态 UI 即可)。
+   */
+  public isCookieKnownInvalid(): boolean {
+    return this.cookieKnownInvalid && this.isLoggedIn();
   }
 
   /** 给 axios 拼 Cookie 头用 */
@@ -83,6 +105,9 @@ export class ZhihuAuthService {
     const trimmed = cookie.trim();
     await this.ctx.secrets.set('cookie', trimmed);
     this.cachedCookie = trimmed;
+    // 新导入的 cookie 默认认为有效, 让 banner 立刻消失;
+    // 如果新 cookie 其实也无效, interceptor 下次请求时会再标记回来。
+    this.markCookieValid();
     this._onDidChangeLoginState.fire(true);
     vscode.window.showInformationMessage('知乎: Cookie 已保存, 登录成功');
     return true;
@@ -92,38 +117,49 @@ export class ZhihuAuthService {
   public async logout(): Promise<void> {
     await this.ctx.secrets.delete('cookie');
     this.cachedCookie = undefined;
+    this.markCookieValid();
     this._onDidChangeLoginState.fire(false);
     vscode.window.showInformationMessage('知乎: 已退出登录');
   }
 
   /**
-   * 检测到登录失效 (401/403/code=ERR_USER_NEED_LOGIN 等) 时调用,
-   * 给个非阻塞提示让用户重粘。
+   * 检测到登录失效 (401/403/code=ERR_USER_NEED_LOGIN 等) 时调用。
    *
-   * 节流策略和 weread 一致: 5 分钟一次, 并发的多个失败共享同一个 prompt。
+   * **完全静默** — 之前会弹 showWarningMessage 让用户重导, 但用户反馈每次都要
+   * 点关闭很烦. 现在改为仅打一条节流日志, 视图层拉不到数据自然会显示空态/错误态,
+   * 用户感知到了再自行 "知乎: 导入 Cookie" 即可, 插件不主动打扰。
+   *
+   * 接口签名保留 (返回 Promise<void>), 方便上层调用方继续 `void this.auth.notifyExpired()`
+   * 而不需要全局改造。
    */
   public async notifyExpired(): Promise<void> {
-    if (this.expiredPromptInFlight) {
-      return;
+    // 不管节流如何, 状态标记都要打 (banner 不能因为日志节流就漏掉)
+    if (this.isLoggedIn()) {
+      this.markCookieInvalid();
     }
     const now = Date.now();
-    if (now - this.lastExpiredPromptAt < 5 * 60 * 1000) {
+    if (now - this.lastExpiredLogAt < 5 * 60 * 1000) {
       return;
     }
-    this.expiredPromptInFlight = true;
-    this.lastExpiredPromptAt = now;
-    try {
-      const choice = await vscode.window.showWarningMessage(
-        '知乎: 登录已失效, 是否重新导入 Cookie?',
-        '重新导入',
-        '稍后',
-      );
-      if (choice === '重新导入') {
-        await vscode.commands.executeCommand('zhihu.importCookie');
-      }
-    } finally {
-      this.expiredPromptInFlight = false;
-    }
+    this.lastExpiredLogAt = now;
+    console.warn(
+      '[zhihu] 检测到登录失效信号 ' +
+        (this.isLoggedIn() ? '(cookie 已失效, 请通过命令 "知乎: 导入 Cookie" 重新导入)' : '(未登录)'),
+    );
+  }
+
+  /** 内部: 标记 cookie 已失效, 触发 banner 显示 (带变化检测, 避免无谓 fire) */
+  private markCookieInvalid(): void {
+    if (this.cookieKnownInvalid) return;
+    this.cookieKnownInvalid = true;
+    this._onDidChangeCookieValidity.fire(true);
+  }
+
+  /** 内部: 清掉 cookie 失效状态, 触发 banner 隐藏 (带变化检测) */
+  private markCookieValid(): void {
+    if (!this.cookieKnownInvalid) return;
+    this.cookieKnownInvalid = false;
+    this._onDidChangeCookieValidity.fire(false);
   }
 
   /** 解析 "k1=v1; k2=v2" 形式的 cookie 字符串 */
@@ -148,5 +184,6 @@ export class ZhihuAuthService {
 
   public dispose(): void {
     this._onDidChangeLoginState.dispose();
+    this._onDidChangeCookieValidity.dispose();
   }
 }

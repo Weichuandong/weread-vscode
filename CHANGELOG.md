@@ -2,6 +2,26 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)，所有重要变更都会记录在这里。
 
+## [2.0.1] - 2026-06-10
+
+> **体验优化版：彻底消除打扰式弹窗，cookie 失效改为 view 内被动告示；修复知乎详情页交互细节。**
+
+### Changed
+- 🤫 **彻底静默 cookie 失效弹窗** —— 此前 [`notifyExpired()`](src/modules/weread/auth/AuthService.ts) / [`notifyRenewalDead()`](src/modules/weread/auth/AuthService.ts) 会弹 `showWarningMessage`（包括 modal 阻塞弹窗）让用户重导，被反馈"每次都要点关闭很烦"。现一律改为 `console.warn` + 5 分钟日志节流（`lastExpiredLogAt` / `lastRenewalDeadLogAt`），知乎侧同步处理。视图层拉不到数据自然显示空态/错误态，用户感知到了再自行重导，插件不主动打扰
+- 🛡️ **未登录态守卫** —— 之前未登录时仍可能误触发"登录失效"提示。现 `isCookieKnownInvalid()` 内置 `&& isLoggedIn()` 判断，未登录态永远不会触发任何失效信号
+
+### Added
+- 🪧 **View 内被动告示 banner** —— `AuthService` 新增 `cookieKnownInvalid` 字段 + `onDidChangeCookieValidity: Event<boolean>` 事件 + `isCookieKnownInvalid()` 公共 getter。`MainViewProvider` 订阅事件后，cookie 失效时在 view 顶部显示一条带"重新导入"按钮的警告横幅；用户重新导入或 logout 后自动消失。banner 用 vscode `inputValidation.warning` 主题色，与系统 UI 一致
+  - Folio (微信读书) 走 `render()` 整页重建路径，banner 由 `buildInvalidBannerHtml()` 条件性插入到 tabbar 之上
+  - Curio (知乎) 走 `postMessage('cookieValidity')` 增量更新路径，banner DOM 静态存在，hidden 切显隐
+  - 关键设计：用事件驱动而非仅在 resolve 时推一次 —— `retainContextWhenHidden=true` 时切走切回不会重新 resolve，但 cookie 期间可能从有效跌到失效，必须事件实时刷
+  - 标记 cookie 失效**不走日志节流** —— 日志可以 5 分钟一条，但 banner 显示不能漏
+
+### Fixed
+- 🎚️ **知乎详情页隐藏了图片/字号按钮** —— 此前进入问题详情页 (`openQuestion`) 整条 filter-bar 都被 hidden，导致用户在详情页阅读长答案时无法切图片开关或调字号。现 filter-bar 改为按元素粒度分组：用 `.feed-only` class 标记"只对推荐流有意义"的控件（点赞过滤 / 应用清除 / 统计），详情页态由 `.in-question` class CSS 隐藏；图片开关 (`#imagesToggle`) 与字号按钮 (`#fontSmaller` / `#fontLarger`) 不带 feed-only，详情页里仍可见可用
+- 🔄 **从详情页返回 feed 流回到顶部** —— 此前 `closeQuestionView` 直接 `scrollTo(0, 0)`，用户从 feed 中段进详情页返回后被强制顶到最上，要从头翻到原位置体验劝退。现新增 `savedFeedScrollY` 外部变量，`openQuestionView` 时保存当前 `window.scrollY`，关闭时双 `requestAnimationFrame` 等 layout 完成后恢复滚动位置（单层 rAF 在某些 vscode webview 渲染节奏下会赶不上首帧 layout）
+- 🧭 **filter-bar 可见性散落多处的状态不一致** —— 重构出 `syncFilterBarVisibility()` 单点函数统一管理三态（未登录隐藏 / 已登录非详情显示 / 已登录详情显示并切 in-question class），原本散落在 `loginState` / `openQuestion` / `closeQuestion` 各处的 `hidden=...` 收敛到一处，避免忘记同步导致的状态错乱
+
 ## [2.0.0] - 2026-06-09
 
 > **重大版本：模块化架构重构 + 新增知乎摸鱼模块 + 微信读书章节预缓存。**
