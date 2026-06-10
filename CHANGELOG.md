@@ -2,6 +2,34 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)，所有重要变更都会记录在这里。
 
+## [2.1.0] - 2026-06-10
+
+> **知乎体验大升级：后台预拉 + 评论显图 + 加载更多 batch 化。底部"已加载未读卡"自动堆积，翻页零等待。**
+
+### Added
+- 🚀 **后台预拉缓冲池（Prefetch）—— 翻页零等待** —— 全新 [`runPrefetch()`](src/modules/zhihu/views/MainViewProvider.ts:702-738) 后台任务：每次用户刷新/加载更多结束后，后台静默拉到最多 `prefetchTargetCount` 条（默认 12）匹配过滤的卡片，**直接 post 给前端 DOM**（不是塞后端 buffer 等用户 take），前端列表本身就是"用户视角的未读 buffer"。效果：滚到底永远有 ~10-20 张已加载未读卡片排队，下拉一眼就看见，零 loading spinner、零网络往返
+  - 状态协调：`prefetchPromise` 单例 + `frontendWantingFetch` 让位信号 + `prefetchSuspended` 失败熔断（cookie 失效/网络抖动时不再无限 retry 触发 banner 弹）
+  - 单轮上限：`prefetchTargetCount=12` 卡 + `prefetchMaxPages=5` 页双重保护，push 完一轮就停，等下次用户交互再触发，DOM 不会无限膨胀
+  - 退登自动清理 prefetch 状态，不会切账号后看到上个账号 prefetch 的卡
+- 🖼️ **评论区图片显示** —— 知乎评论里 zhimg.com 图片现在能正常出图。之前 [`toCommentView`](src/modules/zhihu/api/ZhihuClient.ts:931) 走 `stripHtmlPreserveBreaks(_, false)` 把 `<img>` 全替成 `[图片]` 文本，对评论里以 `<a data-image-url=...>` 包裹的"点击查看大图"链接更是直接显示成"加载图片"几个字。现改 `preserveImages=true` + 前端 [`renderTextWithImages`](src/modules/zhihu/views/MainViewProvider.ts:2335-2344) 渲染 `[IMG:url]` 占位符
+- 🔍 **`<a>` 形态图片启发式识别** —— 新增 [`extractCommentImageUrl()`](src/modules/zhihu/api/ZhihuClient.ts:1093) 工具：从 `<a>` 属性里抠 `data-image-url` / `data-original` / `data-actualsrc` / `data-image-src`（强语义），抠不到时按 `href` 是 zhimg.com 子域兜底（图床域名）。不依赖 class 兜底避免误杀普通超链接
+- ⚙️ **4 个新配置项**：
+  - `zhihu.refreshTargetCount` (默认 6) —— 刷新和加载更多统一 batch 数，治"加载更多挤牙膏"
+  - `zhihu.refreshMaxAttempts` (默认 10) —— 开启点赞过滤时刷新场景为凑够目标数最多发起的请求次数上限
+  - `zhihu.prefetchTargetCount` (默认 12) —— 后台预拉的目标条数；设 0 关闭后台 prefetch
+  - `zhihu.prefetchMaxPages` (默认 5) —— 单次后台 prefetch 最多发起的请求数，防止持续打接口被服务端限流
+- 🐛 **评论图片诊断采样日志** —— `commentImgSampleCount` (cap=3) 在 raw content 含可疑图片关键字 (`加载图片` / `comment_img` / `zhimg.com`) 但解析后无 `[IMG:` 占位符时打印一次原始 HTML 样本（截断 800 字符），方便快速识别知乎新的 HTML 形态再补到启发式里
+
+### Changed
+- 🚿 **加载更多不再"挤牙膏"** —— 此前 [`fetchAndPush`](src/modules/zhihu/views/MainViewProvider.ts:478) 的内循环 `loopForTarget ? target : 1` 导致加载更多场景 target=1，点一次只来 1 张卡。现改为统一 batch：刷新和加载更多都按 `refreshTargetCount`（默认 6）批量同步 push，剩下让 prefetch 后台继续推
+- ♻️ **大重构 `fetchAndPush`** —— 拆出共用 helper [`fetchPageAndPartition()`](src/modules/zhihu/views/MainViewProvider.ts:602-643)（拉一页 + 按过滤拆 matching/nonMatching + reportRead）和 [`maybeNotifyReachEnd()`](src/modules/zhihu/views/MainViewProvider.ts:649-661)（幂等通知前端到底）；`fetchAndPush` 和 `runPrefetch` 共用这两个 helper，逻辑统一
+- 🎯 **cardBuffer 语义变更** —— 从"待 take 的卡片池"变为"非匹配复用池"：匹配过滤的卡片由 `fetchPageAndPartition` 直接 push 给前端 DOM，buffer 只装当前过滤拉到但不匹配的卡片（供用户后续放宽过滤时复用，节约一次网络）。硬上限 `PREFETCH_HARD_BUFFER_CAP=100`，极端过滤场景下兜底防内存膨胀
+- 🌐 **图片样式作用域改全局** —— `.inline-img` / `.inline-img-broken` / `.inline-img-placeholder` 不再绑 `.detail-text` 前缀，让正文和评论区共用同一份样式。同时 [`syncImagesEnabledToDOM`](src/modules/zhihu/views/MainViewProvider.ts:1755-1773) 选择器也去前缀，用户点 🖼️ 切换图片开关时正文和评论同步切换，不再"正文切了评论没切"
+
+### Fixed
+- 🛑 **reportRead 接口 404 不再每次都试一次无效 HTTP** —— 知乎 `/api/v3/feed/topstory/feedback/read` 时不时返回 404（路径变更 / 鉴权策略调整）。此前每页都试一次失败，每次刷新多 N 次无效请求。现新增进程级熔断 `REPORT_READ_FAIL_THRESHOLD=3`，连续失败到上限后本进程剩余 reportRead 调用直接 short-circuit，任何一次成功立即重置计数；[`resetSession()`](src/modules/zhihu/api/ZhihuClient.ts:395) 也重置熔断，给"下次刷新还能再试"的机会
+- 📌 **评论区图片视觉降一档** —— 单独覆盖 `.comment-body .inline-img` 的 `max-height=220px` + 缩短上下 margin，避免评论里一张表情图把楼层撑得比正文还大
+
 ## [2.0.1] - 2026-06-10
 
 > **体验优化版：彻底消除打扰式弹窗，cookie 失效改为 view 内被动告示；修复知乎详情页交互细节。**

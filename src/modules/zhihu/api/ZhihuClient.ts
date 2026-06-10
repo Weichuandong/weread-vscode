@@ -106,6 +106,34 @@ export class ZhihuClient {
   /** 上次"用过期通知去骚扰用户"的时刻, 防止网络抖动导致弹一堆 */
   private lastExpiredNotifyAt = 0;
 
+  /**
+   * reportRead 接口连续失败计数 — 用于本进程内的熔断.
+   *
+   * 背景: 知乎 /api/v3/feed/topstory/feedback/read 时不时返回 404 (路径变更 /
+   * 鉴权策略调整). 失败本身不影响主流程, 但每页都试一次 = 每次刷新多 N 次无效
+   * HTTP, 既慢也碍眼.
+   *
+   * 策略: 连续失败 >= REPORT_READ_FAIL_THRESHOLD 时, 本进程剩余的 reportRead
+   * 调用直接 short-circuit, 不再发请求. 任何一次成功立刻重置计数. resetSession()
+   * 也重置, 给用户 "下次刷新还能再试" 的机会.
+   *
+   * 不做"指数退避后重试": 那会引入定时器, 比直接熔断复杂得多, 收益不值.
+   */
+  private reportReadConsecutiveFails = 0;
+  private static readonly REPORT_READ_FAIL_THRESHOLD = 3;
+
+  /**
+   * 评论图片 HTML 形态采样计数 — 调试 "评论里没显示图片" 类问题用.
+   *
+   * toCommentView 里, 当 raw.content 里出现可疑的图片相关关键字 (加载图片 / 查看图片 /
+   * comment_img / zhimg) 但解析后没产出 [IMG:url] 占位符时, 会打印一次原始 content
+   * 样本 (截断 800 字符) 到控制台, 方便据此快速识别新的 HTML 形态并补到
+   * stripHtmlPreserveBreaks 的启发式里. 每个 ZhihuClient 实例最多打印 SAMPLE_CAP 次,
+   * 避免日志爆炸.
+   */
+  private commentImgSampleCount = 0;
+  private static readonly COMMENT_IMG_SAMPLE_CAP = 3;
+
   constructor(
     private readonly auth: ZhihuAuthService,
     private readonly context: vscode.ExtensionContext,
@@ -293,6 +321,13 @@ export class ZhihuClient {
       return;
     }
 
+    // 熔断: 本进程内连续失败到上限, 后续刷新不再尝试 (resetSession 会清零给机会重试)
+    if (
+      this.reportReadConsecutiveFails >= ZhihuClient.REPORT_READ_FAIL_THRESHOLD
+    ) {
+      return;
+    }
+
     // 提取每条的 token (attached_info 或 attached_info_bytes), 没有就跳过
     const readDataList = items
       .map((it) => {
@@ -314,11 +349,21 @@ export class ZhihuClient {
         { read_data_list: readDataList },
         { headers: { 'Content-Type': 'application/json' } },
       );
+      this.reportReadConsecutiveFails = 0;
       console.log(`[zhihu] feedback/read 上报 ${readDataList.length} 条 ✓`);
     } catch (e) {
       // 静默: 这个接口失败不影响功能, 只影响后续推荐质量
       const status = (e as AxiosError)?.response?.status;
-      console.warn(`[zhihu] feedback/read 上报失败 (status=${status}), 忽略`);
+      this.reportReadConsecutiveFails++;
+      const tripped =
+        this.reportReadConsecutiveFails >=
+        ZhihuClient.REPORT_READ_FAIL_THRESHOLD;
+      console.warn(
+        `[zhihu] feedback/read 上报失败 (status=${status}), 忽略` +
+          (tripped
+            ? ` — 连续失败 ${this.reportReadConsecutiveFails} 次, 本进程暂停 reportRead 上报 (resetSession 后会重试)`
+            : ` — 连续失败 ${this.reportReadConsecutiveFails}/${ZhihuClient.REPORT_READ_FAIL_THRESHOLD}`),
+      );
     }
   }
 
@@ -350,6 +395,9 @@ export class ZhihuClient {
     this.pageNumber = 1;
     this.endOffset = 0;
     this.seenFeedIds.clear();
+    // 给 reportRead 一个 "下次刷新重新试试" 的机会 — 它可能是临时网络抖动或
+    // 服务端短暂故障, 不应该一次失败就本进程永久 disable
+    this.reportReadConsecutiveFails = 0;
     console.log('[zhihu] session 已重置 (保留持久化已读集合)');
   }
 
@@ -883,10 +931,27 @@ export class ZhihuClient {
     const replyMember =
       raw.reply_to_author?.member ?? raw.reply_to_author ?? null;
 
-    const content = stripHtmlPreserveBreaks(raw.content ?? '');
+    // preserveImages=true: 评论里也可能有图片 (尤其热门话题的 "图说"), 保留 [IMG:url] 占位
+    // 给前端 renderTextWithImages 渲染. 前端会根据 imagesEnabled 开关决定真出图还是占位.
+    const rawContent = raw.content ?? '';
+    const content = stripHtmlPreserveBreaks(rawContent, true);
     if (!content && !replyMember) {
       // 完全空内容 (可能是被删除的评论占位), 不展示
       return null;
+    }
+
+    // 诊断采样: 看似含图片但解析失败时, 把原始 HTML 打到控制台一次, 方便补启发式.
+    // 触发条件: raw 含可疑图片关键字 + 解析结果里没有 [IMG: 占位符. 限频上限内才打.
+    if (
+      this.commentImgSampleCount < ZhihuClient.COMMENT_IMG_SAMPLE_CAP &&
+      /加载图片|查看图片|comment_img|zhimg\.com/i.test(rawContent) &&
+      !content.includes('[IMG:')
+    ) {
+      this.commentImgSampleCount += 1;
+      const sample = rawContent.length > 800 ? rawContent.slice(0, 800) + '…(截断)' : rawContent;
+      console.warn(
+        `[zhihu] 评论图片样本 #${this.commentImgSampleCount}/${ZhihuClient.COMMENT_IMG_SAMPLE_CAP} (原始 HTML, 用于补启发式):\n${sample}`,
+      );
     }
 
     return {
@@ -973,8 +1038,15 @@ function stripHtml(html: string): string {
  * 这个函数则把 <p>/<br>/<li> 转成 \n, 让用户在 webview 里看到的还是分段文章,
  * 否则一坨没换行的长字符串读起来很痛苦。
  *
- * preserveImages=true 时, 把 <img> 转成 [IMG:url] 安全占位符, 交给 webview 展开正文时渲染;
- * 默认仍显示 [图片] 文本, 避免评论等位置无意内嵌图片.
+ * preserveImages=true 时, 把图片元素转成 [IMG:url] 安全占位符, 交给 webview 渲染:
+ *   - <img>:                                         取 data-original / data-actualsrc / src
+ *   - <a class="comment_img" href="..." data-...>:   评论里图片的另一种形态 (点击查看大图),
+ *                                                     a 标签内文本是 "加载图片" / "查看图片", 必须特殊识别,
+ *                                                     否则后面剥 <a> 标签时只剩 "加载图片" 文字看着像没修.
+ *                                                     取 data-image-url / data-original / data-actualsrc /
+ *                                                     data-image-src / href (要求 http(s)).
+ * 正文 / 评论都用这同一份逻辑.
+ * 默认仍显示 [图片] 文本 (向后兼容).
  */
 function stripHtmlPreserveBreaks(html: string, preserveImages = false): string {
   if (!html) return '';
@@ -989,6 +1061,17 @@ function stripHtmlPreserveBreaks(html: string, preserveImages = false): string {
       .replace(
         /<img\b[^>]*?\bsrc=["']([^"']+)["'][^>]*>/gi,
         (_, src: string) => imgPlaceholder(src),
+      )
+      // <a> 形态的评论图片. 用启发式 (而不是死锁 class="comment_img") 兼容知乎接口版本漂移:
+      //   1) 标签里带 data-image-url / data-original / data-actualsrc / data-image-src — 强信号, 直接取;
+      //   2) 否则 href 是 zhimg.com / zhihu.com/pic / picx.zhimg.com 这类图床域名 — 也认.
+      // 普通超链接 (href 不是图床 + 没有 data-image-* 属性) 不动, 让后续标签剥离按普通文本处理.
+      .replace(
+        /<a\b([^>]*?)>([\s\S]*?)<\/a>/gi,
+        (full: string, attrs: string, _inner: string) => {
+          const src = extractCommentImageUrl(attrs);
+          return src ? imgPlaceholder(src) : full;
+        },
       );
   }
   return text
@@ -1008,6 +1091,29 @@ function stripHtmlPreserveBreaks(html: string, preserveImages = false): string {
     .replace(/[ \t]+\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+}
+
+/**
+ * 从 <a> 标签的 attrs 字符串里抽出"这是图片链接"的 URL, 抽不到返回 ''.
+ *
+ * 优先级:
+ *   1) data-image-url / data-original / data-actualsrc / data-image-src  ← 强语义, 直接信
+ *   2) href 是 zhimg.com 子域 (pic*.zhimg.com / picx.zhimg.com / pica.zhimg.com 等)  ← 图床域名兜底
+ *
+ * 不用 class 兜底 (普通超链接 class 也可能含 'image') — 误杀风险大.
+ */
+function extractCommentImageUrl(attrs: string): string {
+  const grab = (re: RegExp): string => {
+    const m = attrs.match(re);
+    return m ? m[1].trim() : '';
+  };
+  const dataUrl = grab(
+    /\b(?:data-image-url|data-original|data-actualsrc|data-image-src)=["']([^"']+)["']/i,
+  );
+  if (dataUrl && /^https?:\/\//i.test(dataUrl)) return dataUrl;
+  const href = grab(/\bhref=["']([^"']+)["']/i);
+  if (href && /^https?:\/\/[^/]*\bzhimg\.com\b/i.test(href)) return href;
+  return '';
 }
 
 /** 生成 [IMG:url] 占位符。只接受 http(s), 避免把可疑协议透传给 webview。 */

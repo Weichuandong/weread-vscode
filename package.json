@@ -290,6 +290,34 @@
             "minimum": 50,
             "maximum": 5000,
             "description": "点击卡片展开正文时，每次显示的字符数（避免长回答一次性灌满屏幕，看完再点\"继续阅读\"加载下一段）"
+          },
+          "zhihu.refreshTargetCount": {
+            "type": "number",
+            "default": 6,
+            "minimum": 1,
+            "maximum": 30,
+            "description": "每次刷新/加载更多一次推给前端的目标卡片数（优先从后台预拉缓冲取，零等待；不够时才发请求补）。开启点赞过滤时，刷新场景会循环凑够该数量的匹配卡片。"
+          },
+          "zhihu.refreshMaxAttempts": {
+            "type": "number",
+            "default": 10,
+            "minimum": 1,
+            "maximum": 30,
+            "description": "开启点赞过滤时，刷新场景为凑够目标数最多发起的请求次数上限（加载更多场景固定最多 1 次，剩余靠后台预拉补，防止过滤极端时无限请求 / 触发风控）"
+          },
+          "zhihu.prefetchTargetCount": {
+            "type": "number",
+            "default": 12,
+            "minimum": 0,
+            "maximum": 50,
+            "description": "后台预拉的卡片缓冲池目标条数 — 用户翻页时优先从缓冲取（瞬时响应，无需等待）；后台静默补到该条数后停止。设为 0 关闭后台预拉。"
+          },
+          "zhihu.prefetchMaxPages": {
+            "type": "number",
+            "default": 5,
+            "minimum": 1,
+            "maximum": 20,
+            "description": "单次后台预拉最多发起的请求数 — 跑完释放资源，下次用户翻页结束后再触发新一轮。防止后台长时间持续打接口被服务端限流。"
           }
         }
       }

@@ -54,10 +54,49 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'zhihuTouch.main';
 
   private view?: vscode.WebviewView;
-  /** 当前是否正在拉取, 用于前端"加载中"状态 + 防止重复并发 */
+  /** 当前是否正在拉取, 用于前端"加载中"状态 + 防止重复并发 (仅前台 fetchAndPush 持有) */
   private loading = false;
-  /** 已经到流末尾了, 不再请求 */
+  /** 服务端流是否到底 (paging.is_end). reachedEnd 是 "用户视角到底": serverIsEnd && buffer 取空才算 */
+  private serverIsEnd = false;
+  /** 通知前端"到底"的最终标志 — buffer 见底 + 服务端 isEnd 才设, 用户视角真到底 */
   private reachedEnd = false;
+
+  /**
+   * "非匹配"卡片的复用池. 注意: 匹配过滤的卡片不进这里, 它们由 fetchPageAndPartition
+   * 直接 push 给前端 DOM (前端列表自己就是"用户视角的未读 buffer"), buffer 只装
+   * 当前过滤拉到但**不匹配**的卡片.
+   *
+   * 设计要点:
+   *   - 存归一化卡片 (ZhihuClient.fetchRecommend 已通过 4 层去重), 不是 raw items —
+   *     reportRead 在拉到的当时就上报了, 这里只是"等用户改宽过滤后再展示"的复用池.
+   *   - 用户改宽过滤后, 下次 fetchAndPush 走 takeMatchingFromBuffer 复用 — 省一次网络.
+   *   - 内存控制: PREFETCH_HARD_BUFFER_CAP 条上限; 极端过滤 (e.g. min=10w) 下连续多页
+   *     全不匹配也不会无限膨胀, fetchPageAndPartition 内部超限时 trim 头部.
+   *   - 刷新 (replace=true) 时清空: 概念上跟新会话不属同一批, 旧卡不复用.
+   */
+  private cardBuffer: ZhihuCardForView[] = [];
+  /** buffer 总容量硬上限. 防御性数值, 极端过滤场景下兜底防内存膨胀 */
+  private static readonly PREFETCH_HARD_BUFFER_CAP = 100;
+
+  /**
+   * 后台 prefetch 的 in-flight promise. 同时只允许一个后台任务跑,
+   * 也用于前台 fetchAndPush 入口 await 让 prefetch 完手头这一页再让位.
+   */
+  private prefetchPromise: Promise<void> | null = null;
+  /**
+   * 前台 fetchAndPush 是否在等待开始. prefetch 循环每页结束后 check 此标志,
+   * 为 true 则停止下一页拉取, 把 ZhihuClient 状态机让给前台.
+   * 没用 AbortSignal 是因为 axios 这条请求本身不需要 abort — 让出"下一页"的调度即可,
+   * 当前 in-flight 的那页跑完无伤大雅 (反正最多让前台等几百毫秒).
+   */
+  private frontendWantingFetch = false;
+  /**
+   * prefetch 出错后的熔断标志. cookie 失效 / 网络断 / 服务端 5xx 期间, 反复后台
+   * prefetch 会一直失败, 浪费请求 + 反复触发 cookie 失效 banner. 一旦后台 prefetch
+   * 抛错就 suspend, 等下次 refresh() (用户主动刷新) 才重置 — 那时候用户应该已经
+   * 解决了登录态问题.
+   */
+  private prefetchSuspended = false;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -89,9 +128,14 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     const sub = this.auth.onDidChangeLoginState((loggedIn) => {
       this.post({ type: 'loginState', loggedIn });
       if (loggedIn) {
-        // 重置 + 拉一页
+        // 重置 + 拉一页 (refresh 内部会清 buffer / 解除熔断)
         void this.refresh();
       } else {
+        // 退登: 清掉本进程的预取状态, 防止下次登录第一屏看到上个账号 prefetch 的卡
+        this.cardBuffer = [];
+        this.serverIsEnd = false;
+        this.reachedEnd = false;
+        this.prefetchSuspended = false;
         this.post({ type: 'cards', cards: [], replace: true });
       }
     });
@@ -123,6 +167,10 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     this.reachedEnd = false;
+    this.serverIsEnd = false;
+    // 解除 prefetch 熔断: 用户主动刷新表明他想再试一次, 此前的失败 (cookie 失效等)
+    // 可能已经处理. 注意 buffer 清空在 fetchAndPush 内做 (与 resetSession 时序更紧).
+    this.prefetchSuspended = false;
     await this.fetchAndPush(true);
   }
 
@@ -390,8 +438,51 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   /**
    * 真正打到 ZhihuClient 的入口。
    * `replace = true` 表示是刷新, 前端会清空再 append; false 表示加载更多。
+   *
+   * 「同步 batch + 后台静默 push 给前端」策略 — 用户视角始终是"底部一直有已加载未读卡":
+   *
+   *   1) 入口先 await 已 in-flight 的 prefetchPromise (如果有), 让它跑完手上这一页就停;
+   *      期间设 frontendWantingFetch=true, prefetch 循环看到就不开新页, 把 ZhihuClient
+   *      状态机让给前台. 等待时间最多一页 HTTP RTT (~几百毫秒), 用户基本无感.
+   *
+   *   2) 取卡片走两路 (同步, 用户视角是按下按钮就出 N 张):
+   *      a. 优先从 cardBuffer (非匹配残留池) 取匹配当前过滤的 — 零网络瞬时;
+   *         主要在 "用户刚改宽过滤" 这种场景命中, 通常 buffer 是空的.
+   *      b. buffer 凑不够 → fetchPageAndPartition: 拉一页 + 拆分 + 匹配 push 前端 +
+   *         非匹配存 buffer (供未来放宽过滤复用).
+   *
+   *   3) 同步阶段目标:
+   *      - target = refreshTargetCount (默认 6) — 刷新和加载更多都按这个 batch 同步 push.
+   *      - maxAttempts:
+   *          * "刷新+过滤激活": refreshMaxAttempts (默认 10) — 过滤极端时多 try 凑数
+   *          * 其它场景: 1 — 只发一次网络, 后续靠 finally 触发的 prefetch 持续 push.
+   *      - serverIsEnd: 流到底, 退出
+   *
+   *   4) finally 阶段触发 startPrefetchIfNeeded() — 不 await. 这就是"用户视角 buffer"
+   *      的来源: 后台 prefetch 跑起来后, 把拉到的匹配卡**直接 post 给前端** (而不是
+   *      塞 cardBuffer), 前端 append 到列表底部. 用户在阅读时, 底部已经积累了 N 张
+   *      已加载未翻到的卡, 滚下去一眼就看见. 后台 push 自身有上限 (prefetchTargetCount
+   *      默认 12, prefetchMaxPages 默认 5), push 完一轮就停, 下次用户交互再触发,
+   *      DOM 不会无限膨胀.
+   *
+   *   5) replace 语义只在 "本次第一次有内容 push" 时生效, 后续都是 append.
+   *
+   *   6) reportRead 在 fetchPageAndPartition 内 fire-and-forget. 失败 N 次后 ZhihuClient
+   *      内部熔断.
    */
   private async fetchAndPush(replace: boolean): Promise<void> {
+    // 标志后台 prefetch 让出: 即使下面 await 期间 prefetch 又被启动也能立刻让位.
+    this.frontendWantingFetch = true;
+    try {
+      // 让正在跑的 prefetch 把当前这一页跑完 (它会因为 frontendWantingFetch=true 不再开新页).
+      // 这是为了避免 ZhihuClient 状态机 (sessionToken/pageNumber/endOffset) 被并发 fetch 改乱.
+      if (this.prefetchPromise) {
+        await this.prefetchPromise.catch(() => undefined);
+      }
+    } finally {
+      this.frontendWantingFetch = false;
+    }
+
     if (this.loading) {
       // 并发保护: 用户连续点 / 快速滚动时不要叠请求
       return;
@@ -400,25 +491,91 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     this.post({ type: 'loading', loading: true });
 
     try {
-      const { cards, rawItems, isEnd } = await this.client.fetchRecommend(replace);
-
-      // 推给前端 (即使为空也推, 前端会显示 "本页没有新内容")
-      this.post({ type: 'cards', cards, replace });
-
-      if (isEnd) {
-        this.reachedEnd = true;
-        this.post({ type: 'reachEnd' });
+      // 刷新: resetSession 会让服务端从头下发, 旧 buffer 概念上跟新会话不属同一批,
+      // 清空避免给用户 "刷新后第一条还是上次看到的卡" 的认知错位.
+      // (持久化去重 seenTargetKeys 仍生效, 所以 resetSession 后服务端给的也是新内容)
+      if (replace) {
+        this.cardBuffer = [];
       }
 
-      // 上报已读 — 不 await, 失败静默 (ZhihuClient 内部已经吞了异常)
-      void this.client.reportRead(rawItems);
+      const filter = this.getFilter();
+      const filterActive = filter.min > 0 || filter.max > 0;
+      // 刷新+过滤 才走多次循环凑目标; 其它场景 (刷新无过滤 / 加载更多) 只发最多 1 次网络,
+      // 剩下让 prefetch 静默把后续匹配卡 push 给前端 (用户视角"底部一直有未读卡").
+      const loopForTarget = replace && filterActive;
+      const targetMatchCount = this.getRefreshTargetCount();
+      const maxAttempts = loopForTarget ? this.getRefreshMaxAttempts() : 1;
 
-      // 一种保险: 如果服务端给我们的全是重复, cards 为 0 且没到底,
-      // 那就再自动拉一页 (最多一次, 避免死循环)
-      if (cards.length === 0 && !isEnd && !replace) {
-        console.log('[zhihu] 本页 0 条新卡片, 自动续拉一页');
-        // 注意: 这里走的是同一个 fetchAndPush 路径, 但 replace=false,
-        // loading 标记会在 finally 里清掉, 不会死锁
+      let pushedToFrontend = 0;
+      let totalServerCards = 0;
+      let bufferHits = 0;       // 统计: 从 buffer 取到的卡数 (零网络)
+      let attempts = 0;          // 服务端实际请求次数
+      let pendingReplace = replace;
+
+      while (pushedToFrontend < targetMatchCount) {
+        const need = targetMatchCount - pushedToFrontend;
+
+        // 1) 优先从 buffer 取 (buffer 装的几乎全是 "上次拉到但不匹配当前过滤" 的卡;
+        //    用户改宽过滤后会从这里复用, 节约一次网络)
+        const fromBuffer = this.takeMatchingFromBuffer(need, filter, filterActive);
+        if (fromBuffer.length > 0) {
+          this.post({
+            type: 'cards',
+            cards: fromBuffer,
+            replace: pendingReplace,
+          });
+          pendingReplace = false;
+          pushedToFrontend += fromBuffer.length;
+          bufferHits += fromBuffer.length;
+          continue;
+        }
+
+        // 2) buffer 没匹配可取了, 看是不是要去服务端拉
+        if (this.serverIsEnd) break;
+        if (attempts >= maxAttempts) break;
+        attempts++;
+        const refreshFlag = attempts === 1 ? replace : false;
+
+        // fetchPageAndPartition 内部已经做了 reportRead + 把非匹配卡塞 buffer.
+        const { matching, rawCount } = await this.fetchPageAndPartition(refreshFlag);
+        totalServerCards += rawCount;
+        if (matching.length > 0) {
+          this.post({
+            type: 'cards',
+            cards: matching,
+            replace: pendingReplace,
+          });
+          pendingReplace = false;
+          pushedToFrontend += matching.length;
+        }
+        // 极端 case: 服务端返回 0 条 + 到底了, 不会再有数据, 跳出避免死循环
+        if (rawCount === 0 && this.serverIsEnd) break;
+      }
+
+      console.log(
+        `[zhihu] fetchAndPush 完成: 推前端 ${pushedToFrontend} 条 (目标 ${targetMatchCount}); ` +
+          `网络 attempts=${attempts} (服务端 ${totalServerCards} 条), buffer 命中 ${bufferHits} 条, ` +
+          `剩余 buffer=${this.cardBuffer.length}; serverIsEnd=${this.serverIsEnd}, filterActive=${filterActive}`,
+      );
+
+      // 边界: 整个流程一次都没 push (服务端 0 卡 + buffer 0 匹配 + replace=true 还要清空旧列表)
+      if (pendingReplace) {
+        this.post({ type: 'cards', cards: [], replace: true });
+      }
+
+      this.maybeNotifyReachEnd();
+
+      // 刷新场景循环跑满仍未凑够匹配 — 提示用户. 加载更多场景不打提示 (prefetch 会继续
+      // 在后台 push 匹配卡, footer 也会自然回到 "加载更多" 让用户继续点).
+      if (
+        loopForTarget &&
+        pushedToFrontend < targetMatchCount &&
+        !this.serverIsEnd &&
+        attempts >= maxAttempts
+      ) {
+        this.postError(
+          `已尝试 ${attempts} 次仅找到 ${pushedToFrontend} 条符合点赞过滤条件的内容 (目标 ${targetMatchCount}), 可适当放宽过滤范围或继续 "加载更多"`,
+        );
       }
     } catch (e) {
       const m = e instanceof Error ? e.message : String(e);
@@ -426,7 +583,266 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     } finally {
       this.loading = false;
       this.post({ type: 'loading', loading: false });
+      // 启动后台 prefetch — 不 await, 让用户的 fetchAndPush 立即返回.
+      // 关键: prefetch 内部会把拉到的"匹配"卡直接 push 给前端 (而不是只塞 buffer),
+      // 用户视角就是 "底部一直自动冒出新卡片, 翻页时一眼就能看见".
+      this.startPrefetchIfNeeded();
     }
+  }
+
+  /**
+   * 拉一页推荐 + 按当前过滤拆分:
+   *   - 匹配的: 返回给调用方 (调用方决定 push 给前端 / 累计计数)
+   *   - 不匹配的: 塞 cardBuffer (用户改宽过滤后下次 fetchAndPush 走 takeMatchingFromBuffer 复用)
+   *
+   * 同时副作用:
+   *   - 更新 this.serverIsEnd
+   *   - 触发 reportRead (fire-and-forget)
+   *
+   * 每次都新读 getFilter — 用户在 inflight 中切了过滤区间, 也走最新值, 避免老过滤吞掉新匹配.
+   *
+   * 不主动 post 给前端 — push 逻辑由调用方决定, 让 fetchAndPush / runPrefetch 各自有
+   * 推送节奏 (前者目标 refreshTargetCount, 后者目标 prefetchTargetCount).
+   */
+  private async fetchPageAndPartition(
+    replace: boolean,
+  ): Promise<{ matching: ZhihuCardForView[]; rawCount: number }> {
+    const result = await this.client.fetchRecommend(replace);
+    this.serverIsEnd = result.isEnd;
+    void this.client.reportRead(result.rawItems);
+
+    const filter = this.getFilter();
+    const filterActive = filter.min > 0 || filter.max > 0;
+    const matching: ZhihuCardForView[] = [];
+    const nonMatching: ZhihuCardForView[] = [];
+    for (const c of result.cards) {
+      if (!filterActive || this.matchesFilter(c, filter)) matching.push(c);
+      else nonMatching.push(c);
+    }
+    if (nonMatching.length > 0) {
+      this.cardBuffer.push(...nonMatching);
+      // buffer 硬上限保护: 极端过滤 (例如 min=1000000) 下连续多页全不匹配, buffer 会膨胀.
+      // 简单 trim 头部 (保留尾部最新批次, 旧的反正用户也大概率不会再放宽到那么低门槛了)
+      if (this.cardBuffer.length > MainViewProvider.PREFETCH_HARD_BUFFER_CAP) {
+        const drop = this.cardBuffer.length - MainViewProvider.PREFETCH_HARD_BUFFER_CAP;
+        this.cardBuffer.splice(0, drop);
+      }
+    }
+    return { matching, rawCount: result.cards.length };
+  }
+
+  /**
+   * 判定是否已到 "用户视角的底" 并通知前端 (幂等, reachedEnd 已为 true 则跳过):
+   *   = 服务端 isEnd 且 buffer 里也没有匹配当前过滤的卡片可推
+   * 后者很重要: 服务端 isEnd 后, buffer 里可能还有非匹配卡, 用户改宽过滤还能看到,
+   * 这种情况就不该现在告诉前端 reachEnd.
+   *
+   * 在 fetchAndPush 和 runPrefetch 结束时各调一次, 二者都可能拿到最后一页拉到 isEnd.
+   */
+  private maybeNotifyReachEnd(): void {
+    if (this.reachedEnd) return;
+    if (!this.serverIsEnd) return;
+    const filter = this.getFilter();
+    const filterActive = filter.min > 0 || filter.max > 0;
+    if (this.countMatchingInBuffer(filter, filterActive) > 0) return;
+    this.reachedEnd = true;
+    this.post({ type: 'reachEnd' });
+  }
+
+  /**
+   * 启动后台 prefetch (如果当前没在跑 且 还有补充必要).
+   *
+   * 不 throw — 内部所有异常吞掉, 因为后台失败不应影响 UI; resetSession 后下次自然重试.
+   *
+   * 注意: 不再用 cardBuffer.length 判断 "是否还要 prefetch"。runPrefetch 现在的
+   * 任务是 "把匹配卡片 push 给前端" 而不是 "把 buffer 填满", buffer 只装非匹配残留.
+   * 何时停由 runPrefetch 内的 pushedThisRound < target 控制.
+   */
+  private startPrefetchIfNeeded(): void {
+    if (this.prefetchPromise) return;
+    if (this.loading) return;
+    if (this.serverIsEnd) return;
+    if (this.prefetchSuspended) return;
+    if (!this.auth.isLoggedIn()) return;
+
+    this.prefetchPromise = this.runPrefetch()
+      .catch((e) => {
+        // 拉取失败 — 触发熔断 (refresh 时解除). 避免后续每次 fetchAndPush 完都重启
+        // prefetch 然后再次失败, 反复触发 cookie 失效 banner / 浪费请求.
+        this.prefetchSuspended = true;
+        console.warn(
+          '[zhihu] prefetch 失败, 本进程暂停后台 prefetch (用户主动刷新后恢复):',
+          e,
+        );
+      })
+      .finally(() => {
+        this.prefetchPromise = null;
+      });
+  }
+
+  /**
+   * 后台 prefetch 实际执行体 — 把匹配过滤的卡片**直接 push 给前端**, 让前端列表
+   * 自己变成"用户视角的未读 buffer": 底部一直冒出已加载的新卡, 用户翻页 (滚动) 时
+   * 不会看到 loading, 因为内容已经在 DOM 里.
+   *
+   * 终止条件 (任一满足即跳出):
+   *   - 本次已 push 给前端的匹配卡数 >= prefetchTargetCount (默认 12 ≈ 2 页满量)
+   *   - 拉了 prefetchMaxPages 页 (单轮 prefetch 上限, 避免极端过滤连拉 50 页都凑不够)
+   *   - serverIsEnd  (推荐流到底, 不会再有新卡)
+   *   - frontendWantingFetch=true  (前台 fetchAndPush 正在等待用 ZhihuClient, 让位)
+   *
+   * 何时重新跑: 下次 fetchAndPush 结束时的 finally → startPrefetchIfNeeded 触发新一轮.
+   * 也就是说 prefetch 不会无限自递归, push 完一轮就停, 等用户下次交互再触发, DOM
+   * 不会被无限灌满.
+   *
+   * 注意不持有 this.loading 锁 — prefetch 跟前台 loading 语义不同, 不该把前端 spinner
+   * 一直转着 (那会让用户以为 "一直在加载中"). 前台触发时通过 frontendWantingFetch
+   * 让出资源, 不通过 loading 互斥.
+   */
+  private async runPrefetch(): Promise<void> {
+    const target = this.getPrefetchTargetCount();
+    const maxPages = this.getPrefetchMaxPages();
+    let pages = 0;
+    let pushedThisRound = 0;
+    console.log(
+      `[zhihu] prefetch 启动: 目标 push ${target} 条, maxPages=${maxPages}, ` +
+        `buffer(非匹配残留)=${this.cardBuffer.length}`,
+    );
+
+    while (
+      pushedThisRound < target &&
+      pages < maxPages &&
+      !this.serverIsEnd &&
+      !this.frontendWantingFetch
+    ) {
+      pages++;
+      const { matching, rawCount } = await this.fetchPageAndPartition(false);
+      if (matching.length > 0) {
+        this.post({ type: 'cards', cards: matching, replace: false });
+        pushedThisRound += matching.length;
+      }
+      // 服务端连续给 0 条 + 到底, 跳出
+      if (rawCount === 0 && this.serverIsEnd) break;
+    }
+
+    this.maybeNotifyReachEnd();
+
+    console.log(
+      `[zhihu] prefetch 结束: 本轮 push 给前端 ${pushedThisRound}/${target} 条, ` +
+        `pages=${pages}, serverIsEnd=${this.serverIsEnd}, ` +
+        `interrupted=${this.frontendWantingFetch}, buffer 残留=${this.cardBuffer.length}`,
+    );
+  }
+
+  /**
+   * 从 buffer 头部取最多 `need` 张符合过滤的卡片, 取出的从 buffer 移除;
+   * 不匹配的留在 buffer 里 (按原顺序). 不修改 buffer 顺序, 保持服务端推荐顺序.
+   */
+  private takeMatchingFromBuffer(
+    need: number,
+    filter: { min: number; max: number },
+    filterActive: boolean,
+  ): ZhihuCardForView[] {
+    if (need <= 0 || this.cardBuffer.length === 0) return [];
+    const taken: ZhihuCardForView[] = [];
+    const remain: ZhihuCardForView[] = [];
+    for (const c of this.cardBuffer) {
+      if (taken.length < need && (!filterActive || this.matchesFilter(c, filter))) {
+        taken.push(c);
+      } else {
+        remain.push(c);
+      }
+    }
+    this.cardBuffer = remain;
+    return taken;
+  }
+
+  /** buffer 中匹配当前过滤的卡片数 — 用来判 "真到底" */
+  private countMatchingInBuffer(
+    filter: { min: number; max: number },
+    filterActive: boolean,
+  ): number {
+    if (!filterActive) return this.cardBuffer.length;
+    let n = 0;
+    for (const c of this.cardBuffer) {
+      if (this.matchesFilter(c, filter)) n++;
+    }
+    return n;
+  }
+
+  /**
+   * 一次给前端的目标卡片数 — 刷新和"加载更多"都用这个数. 默认 6 (跟知乎推荐流单页
+   * 默认条数一致). 上限 30 防止用户调成离谱值导致一次拉太多卡 (前端 DOM 撑大 + 服务端
+   * 单次拉太多页面).
+   *
+   * 命名历史: 引入 prefetch buffer 后 "刷新" 和 "加载更多" 的目标都统一成了这个值,
+   * 但保留 refreshTargetCount 名字 (不改 setting key 以保持用户配置向后兼容); 描述
+   * 在 package.json 已更新成新语义.
+   */
+  private getRefreshTargetCount(): number {
+    const n = vscode.workspace
+      .getConfiguration('zhihu')
+      .get<number>('refreshTargetCount', 6);
+    if (!Number.isFinite(n) || n < 1) return 6;
+    if (n > 30) return 30;
+    return Math.floor(n);
+  }
+
+  /**
+   * 「凑够匹配卡片」的循环上限. 默认 10 — 经验值, 平衡 "确实凑得起来"
+   * 与 "过滤太极端时不要无限烧请求 + 不要触发风控".
+   * 用户也可以临时调高 (但封顶 30) 以应对小众阈值.
+   */
+  private getRefreshMaxAttempts(): number {
+    const n = vscode.workspace
+      .getConfiguration('zhihu')
+      .get<number>('refreshMaxAttempts', 10);
+    if (!Number.isFinite(n) || n < 1) return 10;
+    if (n > 30) return 30;
+    return Math.floor(n);
+  }
+
+  /**
+   * 后台 prefetch 的 buffer 目标存量 (条数). 默认 12 ≈ 2 页 — 用户翻 1-2 屏
+   * 都能 buffer 命中. 上限 50 防止 prefetch 把无效拉取做到极端.
+   * 设 0 关闭后台 prefetch (回退到 "用户翻页才拉" 的同步模式).
+   */
+  private getPrefetchTargetCount(): number {
+    const n = vscode.workspace
+      .getConfiguration('zhihu')
+      .get<number>('prefetchTargetCount', 12);
+    if (!Number.isFinite(n) || n < 0) return 12;
+    if (n > 50) return 50;
+    return Math.floor(n);
+  }
+
+  /**
+   * 单次后台 prefetch 最多发起的服务端请求数. 默认 5 — 单次最多拉 ~5 页 (~30 条),
+   * 拉完释放, 等下次 fetchAndPush 结束时再 startPrefetchIfNeeded.
+   * 不直接用 refreshMaxAttempts: prefetch 是低优先级背景任务, 单次跑太久会让用户
+   * 长时间感受到接口压力 (虽然 spinner 不转, 但服务端可能限流).
+   */
+  private getPrefetchMaxPages(): number {
+    const n = vscode.workspace
+      .getConfiguration('zhihu')
+      .get<number>('prefetchMaxPages', 5);
+    if (!Number.isFinite(n) || n < 1) return 5;
+    if (n > 20) return 20;
+    return Math.floor(n);
+  }
+
+  /**
+   * 是否落入过滤区间 (跟前端 shouldFilterOut 取反语义).
+   * 约定: min<=0 表示不限下界, max<=0 表示不限上界 — 与 getFilter() 的取值约定对齐.
+   */
+  private matchesFilter(
+    card: ZhihuCardForView,
+    filter: { min: number; max: number },
+  ): boolean {
+    const v = typeof card.voteCount === 'number' ? card.voteCount : 0;
+    if (filter.min > 0 && v < filter.min) return false;
+    if (filter.max > 0 && v > filter.max) return false;
+    return true;
   }
   
   /** 给前端发消息 (view 可能尚未 resolve, 兜底) */
@@ -615,7 +1031,10 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
        这里基础值取 12.5px (跟之前 .card-detail 的 12.5px 视觉一致), 不动 chrome 区. */
     font-size: calc(12.5px * var(--reader-font-scale, 1));
   }
-  .detail-text .inline-img {
+  /* 内联图片相关样式 — 不绑 .detail-text 前缀, 让正文 (.detail-text) / 评论 (.comment-body)
+     / 未来其它内容区都能共用. 类名 inline-img 本身够独特, 不会跟外部样式撞.
+     评论区里图片再额外覆盖 max-height (给评论更紧凑的视觉), 见 .comment-body .inline-img. */
+  .inline-img {
     display: block;
     max-width: 100%;
     max-height: 360px;
@@ -624,7 +1043,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     border-radius: 4px;
     background: var(--vscode-editor-background, transparent);
   }
-  .detail-text .inline-img-broken {
+  .inline-img-broken {
     display: inline-block;
     color: var(--vscode-descriptionForeground);
     font-size: 12px;
@@ -633,7 +1052,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   /* 图片占位符 — imagesEnabled=false 时, 把原本应渲染的 <img> 全部替换成它,
      既不发任何网络请求 (摸鱼场景不能让公司网络/旁观者看到 zhimg.com 的图加载),
      又给用户一个明确的 "这里原本有图" 提示, 可以随时点顶部 🖼️ 按钮切换显示. */
-  .detail-text .inline-img-placeholder {
+  .inline-img-placeholder {
     display: inline-block;
     padding: 2px 8px;
     margin: 4px 0;
@@ -642,6 +1061,12 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     border-radius: 3px;
     font-size: 11.5px;
     user-select: none;
+  }
+  /* 评论区里的图片视觉降一档 — max-height 给小 + 缩短上下 margin, 避免一张表情图
+     把楼层撑得比正文还大. 占位符不需要覆盖 (已经够小). */
+  .comment-body .inline-img {
+    max-height: 220px;
+    margin: 6px 0;
   }
   .detail-loading, .detail-error {
     padding: 12px 0;
@@ -1330,16 +1755,19 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
    *           只是把视觉去掉, 网络流量已经发生, 这是合理的取舍).
    * 同时遍历 inline-img-broken (加载失败占位) — 关闭态下也替换为统一的占位符,
    * 避免视觉杂乱.
+   *
+   * 选择器不绑 .detail-text 前缀 — 评论 (.comment-body) 里的图也要一起切换, 否则
+   * 用户开关图片时正文切了但评论没切, 体感很怪. 类名足够独特, 全局扫无副作用.
    */
   function syncImagesEnabledToDOM() {
     if (imagesEnabled) {
-      const placeholders = document.querySelectorAll('.detail-text .inline-img-placeholder');
+      const placeholders = document.querySelectorAll('.inline-img-placeholder');
       placeholders.forEach((el) => {
         const src = el.dataset && el.dataset.src;
         if (src) el.replaceWith(createImgNode(src));
       });
     } else {
-      const imgs = document.querySelectorAll('.detail-text img.inline-img, .detail-text .inline-img-broken');
+      const imgs = document.querySelectorAll('img.inline-img, .inline-img-broken');
       imgs.forEach((el) => {
         const src = (el.dataset && el.dataset.src) || (el.getAttribute && el.getAttribute('src')) || '';
         if (src) el.replaceWith(createImgPlaceholder(src));
@@ -1907,9 +2335,13 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     }
 
     // —— 正文 ——
+    // 走 renderTextWithImages 而不是 textContent — c.content 里可能含 [IMG:url] 占位符
+    // (后端 toCommentView 用 stripHtmlPreserveBreaks(_, true) 保留的). 走占位符渲染
+    // 才能让评论里的图片按当前 imagesEnabled 状态出图或显示 "🖼️ 图片" 占位.
+    // 注意: 没图的评论里这条 helper 退化成只创建一个 textNode, 跟原 textContent 等价.
     const body = document.createElement('div');
     body.className = 'comment-body';
-    body.textContent = c.content || '';
+    renderTextWithImages(body, c.content || '');
     item.appendChild(body);
 
     // —— meta: 点赞 + 回复按钮 ——
