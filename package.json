@@ -301,7 +301,8 @@
     "watch": "tsc -watch -p ./",
     "lint": "echo \"(skip)\"",
     "package": "vsce package",
-    "release": "bash scripts/release.sh"
+    "release": "bash scripts/release.sh",
+    "install-local": "npm run compile && npx vsce package --out /tmp/weread-vscode-local.vsix && code --install-extension /tmp/weread-vscode-local.vsix --force"
   },
   "dependencies": {
     "axios": "^1.6.7"

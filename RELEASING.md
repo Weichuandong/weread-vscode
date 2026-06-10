@@ -133,6 +133,20 @@ git push --follow-tags
 - 📦 GitHub Release: `https://github.com/weichuandong/weread-vscode/releases/tag/v0.0.5`
 - 🛒 Open VSX: `https://open-vsx.org/extension/weichuandong/weread-vscode`
 
+### Step 6：本地 VSCode 装新版本 🆕
+
+发布完之后，**作者本地的 VSCode 不会自动升级**（因为官方 VSCode 默认指向 Microsoft Marketplace，不读 Open VSX）。一行命令搞定：
+
+```bash
+npm run install-local
+```
+
+这条 script 等价于：编译 → `vsce package` 出 vsix → `code --install-extension --force` 装到本地 VSCode（覆盖旧版本）。
+
+**装完别忘了 reload 窗口**：`Cmd+Shift+P` → `Developer: Reload Window`。
+
+> 💡 **Agent 协议**：当用户对 codewiz/claude 说「发布」时，Agent 应当在 `git push --follow-tags` 成功之后，自动追加一步 `npm run install-local`，并提示用户 reload window。
+
 ---
 
 ## 🔁 极简流程速查（贴墙上）
@@ -144,6 +158,9 @@ npm run release -- 0.0.5
 # 3. push
 git push --follow-tags
 # 4. 喝口水, 1~2 分钟后看 Actions 是否绿勾
+# 5. 本地同步最新版本到 VSCode
+npm run install-local
+# 然后 Cmd+Shift+P → Developer: Reload Window
 ```
 
 ---
