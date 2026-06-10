@@ -2,7 +2,7 @@
   "name": "weread-vscode",
   "displayName": "TouchPlus for VSCode",
   "description": "VSCode 摸鱼套件 — 微信读书 / 知乎推荐流，统一侧边栏，通过粘贴 Cookie 登录",
-  "version": "2.0.1",
+  "version": "2.1.0",
   "publisher": "weichuandong",
   "license": "MIT",
   "author": {
