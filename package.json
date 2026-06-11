@@ -1,7 +1,7 @@
 {
   "name": "weread-vscode",
-  "displayName": "TouchPlus for VSCode",
-  "description": "VSCode 摸鱼套件 — 微信读书 / 知乎推荐流，统一侧边栏，通过粘贴 Cookie 登录",
+  "displayName": "TouchPlus — 微信读书 / 知乎 / 小黑盒 摸鱼套件",
+  "description": "VSCode 摸鱼套件：微信读书阅读 + 知乎推荐流 + 小黑盒(MAX+)游戏资讯（守望先锋/CS:GO/APEX/英雄联盟/绝地求生/三角洲），统一侧边栏，零跳转零打扰",
   "version": "2.1.0",
   "publisher": "weichuandong",
   "license": "MIT",
@@ -26,16 +26,35 @@
   ],
   "keywords": [
     "weread",
-    "微信读书",
     "zhihu",
+    "xiaoheihe",
+    "摸鱼",
+    "max+",
+    "微信读书",
     "知乎",
+    "小黑盒",
+    "touchplus",
+    "game",
+    "游戏资讯",
+    "守望先锋",
+    "csgo",
+    "apex",
+    "英雄联盟",
+    "绝地求生",
+    "三角洲",
+    "ow",
+    "lol",
+    "pubg",
     "reading",
     "ebook",
     "book",
     "novel",
-    "摸鱼",
     "epub",
-    "feed"
+    "feed",
+    "cookie",
+    "sidebar",
+    "fishing",
+    "slack"
   ],
   "galleryBanner": {
     "color": "#2a2a2a",
@@ -58,6 +77,11 @@
           "id": "zhihuVscode",
           "title": "Curio",
           "icon": "resources/zhihu.svg"
+        },
+        {
+          "id": "xiaoheiheVscode",
+          "title": "Arena",
+          "icon": "resources/xiaoheihe.svg"
         }
       ]
     },
@@ -78,6 +102,15 @@
           "name": "curio",
           "icon": "resources/zhihu.svg",
           "contextualTitle": "Curio"
+        }
+      ],
+      "xiaoheiheVscode": [
+        {
+          "type": "webview",
+          "id": "xiaoheiheVscode.main",
+          "name": "arena",
+          "icon": "resources/xiaoheihe.svg",
+          "contextualTitle": "Arena"
         }
       ]
     },
@@ -160,6 +193,36 @@
         "command": "zhihu.clearReadHistory",
         "title": "Curio: 清空已看过记录",
         "icon": "$(clear-all)"
+      },
+      {
+        "command": "xiaoheihe.refresh",
+        "title": "Arena: 刷新当前游戏资讯",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "xiaoheihe.switchGame",
+        "title": "Arena: 切换游戏",
+        "icon": "$(list-selection)"
+      },
+      {
+        "command": "xiaoheihe.openInBrowser",
+        "title": "Arena: 在浏览器中打开",
+        "icon": "$(link-external)"
+      },
+      {
+        "command": "xiaoheihe.resetImei",
+        "title": "Arena: 重置设备 ID (解除小黑盒风控)",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "xiaoheihe.importCookie",
+        "title": "Arena: 导入 Cookie 登录 (启用个性化推荐流)",
+        "icon": "$(sign-in)"
+      },
+      {
+        "command": "xiaoheihe.logout",
+        "title": "Arena: 退出登录",
+        "icon": "$(sign-out)"
       }
     ],
     "menus": {
@@ -217,6 +280,31 @@
         {
           "command": "zhihu.clearReadHistory",
           "when": "view == zhihuTouch.main",
+          "group": "9_recovery@1"
+        },
+        {
+          "command": "xiaoheihe.refresh",
+          "when": "view == xiaoheiheVscode.main",
+          "group": "navigation@1"
+        },
+        {
+          "command": "xiaoheihe.switchGame",
+          "when": "view == xiaoheiheVscode.main",
+          "group": "navigation@2"
+        },
+        {
+          "command": "xiaoheihe.importCookie",
+          "when": "view == xiaoheiheVscode.main",
+          "group": "1_actions@3"
+        },
+        {
+          "command": "xiaoheihe.logout",
+          "when": "view == xiaoheiheVscode.main",
+          "group": "1_actions@4"
+        },
+        {
+          "command": "xiaoheihe.resetImei",
+          "when": "view == xiaoheiheVscode.main",
           "group": "9_recovery@1"
         }
       ]
@@ -318,6 +406,78 @@
             "minimum": 1,
             "maximum": 20,
             "description": "单次后台预拉最多发起的请求数 — 跑完释放资源，下次用户翻页结束后再触发新一轮。防止后台长时间持续打接口被服务端限流。"
+          }
+        }
+      },
+      {
+        "title": "Arena",
+        "properties": {
+          "xiaoheihe.requestTimeout": {
+            "type": "number",
+            "default": 15000,
+            "description": "小黑盒 HTTP 请求超时时间（毫秒）"
+          },
+          "xiaoheihe.defaultSection": {
+            "type": "string",
+            "default": "home",
+            "description": "首次打开 Arena 时默认显示的板块 id（'home' = 主页推荐流，把你启用的板块本地混排；其它常用：ow / sjz / csgo / apex / lol / pubg / yuanshen / naraka / valorant / dota2 / eldenring / pubgm / gta5 / diablo4 / wuthering）。之后会自动记住上次切换的板块。"
+          },
+          "xiaoheihe.enabledSections": {
+            "type": "array",
+            "items": { "type": "string" },
+            "default": ["home", "ow", "sjz", "csgo", "apex", "lol", "pubg"],
+            "description": "启用的板块 id 列表（'home' 主页推荐流总是会显示，不可移除）。tab 栏只展示启用的板块，未启用的隐藏。建议直接在侧栏 tab 栏右侧 ⚙ 按钮里勾选，不要在这里手改。"
+          },
+          "xiaoheihe.customSections": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["id", "label", "tag"],
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "description": "唯一 id（小写无空格，不能跟内置板块重名，例如 'mygame'）"
+                },
+                "label": {
+                  "type": "string",
+                  "description": "tab 上显示的中文短名"
+                },
+                "tag": {
+                  "type": "string",
+                  "description": "小黑盒服务端 tag 字段值（参考小黑盒 APP 抓包；常见格式如 'overwatchtwo' / 'topic_611472'）"
+                }
+              }
+            },
+            "default": [],
+            "description": "自定义板块列表 — 给高阶用户加内置池没有的游戏。每项需要 {id, label, tag}，tag 是小黑盒服务端 /bbs/app/feeds/news 接口认的 tag 字符串（自己抓包确认）。"
+          },
+          "xiaoheihe.homeMixStrategy": {
+            "type": "string",
+            "enum": ["roundrobin", "interleave"],
+            "enumDescriptions": [
+              "轮询：依次从每个启用板块取一条，循环拼到目标条数",
+              "穿插：每个板块取整页后按顺序穿插（保留每个板块的局部顺序）"
+            ],
+            "default": "roundrobin",
+            "description": "主页推荐流的本地混排策略。轮询适合'雨露均沾'，穿插更接近'每个板块都给我几条连续看'。"
+          },
+          "xiaoheihe.pageSize": {
+            "type": "number",
+            "default": 30,
+            "minimum": 10,
+            "maximum": 50,
+            "description": "每页拉取的资讯条数（默认 30，跟官方 APP 一致；调大可能被服务端限流）"
+          },
+          "xiaoheihe.api.cookieInjectMode": {
+            "type": "string",
+            "enum": ["header", "query", "off"],
+            "enumDescriptions": [
+              "把整串 cookie 放进 HTTP Cookie header（H5 web 域标准做法，默认推荐）",
+              "把 pkey/heybox_id 拼到 URL query 上（早期 APP 协议风格，部分服务端可能拒绝，仅做兼容备选）",
+              "完全不注入登录信息，等于强制按未登录态请求（推荐流降级回本地混排）。临时排障兜底用：万一登录后所有接口报'非法请求'/'验证参数错误'，切到这个模式可立刻恢复主页内容（代价是没有个性化推荐）"
+            ],
+            "default": "header",
+            "description": "登录态 cookie 注入位置。改完不用重启，下次请求生效。一般保持默认；接口报 '非法请求' / '验证参数错误' 时可临时切到 'off' 排除是不是 cookie 鉴权失败导致。"
           }
         }
       }

@@ -4,6 +4,7 @@ import { createModuleContext } from './ModuleContext';
 
 import wereadModule from '../modules/weread';
 import zhihuModule from '../modules/zhihu';
+import xiaoheiheModule from '../modules/xiaoheihe';
 
 /**
  * 所有内置模块的清单。
@@ -18,6 +19,7 @@ import zhihuModule from '../modules/zhihu';
 const ALL_MODULES: Module[] = [
   wereadModule,
   zhihuModule,
+  xiaoheiheModule,
 ];
 
 /** 已激活的模块, 用于插件 deactivate 时反向清理 */

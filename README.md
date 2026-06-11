@@ -1,6 +1,6 @@
 # TouchPlus for VSCode
 
-> 在 VSCode 侧边栏看书 + 刷推荐流的双模块"摸鱼"套件。微信读书、知乎一个插件搞定，**零跳转、零打扰、零上传**。
+> 在 VSCode 侧边栏看书 + 刷推荐流 + 看游戏资讯的"摸鱼"套件。微信读书、知乎、小黑盒一个插件搞定，**零跳转、零打扰、零上传**。
 
 [![Version](https://img.shields.io/badge/version-2.0.1-blue.svg)](https://github.com/Weichuandong/weread-vscode/releases)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
@@ -13,7 +13,7 @@
 
 | 亮点 | 一句话 |
 |---|---|
-| 🧩 **一插双模块** | 微信读书 (Folio) + 知乎 (Curio) 共享同一份代码框架，Activity Bar 一边一个图标，不用装两个插件 |
+| 🧩 **一插多模块** | 微信读书 (Folio) + 知乎 (Curio) + 小黑盒 (Arena) 共享同一份代码框架，Activity Bar 一边一个图标，不用装三个插件 |
 | 🪟 **原生侧栏 inline 阅读** | 章节正文直接在 VSCode webview 里渲染，**不开 iframe、不跳浏览器**，看着像在读文档，老板路过零破绽 |
 | 🤫 **零打扰静默 UX** | Cookie 失效不弹 toast / modal，只在 view 顶部挂一条被动 banner，点"重新导入"即可，再也不用一直点关闭弹窗 |
 | 📡 **完整离线能力** | 微信读书章节预缓存层（内存 LRU + 磁盘持久化），翻章自动后台静默预拉后续 N 章，**cookie 过期/断网/飞机上仍能继续看** |
@@ -103,6 +103,31 @@
 
 ---
 
+### 🎮 Arena — 小黑盒游戏资讯
+
+在 VSCode 侧边栏刷小黑盒（MAX+）游戏资讯：六大热门游戏一键切换、卡片式列表、点开浏览器看详情。
+
+#### 资讯流浏览
+
+- 📋 **卡片式列表** —— 封面 + 标题 + 摘要 + 评论/点赞数 + 发布时间
+- 🎬 **视频标记** —— 视频帖卡片角标显示 ▶，提示走外部浏览器看
+- 🔄 **下拉/滚到底加载更多** —— 距底 200px 自动触发，不用手动点
+- 🧠 **会话内去重** —— 服务端偶发返回重复 linkid 时本地过滤掉
+
+#### 多游戏切换
+
+- 顶部 tab 一键切换以下 6 款游戏（顺序即 tab 顺序）：
+  - 守望先锋 / 三角洲 / CS:GO / APEX 英雄 / 英雄联盟 / 绝地求生
+- 切换后自动记住上次选择，下次打开 VSCode 直接定位到那个游戏
+- 命令面板 `Arena: 切换游戏` 也能用 QuickPick 选
+
+#### 无需登录
+
+- 🚪 **零登录** —— 走伪 imei + 签名访问公开 API，没有"cookie 失效"概念，永远直接可用
+- 🔏 **签名内置** —— HMAC-SHA512 + CRC32 算法在 `utils/sign.ts` 本地计算，不依赖远端服务
+
+---
+
 ## 📦 安装
 
 ### 通过编辑器内市场安装
@@ -143,6 +168,13 @@
 3. 推荐流自动加载，点击卡片展开正文
 4. 看完了点"继续阅读"加载下一段
 
+### Arena（小黑盒）
+
+1. 点击 Activity Bar 左侧 🎮 图标
+2. 资讯流自动加载（无需登录）
+3. 顶部 tab 切换游戏；滚到底自动加载更多
+4. 点卡片在浏览器中查看详情（视频帖也走浏览器）
+
 ---
 
 ## 🧭 命令一览
@@ -173,6 +205,14 @@
 | `zhihu.openInBrowser` | Curio: 在浏览器中打开 |
 | `zhihu.clearReadHistory` | Curio: 清空已看过记录 |
 
+### Arena（小黑盒）
+
+| 命令 ID | 标题 |
+|---|---|
+| `xiaoheihe.refresh` | Arena: 刷新当前游戏资讯 |
+| `xiaoheihe.switchGame` | Arena: 切换游戏 |
+| `xiaoheihe.openInBrowser` | Arena: 在浏览器中打开 |
+
 ---
 
 ## ⚙️ 配置
@@ -198,6 +238,14 @@
 | `zhihu.reportRead` | boolean | `true` | 是否向知乎上报"已读"（去重用） |
 | `zhihu.readChunkSize` | number | `400` | 展开正文时每次显示的字符数 |
 
+### Arena（小黑盒）
+
+| 配置项 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `xiaoheihe.requestTimeout` | number | `15000` | HTTP 请求超时时间（毫秒） |
+| `xiaoheihe.defaultGame` | string | `"ow"` | 首次打开默认加载的游戏（`ow`/`sjz`/`csgo`/`apex`/`lol`/`pubg`），之后会自动记住上次切换 |
+| `xiaoheihe.pageSize` | number | `30` | 每页拉取的资讯条数（10~50，跟官方 APP 默认一致） |
+
 ---
 
 ## ⚠️ 免责声明
@@ -212,7 +260,8 @@
 ## 🙏 致谢
 
 - 章节内容接口、签名与解密算法实现，参考了 [touchFish](https://github.com/ylw1997/touchFish) 等优秀开源项目
-- 感谢微信读书和知乎提供优质的内容平台
+- 小黑盒 API 签名算法（HMAC-SHA512 + CRC32）参考了 [vscode-maxPlus](https://github.com/AShujiao/vscode-maxPlus)
+- 感谢微信读书、知乎和小黑盒提供优质的内容平台
 
 ---
 
