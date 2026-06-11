@@ -2,7 +2,7 @@
   "name": "weread-vscode",
   "displayName": "TouchPlus — 微信读书 / 知乎 / 小黑盒 摸鱼套件",
   "description": "VSCode 摸鱼套件：微信读书阅读 + 知乎推荐流 + 小黑盒(MAX+)游戏资讯（守望先锋/CS:GO/APEX/英雄联盟/绝地求生/三角洲），统一侧边栏，零跳转零打扰",
-  "version": "2.1.0",
+  "version": "3.0.0",
   "publisher": "weichuandong",
   "license": "MIT",
   "author": {
@@ -444,13 +444,26 @@
           },
           "xiaoheihe.enabledSections": {
             "type": "array",
-            "items": { "type": "string" },
-            "default": ["home", "ow", "sjz", "csgo", "apex", "lol", "pubg"],
+            "items": {
+              "type": "string"
+            },
+            "default": [
+              "home",
+              "ow",
+              "sjz",
+              "csgo",
+              "apex",
+              "lol",
+              "pubg"
+            ],
             "description": "启用的板块 id 列表（'home' 主页推荐流总是会显示，不可移除）。tab 栏只展示启用的板块，未启用的隐藏。建议直接在侧栏 tab 栏右侧 ⚙ 按钮里勾选，不要在这里手改。"
           },
           "xiaoheihe.homeMixStrategy": {
             "type": "string",
-            "enum": ["roundrobin", "interleave"],
+            "enum": [
+              "roundrobin",
+              "interleave"
+            ],
             "enumDescriptions": [
               "轮询：依次从每个启用板块取一条，循环拼到目标条数",
               "穿插：每个板块取整页后按顺序穿插（保留每个板块的局部顺序）"
@@ -467,7 +480,11 @@
           },
           "xiaoheihe.api.cookieInjectMode": {
             "type": "string",
-            "enum": ["header", "query", "off"],
+            "enum": [
+              "header",
+              "query",
+              "off"
+            ],
             "enumDescriptions": [
               "把整串 cookie 放进 HTTP Cookie header（H5 web 域标准做法，默认推荐）",
               "把 pkey/heybox_id 拼到 URL query 上（早期 APP 协议风格，部分服务端可能拒绝，仅做兼容备选）",
