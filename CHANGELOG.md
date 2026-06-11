@@ -2,6 +2,72 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)，所有重要变更都会记录在这里。
 
+## [3.0.0] - 2026-06-11
+
+> **小黑盒 (Arena) 模块大升级：133 个内置板块 + 主页本地混排 + 卡片就地展开 + 评论分页 + 登录态个性化推荐。** 同时移除 v2.x 草稿态的"手写自定义板块"配置，统一改走"反馈到内置池"路径，避免乱填 tag 触发服务端风控。
+
+### Added — Arena 模块 (重头戏)
+
+#### 多板块体系
+- 🎮 **133 个内置板块** —— [`BUILTIN_SECTIONS`](src/modules/xiaoheihe/types/index.ts:130-285) 一次性硬编码：
+  - **17 个英文 slug 板块**：守望先锋 / 三角洲行动 / CS:GO / APEX / 英雄联盟 / 绝地求生 (6 个 vscode-maxPlus 原版同款) + 原神 / 永劫无间 / 无畏契约 / DOTA2 / 艾尔登法环 / 和平精英 / GTA5 / 暗黑破坏神4 / 星穹铁道 / 鸣潮 / 其它
+  - **116 个话题派生板块**：来源是用户 2026/06 运行时累积的 `xiaoheihe.topicMap` 字典，命名 `t<topicId>`、tag 用 `topic_<topicId>` 兜底；覆盖星露谷、博德 3、赛博 2077、黑神话悟空、怪物猎人荒野、雀魂、王者荣耀，连"沙雕日常 / 校园生活 / 杂谈吐槽"非游戏板块一并收录
+- ⚙ **tab 栏 + 设置面板** —— 顶部 tab 栏只展示用户启用的板块；右上 ⚙ 按钮打开侧边设置面板，复选框勾选内置板块即时生效，关闭后从 tab 栏移除（数据不丢，重新勾回自动恢复）
+- 🔎 **`xiaoheihe.switchToTopic` 命令** —— QuickPick 模糊搜索全部内置板块 + 运行时累积的话题字典；选中后自动 push 进 `enabledSections` 并切过去，比 ⚙ 勾选更快一步直达
+- 📤 **`xiaoheihe.dumpTopicMap` 命令** —— 把当前自动累积的 topicMap 字典输出到 VSCode 新文档（JSON + Markdown 双格式），方便反馈给作者补进下个版本的 BUILTIN_SECTIONS
+
+#### 主页推荐流
+- 🏠 **`home` tab (主页) 永远在第一位** —— 不可禁用，避免空 tab；用户没启用任何其它板块时也至少有一条流
+- 🔀 **本地混排策略 (`xiaoheihe.homeMixStrategy`)**：
+  - `roundrobin` (默认) —— 按启用板块依次轮询取一条，循环拼到目标条数，"雨露均沾"
+  - `interleave` —— 每个板块取整页后按顺序穿插，"每个板块给我看几条连续的"
+- 🎯 **登录后切官方个性化推荐** —— `home` 在登录态下直接走小黑盒 `/bbs/app/feeds/news` 接口，按用户画像排序，效果与官方 APP 首屏一致；未登录降级为本地混排
+- 🧩 **单板块 tab 也用官方推荐流** —— 登录态下单板块走 `/bbs/app/topic/feeds?topic_id=` 个性化推荐，未登录走 APP `tag` 路径按时间序
+
+#### 卡片就地展开
+- 📋 **卡片视图** —— 封面 + 标题 + 摘要 + 作者 + 标签 + 评论/点赞数 + 发布时间；视频帖角标 ▶；home 混排时显示来源板块角标"来自 守望先锋"
+- 📖 **正文 inline 展开** —— 点卡片在侧栏内就地展开（不跳浏览器），图文混排，`[IMG:url]` 占位符按原位渲染；展开后**标题 sticky 置顶**贴在 tab-bar 下方（参照 zhihu 的体验，ResizeObserver 同步高度）
+- 💬 **评论分页** —— "查看评论 (N)" 按钮加载主楼层，每页 N 条，"加载更多"按服务端分页累加；含用户名 / 头像 / 等级 / 点赞 / IP 属地 / 楼层号 / 楼中楼条数提示
+- 🖼️ **图片摸鱼默认关 + 一键开图** —— 卡片图、正文图、评论图全部默认隐藏占位符（老板路过零暴露），工具栏 🖼️ 按钮一键全局切换
+- 🔄 **滚到底自动加载** —— 距底 200px 自动追加；会话内 `linkId` 去重，服务端偶发重复也只显示一次
+
+#### 签名 / 鉴权
+- 🔏 **APP 协议** —— [`utils/sign.ts`](src/modules/xiaoheihe/utils/sign.ts) 内置 HMAC-SHA512 + CRC32 算法（参考 vscode-maxPlus），伪 `imei` 自动生成并持久化
+- 🔐 **Web 协议 v2.2.4 `ov` hash** —— [`utils/webSign.ts`](src/modules/xiaoheihe/utils/webSign.ts) 实现 Nuxt bundle 逆向后的新版 hash 算法，通过官方 3 个 test case + 真实抓包验证；登录态下优先走 web 协议拿个性化推荐流
+- 🛡️ **signedGetLinkTree helper** —— 登录态优先 web、`captcha`/网络错误不 fallback，仅"非法请求"/"登录态被拒"回落 APP 匿名，避免接口异常时盲目降级丢登录权益
+
+#### 登录
+- 🔐 **`xiaoheihe.importCookie` / `xiaoheihe.logout`** —— 粘贴 `pkey` / `heybox_id` cookie 登录、退出登录命令，登录态通过 `SecretStorage` 加密存储
+- 🛠 **`xiaoheihe.api.cookieInjectMode` 配置** —— `header` (默认) / `query` (早期 APP 风格兜底) / `off` (强制匿名排障)，接口报"非法请求"时切 `off` 立刻恢复匿名内容
+- 🔄 **`xiaoheihe.resetImei` 命令** —— 重置伪设备 ID，解小黑盒服务端风控
+
+#### 板块字典累积
+- 📊 **自动累积 topicMap** —— 每次 `fetchTopicRecommendFeed` / `fetchRecommendFeed` / `fetchHomeFeed` 返回 link 数组后，旁路扫描 `link.topics[]` 把"中文板块名 → topicId/picUrl/appId/gameType" 写进 globalState `xiaoheihe.topicMap` 字典
+- 🔁 **字典反查 fallback** —— `fetchFeed` 找不到硬编码 topicId 时反查字典，用得越多字典越完整，越多板块自动获得"推荐流"待遇
+- 📤 **`xiaoheihe.dumpTopicMap` 命令导出** —— 一键把字典输出到 VSCode 新文档 (JSON + Markdown 双格式) 供反馈
+
+### Changed — Arena
+
+- 🏗️ **类型从 `XiaoheiheGameId` 升级为 `XiaoheiheSectionId`** —— 旧 union literal `'ow' | 'sjz' | ...` 改为 `string` 接纳运行时发现的板块；`XiaoheiheGameMeta` / `GAMES` 等旧名保留为 `@deprecated` alias 平稳过渡
+- ⚙ **配置项重命名** —— `xiaoheihe.defaultGame` → `xiaoheihe.defaultSection` (语义升级为"板块"而非"游戏"，默认值从 `"ow"` 改为 `"home"`)
+- 🏠 **首屏默认显示 `home` 而不是某个具体游戏** —— 新用户开箱即得本地混排流，而不是某一款游戏的单板块流
+- 🔄 **`xiaoheihe.switchGame` 命令保留但分流** —— 仍可 QuickPick 切板块，新增 `xiaoheihe.switchToTopic` 提供"含字典发现板块"的全集搜索入口
+
+### Removed — Arena
+
+- ❌ **`xiaoheihe.customSections` 配置项** —— v2.x 草稿态曾允许用户手写 `{id, label, tag}` 数组自定义板块，实际使用中**普通用户根本猜不到 tag 是 'overwatchtwo' 还是 'topic_611472'**，乱填触发服务端"非法请求"。v3.0.0 直接移除该配置项 (旧用户配置自动忽略不报错)，统一改走"反馈到内置池"路径：
+  - 想加新板块？刷一会让 `topicMap` 字典累积 → 跑 `xiaoheihe.dumpTopicMap` 导出 → 发 Issue 给作者
+  - 内置池已收录 133 项，覆盖小黑盒主流场景；缺漏的话题往往是极小众内容，反馈合并后下个版本所有用户一并受益
+- 🧹 **移除 UI 上"未验证"角标** —— BUILTIN_SECTIONS 的 `verified: false` 现仅作为内部元数据保留（指示作者哪些板块需要补抓包），不再在 tab / 设置面板露出 `?` 角标，避免误导用户以为"未验证 = 不能用"
+
+### Fixed — Arena
+
+- 🩹 **守望先锋板块 topicId 修正** —— v2.2.6 早期草稿误把 `'23563'` (实际是"主机游戏"话题) 写成守望先锋 topicId，导致登录后该板块返回的不是守望先锋内容；本次按用户实测抓包数据修正为 `'563627'`，全部 6 个已验证游戏的 topicId 都通过 `link.topics[].topic_id` 反查二次确认
+
+### 致谢
+- 小黑盒 Web 协议 `ov` hash 算法 (Nuxt bundle 逆向) 由用户 2026/06 自行抓包还原，3 个官方 test case 全部对齐
+- 小黑盒 APP 协议签名算法 (HMAC-SHA512 + CRC32) 参考 [vscode-maxPlus](https://github.com/AShujiao/vscode-maxPlus)
+
 ## [2.1.0] - 2026-06-10
 
 > **知乎体验大升级：后台预拉 + 评论显图 + 加载更多 batch 化。底部"已加载未读卡"自动堆积，翻页零等待。**

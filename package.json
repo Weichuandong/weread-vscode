@@ -223,6 +223,16 @@
         "command": "xiaoheihe.logout",
         "title": "Arena: 退出登录",
         "icon": "$(sign-out)"
+      },
+      {
+        "command": "xiaoheihe.switchToTopic",
+        "title": "Arena: 切换到任意板块 (含自动发现的)",
+        "icon": "$(arrow-swap)"
+      },
+      {
+        "command": "xiaoheihe.dumpTopicMap",
+        "title": "Arena: 导出板块 topicMap 字典 (复制 + 打开预览)",
+        "icon": "$(export)"
       }
     ],
     "menus": {
@@ -301,6 +311,16 @@
           "command": "xiaoheihe.logout",
           "when": "view == xiaoheiheVscode.main",
           "group": "1_actions@4"
+        },
+        {
+          "command": "xiaoheihe.switchToTopic",
+          "when": "view == xiaoheiheVscode.main",
+          "group": "1_actions@5"
+        },
+        {
+          "command": "xiaoheihe.dumpTopicMap",
+          "when": "view == xiaoheiheVscode.main",
+          "group": "1_actions@6"
         },
         {
           "command": "xiaoheihe.resetImei",
@@ -427,29 +447,6 @@
             "items": { "type": "string" },
             "default": ["home", "ow", "sjz", "csgo", "apex", "lol", "pubg"],
             "description": "启用的板块 id 列表（'home' 主页推荐流总是会显示，不可移除）。tab 栏只展示启用的板块，未启用的隐藏。建议直接在侧栏 tab 栏右侧 ⚙ 按钮里勾选，不要在这里手改。"
-          },
-          "xiaoheihe.customSections": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "required": ["id", "label", "tag"],
-              "properties": {
-                "id": {
-                  "type": "string",
-                  "description": "唯一 id（小写无空格，不能跟内置板块重名，例如 'mygame'）"
-                },
-                "label": {
-                  "type": "string",
-                  "description": "tab 上显示的中文短名"
-                },
-                "tag": {
-                  "type": "string",
-                  "description": "小黑盒服务端 tag 字段值（参考小黑盒 APP 抓包；常见格式如 'overwatchtwo' / 'topic_611472'）"
-                }
-              }
-            },
-            "default": [],
-            "description": "自定义板块列表 — 给高阶用户加内置池没有的游戏。每项需要 {id, label, tag}，tag 是小黑盒服务端 /bbs/app/feeds/news 接口认的 tag 字符串（自己抓包确认）。"
           },
           "xiaoheihe.homeMixStrategy": {
             "type": "string",

@@ -16,6 +16,7 @@ import type {
   XiaoheiheRawLink,
   XiaoheiheSectionId,
   XiaoheiheSectionMeta,
+  XiaoheiheTopicMeta,
 } from '../types';
 
 /**
@@ -170,15 +171,57 @@ export class XiaoheiheClient {
   private readonly getCookieInjectMode: () => 'header' | 'query' | 'off';
 
   /**
+   * 旁路"板块自动发现"回调 — feeds 响应里每条 link 都自带 topics[] 元信息
+   * (topic_id / name / pic_url / app_id / game_type), 我们 fire-and-forget 把它
+   * 们累积到 globalState 字典 (key 'xiaoheihe.topicMap'), 给 fetchFeed 反查 topicId
+   * 做 fallback. 详见 types/index.ts XiaoheiheTopicMeta 注释.
+   *
+   * 用回调而不是直接持 ExtensionContext 的理由跟 getCookieJar 一致:
+   *   1. 保持 client 不依赖 vscode 运行时 (单测无需 mock vscode)
+   *   2. 累积策略 (合并 / 去重 / 清空策略) 由 index.ts 集中实现, client 不关心
+   *   3. 不注入回调时直接 noop (单测 / 旧调用方不用改)
+   *
+   * 回调实现侧应该:
+   *   - 接收 normalized 后的 XiaoheiheTopicMeta[] (字段已 camelCase, topicId 强转 string)
+   *   - 内部按 name 合并到字典 (后入覆盖前入), 写 globalState
+   *   - 不要在回调里 throw — fire-and-forget 调用方不会 catch, 抛出去也是丢
+   */
+  private readonly onTopicsDiscovered: (topics: XiaoheiheTopicMeta[]) => void;
+
+  /**
+   * 反查"已自动发现的板块 topicId" 回调 — fetchFeed 走推荐流前的兜底.
+   *
+   * 触发顺序: fetchFeed 取 topicId 时
+   *   1) 优先 section.topicId (BUILTIN_SECTIONS 硬编码值, 抓包验证过的)
+   *   2) fallback this.lookupDiscoveredTopicId(section.label / section.id)
+   *      (用户用过的板块, 主页推荐流 / 同板块帖子 link.topics[] 累积出来的)
+   *   3) 全空 → 走老 APP tag 路径 (匿名按时间序)
+   *
+   * key 优先用 section.label (中文名, 跟 topic.name 自然对齐), id (英文 slug)
+   * 兜底是为了万一用户自定义 section 时 label 不规范, 用 id 也能命中.
+   *
+   * 不注入时直接 noop (返回 undefined) — 退化成"只看硬编码 topicId".
+   */
+  private readonly lookupDiscoveredTopicId: (key: string) => string | undefined;
+
+  /**
    * @param opts.imei            必填, 设备 IMEI (调用方应通过 getOrCreateImei 获取)
    * @param opts.getCookieJar    必填, 同步获取当前 cookie jar 的回调 (无登录态时返回 null)
    * @param opts.getCookieInjectMode 可选, 获取 cookie 注入模式. 默认全部返回 'header'.
+   * @param opts.onTopicsDiscovered 可选, "运行时自动发现板块 topicId" 回调.
+   *        每次 fetch{Home|Recommend|TopicRecommend}Feed 返回 link 数组时旁路调用一次,
+   *        参数是从 link.topics[] 归一化出来的 XiaoheiheTopicMeta[]. 不传则不累积.
+   * @param opts.lookupDiscoveredTopicId 可选, "反查已发现 topicId" 回调.
+   *        fetchFeed 在 section 未硬编码 topicId 时按 section.label / section.id 反查;
+   *        命中即走推荐流. 不传则只用硬编码值.
    * @param opts.requestTimeoutMs 请求超时, 默认 15s
    */
   constructor(opts: {
     imei: string;
     getCookieJar: () => XiaoheiheCookieJar | null;
     getCookieInjectMode?: () => 'header' | 'query' | 'off';
+    onTopicsDiscovered?: (topics: XiaoheiheTopicMeta[]) => void;
+    lookupDiscoveredTopicId?: (key: string) => string | undefined;
     requestTimeoutMs?: number;
   }) {
     if (!opts || !opts.imei) {
@@ -191,6 +234,11 @@ export class XiaoheiheClient {
     this.getCookieJar = opts.getCookieJar;
     this.getCookieInjectMode =
       opts.getCookieInjectMode || (() => 'header');
+    // 默认 noop — 没传回调时 collectTopicsFromLinks 仍然会被调用,
+    // 只是没人接收 (省一个 if 分支, 也方便单测注入计数 mock).
+    this.onTopicsDiscovered = opts.onTopicsDiscovered || (() => {});
+    this.lookupDiscoveredTopicId =
+      opts.lookupDiscoveredTopicId || (() => undefined);
     this.axios = axios.create({
       baseURL: 'https://api.xiaoheihe.cn',
       timeout: opts.requestTimeoutMs ?? 15000,
@@ -221,16 +269,72 @@ export class XiaoheiheClient {
     offset: number,
     limit = 30,
   ): Promise<{ cards: XiaoheiheCardForView[]; isEnd: boolean }> {
-    if (!section || !section.tag) {
-      // 主页 (tag='') 不该走这里 — 调用方应改走 fetchHomeFeed.
-      // 这里报错而不是静默返回空, 防止 home tag 错配时主页一直拉空让人误以为是网络问题.
-      throw new Error('fetchFeed 不支持 tag 为空的板块, 主页请走 fetchHomeFeed');
+    if (!section) {
+      throw new Error('fetchFeed 缺 section 参数');
+    }
+    // tag / topicId 至少要有一个 — 主页 (tag='' + topicId 也空) 不该走这里, 应走 fetchHomeFeed.
+    // 历史上这里只校验 tag, 现在 BUILTIN_SECTIONS 全部都有 tag (新增 116 个用 'topic_<id>'
+    // 占位), 但为了兜底未来"只有 topicId 没有 tag" 的自动发现板块也能用, 校验放宽到二选一.
+    if (!section.tag && !section.topicId) {
+      throw new Error('fetchFeed 不支持 tag/topicId 全为空的板块, 主页请走 fetchHomeFeed');
+    }
+
+    // ============================================================
+    // v2.2.6: 登录态 + 板块配了 topicId → 优先走 web 推荐流接口
+    // ============================================================
+    //   - /bbs/app/topic/feeds?topic_id=<数字id>: 服务端按 pkey 个性化排序,
+    //     每次刷新内容会变. 是主页 /bbs/app/feeds 推荐接口的"按板块过滤" 版本.
+    //   - 失败 (path 错 / topicId 错 / cookie 过期 / 风控): 静默 fallback 老 APP
+    //     tag 路径, 体验降级回"按时间序"但仍可用, 不会变白屏.
+    //   - 未登录 / 板块无 topicId / forceApp 兜底: 直接走老 APP tag 路径.
+    //
+    // 内容侧实测差异: web topic/feeds 同板块每次刷新顺序明显不同 (服务端推荐),
+    // 而 APP /feeds/news 是固定按时间序; 这就是 "分板块也变成推荐流" 的根因修复.
+    // ============================================================
+    const jar = this.getCookieJar();
+    // 反查 topicId 优先级 (硬编码 > 字典反查):
+    //   - section.topicId: BUILTIN_SECTIONS 抓包验证过的硬编码值, 优先级最高
+    //   - lookupDiscoveredTopicId: 运行时自动发现的字典 (globalState 'xiaoheihe.topicMap')
+    //     key 用 section.label (中文名) 优先, section.id (英文 slug) 兜底.
+    //     字典是用户用过的所有板块累积出来的, 用得越多覆盖越全.
+    // 任意命中 + 登录态 → 走推荐流; 否则走老 APP tag 路径.
+    const discoveredTopicId =
+      this.lookupDiscoveredTopicId(section.label) ||
+      this.lookupDiscoveredTopicId(section.id);
+    const effectiveTopicId = section.topicId || discoveredTopicId;
+    if (effectiveTopicId && jar && jar.pkey) {
+      // 用 effective topicId 重新构造一个临时 section 传给 fetchTopicRecommendFeed —
+      // 避免污染外层 section (它来自配置 / BUILTIN_SECTIONS, 是只读 readonly).
+      const sectionWithTopic: XiaoheiheSectionMeta = {
+        ...section,
+        topicId: effectiveTopicId,
+      };
+      try {
+        return await this.fetchTopicRecommendFeed(sectionWithTopic, offset, limit);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        const tidSource = section.topicId ? 'builtin' : 'discovered';
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[xiaoheihe] fetchTopicRecommendFeed 失败, fallback 到 APP tag 路径: section=${section.id} topicId=${effectiveTopicId}(${tidSource}) err=${msg}`,
+        );
+      }
+    }
+
+    // ---- APP tag 路径 (推荐流 fallback / 未登录 / 无 topicId) ----
+    // 进到这里仍要求 section.tag 非空 — 没 tag 没法发请求, 此时只能抛错让前端
+    // 提示"该板块需登录后查看" (登录后会走上面 topicId 推荐流分支).
+    if (!section.tag) {
+      throw new Error(
+        `该板块 (${section.label}) 仅支持登录态推荐流, 请导入 Cookie 登录后再查看`,
+      );
     }
 
     // forceAppProtocol=true: /bbs/app/feeds/news 是 APP 端专属路径, web 协议
     // 参数族 (os_type=web 等) 打过去服务端返回 "非法请求". 单板块按 tag 过滤
     // 内容本来就跟账号画像无关, 这里直接强制走 APP 匿名协议, 绕开 web 协议坑.
-    // 代价: 单板块永远是匿名内容 (无个性化), 但官方"单板块"本来就没个性化.
+    // 代价: 单板块走这里只是匿名按时间序 (无个性化), 但 topicId 通道已经在上面
+    // 优先吃下了登录态推荐场景, 这里只承担"无 topicId / 推荐失败 / 未登录" 三档.
     const data = await this.signedGet<XiaoheiheNewsResponse>(
       '/bbs/app/feeds/news',
       {
@@ -244,12 +348,87 @@ export class XiaoheiheClient {
     );
 
     const rawLinks = Array.isArray(data?.result?.links) ? data.result!.links! : [];
+    // 旁路累积 topics — APP /feeds/news 响应 link.topics 大概率为空 (APP 协议字段族
+    // 跟 web 协议不一致), 但试一下不亏, 万一服务端补字段了我们立刻受益.
+    this.collectTopicsFromLinksSafe(rawLinks);
     const cards = rawLinks
       .filter((it) => XiaoheiheClient.isRenderableLink(it))
       .map((it) => this.normalizeLink(it));
 
     // is_end 服务端不一定给, 用"本页一条没拿到" 作为兜底信号 — 配合 offset > 0
     // 时空页基本就到底了 (offset = 0 拿到空页通常意味着 tag 错 / 该游戏没新闻).
+    const isEnd =
+      data?.result?.is_end === true ||
+      data?.result?.is_end === 1 ||
+      rawLinks.length === 0;
+
+    return { cards, isEnd };
+  }
+
+  /**
+   * 拉一页"分板块推荐流" (登录态单板块) — 调用 web 端 /bbs/app/topic/feeds 接口.
+   *
+   * 跟 fetchFeed 老路径 (/bbs/app/feeds/news + tag) 的差异:
+   *   - 路径不同: /bbs/app/topic/feeds, 跟主页推荐 /bbs/app/feeds 同源 (web 协议)
+   *   - 板块标识不同: topic_id 数字 id (e.g. 23563=ow), 而不是 tag 字符串
+   *   - 排序: 服务端按 pkey 个性化推荐排序, 每次刷新顺序可能不同 (vs APP 按时间序)
+   *
+   * 接口契约 (2026/06 用户抓包确认):
+   *   GET /bbs/app/topic/feeds
+   *     topic_id:  板块数字 id (从 XiaoheiheSectionMeta.topicId 取)
+   *     offset:    偏移量, 0 起步
+   *     limit:     每页条数, 默认 10 (抓包默认值; 调大未测过但理论可行)
+   *     lastval:   翻页游标; 浏览器抓包 offset=0 时传空字符串. 后续翻页是否需要
+   *                填上一页末尾 link 的某字段尚未验证, 暂传空跑通最小可行版本.
+   *     dw:        '304' (web 端固定值, 服务端实测不严格校验; 这里不传, 复用 web
+   *                分支默认的 '604' 即可, 主页推荐路径已实证 dw=604 OK)
+   *     (其余环境字段由 signedGet web 分支统一注入: os_type=web / x_app=heybox_website /
+   *      device_id / hkey / nonce / _time / pkey via Cookie header)
+   *   响应 result.links: XiaoheiheRawLink[] (跟 feeds/news 同结构)
+   *
+   * 错误处理:
+   *   - 未登录: 抛 Error (调用方 fetchFeed 已挡, 这里保留兜底)
+   *   - 路径 / topic_id 不对: signedGet 抛业务错误 -> 调用方 fallback 老 tag 路径
+   *
+   * @param section 必须有 topicId 字段, sourceSectionId/Label 不在这里 patch
+   *                (单板块场景前端不需要"来自 XXX" 角标)
+   * @param offset  偏移量 (0 起步)
+   * @param limit   每页条数, 默认 30 (服务端不严格校验)
+   */
+  public async fetchTopicRecommendFeed(
+    section: XiaoheiheSectionMeta,
+    offset: number,
+    limit = 30,
+  ): Promise<{ cards: XiaoheiheCardForView[]; isEnd: boolean }> {
+    if (!section || !section.topicId) {
+      throw new Error('fetchTopicRecommendFeed 需要 section.topicId');
+    }
+    const jar = this.getCookieJar();
+    if (!jar || !jar.pkey) {
+      throw new Error(
+        'fetchTopicRecommendFeed 需要登录态 (缺 pkey); 未登录请走 fetchFeed APP 路径',
+      );
+    }
+    // lastval 空字符串: URLSearchParams 会编码成 'lastval=', 跟浏览器抓包一致
+    // (curl 里写成 '&lastval&' 是 cURL 的省略写法, 等价于 lastval='').
+    const data = await this.signedGet<XiaoheiheNewsResponse>(
+      '/bbs/app/topic/feeds',
+      {
+        topic_id: section.topicId,
+        offset: String(offset),
+        limit: String(limit),
+        lastval: '',
+      },
+    );
+
+    const rawLinks = Array.isArray(data?.result?.links) ? data.result!.links! : [];
+    // 旁路累积 topics — 单板块响应里每条 link 仍可能挂多个 topic
+    // (e.g. 守望先锋页帖子常多挂"PC游戏"), 累积下来后其它板块也能受益.
+    this.collectTopicsFromLinksSafe(rawLinks);
+    const cards = rawLinks
+      .filter((it) => XiaoheiheClient.isRenderableLink(it))
+      .map((it) => this.normalizeLink(it));
+
     const isEnd =
       data?.result?.is_end === true ||
       data?.result?.is_end === 1 ||
@@ -332,6 +511,9 @@ export class XiaoheiheClient {
     });
 
     const rawLinks = Array.isArray(data?.result?.links) ? data.result!.links! : [];
+    // 旁路累积 topics — 主页推荐流是"板块发现"最高效的数据源 (跨多板块混合,
+    // 一次刷新就能覆盖十几个板块). 这里累积下来后 fetchFeed 即可反查 fallback.
+    this.collectTopicsFromLinksSafe(rawLinks);
     const cards = rawLinks
       .filter((it) => XiaoheiheClient.isRenderableLink(it))
       .map((it) => this.normalizeLink(it));
@@ -656,6 +838,72 @@ export class XiaoheiheClient {
    *
    * 不再黑/白名单 content_type, 服务端再加新类型也不需要改这里.
    */
+  /**
+   * 从一批 raw link 里抽出板块 (topic) 元信息, 归一化后 fire-and-forget 推给
+   * onTopicsDiscovered 回调.
+   *
+   * "Safe" 后缀: 内部全程 try-catch, 任何异常都吞 (旁路逻辑绝不允许污染主流程).
+   * 服务端字段缺失 / topics 不是数组 / topic_id 不是数字之类的脏数据都按"跳过该条"
+   * 处理, 不抛.
+   *
+   * 数据源契约 (2026/06 单板块 feeds 响应抓包确认):
+   *   link.topics: [{topic_id, name, pic_url, app_id, game_type, hot_value_v2}, ...]
+   *
+   * 累积语义: 同一次调用内 name 重复时取首个 (一批 link 同板块名应该是同一个 topic_id);
+   * 跨调用合并由 onTopicsDiscovered 回调实现侧负责 (index.ts 把"后入覆盖前入" 写
+   * globalState).
+   */
+  private collectTopicsFromLinksSafe(
+    rawLinks: readonly XiaoheiheRawLink[],
+  ): void {
+    try {
+      if (!Array.isArray(rawLinks) || rawLinks.length === 0) return;
+      const collected = new Map<string, XiaoheiheTopicMeta>();
+      for (const link of rawLinks) {
+        const topics = link?.topics;
+        if (!Array.isArray(topics)) continue;
+        for (const t of topics) {
+          if (!t) continue;
+          const name = typeof t.name === 'string' ? t.name.trim() : '';
+          // topic_id 服务端给 number, 也防御性兜住 string. <=0 / 不可解析的丢弃.
+          const tidRaw = t.topic_id;
+          const tidNum =
+            typeof tidRaw === 'number'
+              ? tidRaw
+              : typeof tidRaw === 'string'
+              ? Number(tidRaw)
+              : NaN;
+          if (!name || !Number.isFinite(tidNum) || tidNum <= 0) continue;
+          if (collected.has(name)) continue; // 同批以首个为准
+          collected.set(name, {
+            topicId: String(tidNum),
+            name,
+            picUrl: typeof t.pic_url === 'string' ? t.pic_url : undefined,
+            appId: typeof t.app_id === 'number' ? t.app_id : undefined,
+            gameType: typeof t.game_type === 'string' ? t.game_type : undefined,
+          });
+        }
+      }
+      if (collected.size === 0) return;
+      // 防回调里再抛把旁路逻辑变成主流程异常源 — 再加一层 try.
+      try {
+        this.onTopicsDiscovered(Array.from(collected.values()));
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          '[xiaoheihe] onTopicsDiscovered 回调抛错, 已忽略:',
+          e instanceof Error ? e.message : String(e),
+        );
+      }
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        '[xiaoheihe] collectTopicsFromLinksSafe 内部异常, 已忽略:',
+        e instanceof Error ? e.message : String(e),
+      );
+    }
+  }
+
   private static isRenderableLink(
     raw: XiaoheiheRawLink | null | undefined,
   ): raw is XiaoheiheRawLink {

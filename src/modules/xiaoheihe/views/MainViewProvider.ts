@@ -6,6 +6,7 @@ import type {
   XiaoheiheCardForView,
   XiaoheiheSectionId,
   XiaoheiheSectionMeta,
+  XiaoheiheTopicMeta,
 } from '../types';
 import {
   BUILTIN_SECTIONS,
@@ -21,10 +22,10 @@ import {
  *   1. 主页推荐流 (id='home'): 不依赖未知接口, 本地把"用户启用的所有板块" round-robin
  *      混排成主页. 默认作为第一个 tab, 不可禁用. 既解决了"没有官方推荐接口"问题, 又
  *      让"个性化"完全可解释 (用户勾选了哪些板块就决定主页内容).
- *   2. 板块自选: 内置 ~16 个板块 (6 个已验证 + 10 个社区高频未验证), 用户在 tab 栏右侧
- *      ⚙ 按钮里勾选启用. 未启用的板块不出现在 tab 里, 主页混排也跳过.
- *   3. 自定义板块: 高阶用户可在 vscode settings.json 的 xiaoheihe.customSections 加
- *      自己抓包的 tag (内置池没覆盖到的小众游戏 / 话题).
+ *   2. 板块自选: 内置板块池 (BUILTIN_SECTIONS, 含 home/常见热门 + 字典硬编码补齐 ~133 项),
+ *      用户在 tab 栏右侧 ⚙ 按钮里勾选启用. 未启用的板块不出现在 tab 里, 主页混排也跳过.
+ *      不在 BUILTIN_SECTIONS 里的新板块: 走 onTopicsDiscovered 收集进 topicMap (供
+ *      xiaoheihe.dumpTopicMap 命令导出反馈给维护者补硬编码), 用户侧无法直接切.
  *
  * 设计取舍 (与 zhihu 模块对比):
  *   1. 主页推荐为啥用本地混排不直连小黑盒推荐接口?
@@ -48,10 +49,10 @@ import {
  *  loadMore:           --postMessage-->  'loadMore'                -->  fetchXxx(current, offset+limit)
  *
  *  点 ⚙:               --postMessage-->  'openSettings'
- *                     <--postMessage--    'sectionsCatalog' { all, enabled, customs }
- *  保存设置:           --postMessage-->  'saveSettings' { enabled, customs }
+ *                     <--postMessage--    'sectionsCatalog' { builtin, enabled }
+ *  保存设置:           --postMessage-->  'saveSettings' { enabled }
  *                                              │
- *                                              ↓ globalState + config
+ *                                              ↓ globalState
  *                     <--postMessage--    'init' (重新推 tab 列表 + 切换到合适板块)
  *
  *  点卡片 (展开):       --postMessage-->  'expand' { reqId, linkId }
@@ -157,6 +158,53 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     return this.switchSection(sectionId);
   }
 
+  /**
+   * "切到指定板块, 顺便把它加进启用列表" — 给 xiaoheihe.switchToTopic 命令用.
+   *
+   * 跟 switchSection 的差别:
+   *   - switchSection 只切, 板块不在 enabled 列表里前端 tab 栏不会显示, 用户视觉割裂
+   *     (能看到帖子但找不到 tab)
+   *   - 这个方法会:
+   *      1. 找不到 section (BUILTIN_SECTIONS 未收录) → 弹通知提示 + return,
+   *         不再硬切. 字典发现的新板块需走 xiaoheihe.dumpTopicMap 反馈给维护者
+   *         补 BUILTIN.
+   *      2. 把目标 sectionId 加进 'xiaoheihe.enabledSections' globalState (如果不在)
+   *      3. 调 pushInit 让前端 tab 列表立刻刷新出新 tab
+   *      4. 调用 loadFirstPage 实际切板块
+   *
+   * @param sectionId   要切到的板块 id (必须命中 BUILTIN_SECTIONS)
+   * @param topicMeta   可选 — 仅用于在"未收录"提示文案里展示板块名, 帮用户辨认.
+   *                   命中 BUILTIN_SECTIONS 时这个参数会被忽略.
+   */
+  public async switchToTopicEnsureEnabled(
+    sectionId: XiaoheiheSectionId,
+    topicMeta?: XiaoheiheTopicMeta,
+  ): Promise<void> {
+    // 1. 确保 section 已在 BUILTIN 收录 — 没收录直接拒绝, 不再自动写 customSections
+    const meta = this.findSection(sectionId);
+    if (!meta) {
+      const niceName = topicMeta?.name ? `「${topicMeta.name}」` : `「${sectionId}」`;
+      vscode.window.showInformationMessage(
+        `小黑盒: 板块 ${niceName} 未在内置列表收录, 暂时无法切换. ` +
+          `可执行 "小黑盒: 导出已发现的话题字典" 命令把它反馈给维护者补进下个版本.`,
+      );
+      return;
+    }
+
+    // 2. 把 sectionId 加进 enabledSections (如果还没启用)
+    const enabled = this.getEnabledSectionIds();
+    if (!enabled.includes(sectionId)) {
+      const next = Array.from(new Set([HOME_SECTION_ID, ...enabled, sectionId]));
+      await this.context.globalState.update('xiaoheihe.enabledSections', next);
+    }
+
+    // 3. 推一次 tab 列表 — 让前端立刻把新启用的 tab 渲染出来 (用户能看到从哪切过去的)
+    this.pushInit();
+
+    // 4. 实际切板块 — 这里直接走 loadFirstPage, 跟 switchSection 等价
+    await this.loadFirstPage(sectionId);
+  }
+
   // ---------- 内部 ----------
 
   private async handleMessage(msg: { type?: string; [k: string]: unknown }): Promise<void> {
@@ -232,18 +280,13 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
         return;
 
       case 'openSettings': {
-        // 弹设置面板 — 推完整的"可选板块目录" + 当前启用 + 自定义板块
+        // 弹设置面板 — 推内置板块目录 + 当前启用
         this.post({
           type: 'sectionsCatalog',
           builtin: BUILTIN_SECTIONS.map((s) => ({
             id: s.id,
             label: s.label,
             verified: s.verified,
-          })),
-          customs: this.getCustomSections().map((s) => ({
-            id: s.id,
-            label: s.label,
-            tag: s.tag,
           })),
           enabled: this.getEnabledSectionIds(),
         });
@@ -254,35 +297,17 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
         const newEnabled = Array.isArray(msg.enabled)
           ? (msg.enabled as unknown[]).filter((x): x is string => typeof x === 'string')
           : [];
-        const newCustoms = Array.isArray(msg.customs)
-          ? (msg.customs as unknown[])
-              .filter((x): x is { id: string; label: string; tag: string } => {
-                if (!x || typeof x !== 'object') return false;
-                const o = x as Record<string, unknown>;
-                return typeof o.id === 'string' &&
-                       typeof o.label === 'string' &&
-                       typeof o.tag === 'string';
-              })
-              // 兜底清洗: id / label / tag 不允许空; id 不能跟内置重名
-              .map((o) => ({ id: o.id.trim(), label: o.label.trim(), tag: o.tag.trim() }))
-              .filter((o) => o.id && o.label && o.tag &&
-                !BUILTIN_SECTIONS.find((b) => b.id === o.id))
-          : [];
 
         // home 必须在 enabled 里 (前端 UI 应该没法取消勾选, 这里再兜底)
         const normalized = Array.from(new Set([HOME_SECTION_ID, ...newEnabled]));
-        // enabled 项必须真实存在 (在内置 + 自定义里)
+        // enabled 项必须真实存在 (在内置板块里)
         const validIds = new Set<string>([
           HOME_SECTION_ID,
           ...BUILTIN_SECTIONS.map((s) => s.id),
-          ...newCustoms.map((s) => s.id),
         ]);
         const cleaned = normalized.filter((id) => validIds.has(id));
 
         await this.context.globalState.update('xiaoheihe.enabledSections', cleaned);
-        await vscode.workspace
-          .getConfiguration('xiaoheihe')
-          .update('customSections', newCustoms, vscode.ConfigurationTarget.Global);
 
         // 若当前板块被禁了 → 切到 home
         if (!cleaned.includes(this.currentSection)) {
@@ -349,25 +374,18 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   /** 把 tab 列表 + 当前选中推送给前端 (init / 设置变更后调用) */
   private pushInit(): void {
     const enabledIds = this.getEnabledSectionIds();
-    // tabs 顺序: home 永远第一, 其它按 BUILTIN_SECTIONS / customs 的"原始顺序" 过滤出已启用的
-    const sections: Array<{ id: string; label: string; verified: boolean; custom: boolean }> = [];
+    // tabs 顺序: home 永远第一, 其它按 BUILTIN_SECTIONS 的"原始顺序" 过滤出已启用的
+    const sections: Array<{ id: string; label: string; verified: boolean }> = [];
     // home tab
     sections.push({
       id: HOME_SECTION_ID,
       label: HOME_SECTION_META.label,
       verified: true,
-      custom: false,
     });
     // builtin
     for (const s of BUILTIN_SECTIONS) {
       if (enabledIds.includes(s.id)) {
-        sections.push({ id: s.id, label: s.label, verified: s.verified, custom: false });
-      }
-    }
-    // custom
-    for (const s of this.getCustomSections()) {
-      if (enabledIds.includes(s.id)) {
-        sections.push({ id: s.id, label: s.label, verified: false, custom: true });
+        sections.push({ id: s.id, label: s.label, verified: s.verified });
       }
     }
     this.post({
@@ -402,7 +420,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     } catch (e) {
       const m = e instanceof Error ? e.message : String(e);
       // 主页 / 单板块的错误体验: 主页全部子板块挂了 = 网络问题; 单板块拉空通常是
-      // tag 错 (未验证板块用户勾上了). 错误文案给得具体些, 引导用户操作.
+      // tag 已变更, 错误文案引导用户去 ⚙ 取消勾选.
       const hint =
         sectionId === HOME_SECTION_ID
           ? m
@@ -478,38 +496,10 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
 
   /** ============ section 解析 ============ */
 
-  /** 内置 + 自定义合并后的全板块查找 (不含 home) */
+  /** 内置板块查找 (含 home) */
   private findSection(id: XiaoheiheSectionId): XiaoheiheSectionMeta | undefined {
     if (id === HOME_SECTION_ID) return HOME_SECTION_META;
-    const builtin = BUILTIN_SECTIONS.find((s) => s.id === id);
-    if (builtin) return builtin;
-    return this.getCustomSections().find((s) => s.id === id);
-  }
-
-  /** 从 vscode config 读自定义板块 (允许用户在 settings.json 手加) */
-  private getCustomSections(): XiaoheiheSectionMeta[] {
-    const raw = vscode.workspace
-      .getConfiguration('xiaoheihe')
-      .get<Array<{ id?: string; label?: string; tag?: string }>>('customSections', []);
-    if (!Array.isArray(raw)) return [];
-    return raw
-      .filter(
-        (it) =>
-          it &&
-          typeof it.id === 'string' &&
-          typeof it.label === 'string' &&
-          typeof it.tag === 'string' &&
-          it.id.trim() && it.label.trim() && it.tag.trim() &&
-          // 别跟内置 id 冲突
-          !BUILTIN_SECTIONS.find((b) => b.id === it.id),
-      )
-      .map((it) => ({
-        id: it.id!.trim(),
-        label: it.label!.trim(),
-        tag: it.tag!.trim(),
-        verified: false,
-        custom: true,
-      }));
+    return BUILTIN_SECTIONS.find((s) => s.id === id);
   }
 
   /** 当前启用的板块 id 列表 (home 一定在里面) */
@@ -518,7 +508,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     const list = Array.isArray(raw) && raw.length > 0 ? raw : Array.from(DEFAULT_ENABLED_SECTIONS);
     // home 强制存在 + 去重
     const set = new Set<string>([HOME_SECTION_ID, ...list]);
-    // 过滤掉已经不存在的 (用户改了 customSections 后旧 id 残留)
+    // 过滤掉已经不存在的 (BUILTIN 调整后旧 id 可能残留在 globalState 里)
     const valid = Array.from(set).filter((id) => !!this.findSection(id));
     return valid;
   }
@@ -679,25 +669,6 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   .tab.home::before {
     content: '🏠 ';
     margin-right: 2px;
-  }
-  /* 未验证 / 自定义 tab 在文字尾部加个小角标 */
-  .tab .badge-unverified,
-  .tab .badge-custom {
-    display: inline-block;
-    margin-left: 4px;
-    padding: 0 4px;
-    font-size: 9px;
-    line-height: 14px;
-    border-radius: 7px;
-    vertical-align: middle;
-  }
-  .tab .badge-unverified {
-    background: var(--vscode-editorWarning-background, rgba(255,180,0,0.15));
-    color: var(--vscode-editorWarning-foreground, #ffb400);
-  }
-  .tab .badge-custom {
-    background: var(--vscode-badge-background, rgba(128,128,128,0.2));
-    color: var(--vscode-badge-foreground, var(--vscode-foreground));
   }
   .tab-actions {
     flex-shrink: 0;
@@ -1127,67 +1098,10 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .settings-row .row-badge {
-    flex-shrink: 0;
-    font-size: 9px;
-    line-height: 14px;
-    padding: 0 4px;
-    border-radius: 7px;
-  }
-  .settings-row .row-badge.unverified {
-    background: var(--vscode-editorWarning-background, rgba(255,180,0,0.15));
-    color: var(--vscode-editorWarning-foreground, #ffb400);
-  }
-  .settings-row .row-badge.custom {
-    background: var(--vscode-badge-background, rgba(128,128,128,0.2));
-    color: var(--vscode-badge-foreground, var(--vscode-foreground));
-  }
   .settings-row.disabled {
     opacity: 0.6;
     cursor: not-allowed;
   }
-  .custom-row {
-    display: flex;
-    gap: 6px;
-    margin-bottom: 6px;
-    align-items: center;
-  }
-  .custom-row input {
-    flex: 1;
-    min-width: 0;
-    padding: 3px 6px;
-    font-size: 12px;
-    background: var(--vscode-input-background);
-    color: var(--vscode-input-foreground);
-    border: 1px solid var(--vscode-input-border, rgba(128,128,128,0.3));
-    border-radius: 3px;
-    font-family: inherit;
-  }
-  .custom-row input:focus { outline: 1px solid var(--vscode-focusBorder); }
-  .custom-row .del-btn {
-    flex-shrink: 0;
-    background: none;
-    border: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.3));
-    color: var(--vscode-errorForeground, #f48771);
-    cursor: pointer;
-    padding: 2px 8px;
-    border-radius: 3px;
-    font-size: 12px;
-    font-family: inherit;
-  }
-  .add-custom-btn {
-    width: 100%;
-    margin-top: 4px;
-    padding: 5px;
-    background: transparent;
-    color: var(--vscode-textLink-foreground, var(--vscode-foreground));
-    border: 1px dashed var(--vscode-widget-border, rgba(128,128,128,0.3));
-    border-radius: 3px;
-    cursor: pointer;
-    font-size: 11px;
-    font-family: inherit;
-  }
-  .add-custom-btn:hover { background: var(--vscode-list-hoverBackground); }
   .settings-actions {
     margin-top: 16px;
     display: flex;
@@ -1223,7 +1137,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     <div class="tab-actions">
       <button class="icon-btn login-btn" id="login-btn" title="登录小黑盒账号 (启用个性化推荐流)">👤</button>
       <button class="icon-btn images-toggle" id="images-toggle-btn" title="开启/关闭正文图片显示 (默认关闭). 也可以直接点击正文里的 🖼️ 占位一键开启.">🖼️</button>
-      <button class="icon-btn" id="settings-btn" title="选择板块 / 自定义">⚙</button>
+      <button class="icon-btn" id="settings-btn" title="选择要在 tab 栏显示的板块">⚙</button>
     </div>
   </div>
   <div id="list"></div>
@@ -1236,7 +1150,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     前端逻辑.
     新增 v2.2:
       - 主页 tab (id='home'): 第一个不可去掉, 渲染时加 🏠 前缀
-      - tab 栏右侧 ⚙ 按钮: 点击弹出设置面板 (modal), 复选板块 + 自定义板块 CRUD
+      - tab 栏右侧 ⚙ 按钮: 点击弹出设置面板 (modal), 复选要在 tab 栏显示的内置板块
       - 卡片在主页流场景多一个 "来自 XXX" 角标 (sourceSectionLabel)
 
     现有功能 (v2.1):
@@ -1344,7 +1258,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
         onCommentsError(msg.reqId, msg.page, msg.message);
         break;
       case 'sectionsCatalog':
-        openSettingsPanel(msg.builtin || [], msg.customs || [], msg.enabled || []);
+        openSettingsPanel(msg.builtin || [], msg.enabled || []);
         break;
       case 'imagesState': {
         // extension 下发的图片显示开关持久化值. ready 后下发一次; 收到后同步 UI + DOM
@@ -1375,19 +1289,6 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       el.className = 'tab' + (s.id === 'home' ? ' home' : '') + (s.id === current ? ' active' : '');
       el.dataset.sectionId = s.id;
       el.textContent = s.label;
-      // 未验证 / 自定义 角标
-      if (s.custom) {
-        const b = document.createElement('span');
-        b.className = 'badge-custom';
-        b.textContent = '自';
-        el.appendChild(b);
-      } else if (!s.verified && s.id !== 'home') {
-        const b = document.createElement('span');
-        b.className = 'badge-unverified';
-        b.title = '未验证 tag — 若没数据可在 ⚙ 里取消勾选';
-        b.textContent = '?';
-        el.appendChild(b);
-      }
       el.addEventListener('click', () => {
         if (s.id === currentSection || listLoading) return;
         vscode.postMessage({ type: 'switchSection', sectionId: s.id });
@@ -1767,23 +1668,19 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
 
   /**
    * 打开设置面板. 设计:
-   *   - 上半部分: 内置板块复选 (双列 grid, home 项 disabled 永远 checked)
-   *   - 下半部分: 自定义板块 — 每行 [label / id / tag / 删除], 底部"加一行"按钮
+   *   - 单一列表: 内置板块复选 (双列 grid, home 项 disabled 永远 checked)
    *   - 底部: [取消] [保存]
    *
-   * 保存时把 enabled (id 数组) + customs 一起 post 回去, extension 写 globalState +
-   * vscode config.
+   * 保存时把 enabled (id 数组) post 回去, extension 写 globalState.
    *
    * @param builtin Array<{id, label, verified}>
-   * @param customs Array<{id, label, tag}>
    * @param enabled string[]
    */
-  function openSettingsPanel(builtin, customs, enabled) {
+  function openSettingsPanel(builtin, enabled) {
     $settingsRoot.innerHTML = '';
     const enabledSet = new Set(enabled);
     // 本地草稿副本 — 用户点保存才生效, 取消则丢弃
     const draftEnabled = new Set(enabledSet);
-    let draftCustoms = customs.map((c) => ({ ...c }));
 
     const mask = document.createElement('div');
     mask.className = 'settings-mask';
@@ -1809,7 +1706,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     const desc = document.createElement('div');
     desc.className = 'settings-desc';
     desc.textContent =
-      '勾选要显示的板块。主页 (🏠) 会把所有勾选的板块本地混排成"推荐流"，所以建议至少勾 3-5 个。带 ? 角标的板块 tag 未抓包验证，没数据时取消勾选即可。';
+      '勾选要显示的板块。主页 (🏠) 会把所有勾选的板块本地混排成"推荐流"，所以建议至少勾 3-5 个。';
     panel.appendChild(desc);
 
     // 内置板块
@@ -1840,82 +1737,6 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     });
     panel.appendChild(builtinList);
 
-    // 自定义板块
-    const customTitle = document.createElement('div');
-    customTitle.className = 'settings-section-title';
-    customTitle.textContent = '自定义板块 (高阶: 手动抓包 tag)';
-    panel.appendChild(customTitle);
-
-    const customWrap = document.createElement('div');
-    panel.appendChild(customWrap);
-
-    function renderCustoms() {
-      customWrap.innerHTML = '';
-      draftCustoms.forEach((c, idx) => {
-        const row = document.createElement('div');
-        row.className = 'custom-row';
-
-        const enableCb = document.createElement('input');
-        enableCb.type = 'checkbox';
-        enableCb.checked = draftEnabled.has(c.id);
-        enableCb.title = '启用';
-        enableCb.addEventListener('change', () => {
-          if (enableCb.checked) draftEnabled.add(c.id);
-          else draftEnabled.delete(c.id);
-        });
-        row.appendChild(enableCb);
-
-        const labelInput = document.createElement('input');
-        labelInput.value = c.label;
-        labelInput.placeholder = '显示名 (如 我的世界)';
-        labelInput.addEventListener('input', () => { c.label = labelInput.value; });
-        row.appendChild(labelInput);
-
-        const idInput = document.createElement('input');
-        idInput.value = c.id;
-        idInput.placeholder = 'id (如 minecraft)';
-        idInput.style.maxWidth = '90px';
-        idInput.addEventListener('input', () => {
-          // id 改了要同步 draftEnabled 里的 id
-          if (draftEnabled.has(c.id)) {
-            draftEnabled.delete(c.id);
-            draftEnabled.add(idInput.value.trim());
-          }
-          c.id = idInput.value.trim();
-        });
-        row.appendChild(idInput);
-
-        const tagInput = document.createElement('input');
-        tagInput.value = c.tag;
-        tagInput.placeholder = 'tag (服务端)';
-        tagInput.style.maxWidth = '110px';
-        tagInput.addEventListener('input', () => { c.tag = tagInput.value.trim(); });
-        row.appendChild(tagInput);
-
-        const del = document.createElement('button');
-        del.className = 'del-btn';
-        del.textContent = '×';
-        del.title = '删除';
-        del.addEventListener('click', () => {
-          draftEnabled.delete(c.id);
-          draftCustoms.splice(idx, 1);
-          renderCustoms();
-        });
-        row.appendChild(del);
-
-        customWrap.appendChild(row);
-      });
-      const add = document.createElement('button');
-      add.className = 'add-custom-btn';
-      add.textContent = '+ 新增自定义板块';
-      add.addEventListener('click', () => {
-        draftCustoms.push({ id: '', label: '', tag: '' });
-        renderCustoms();
-      });
-      customWrap.appendChild(add);
-    }
-    renderCustoms();
-
     // 底部按钮
     const actions = document.createElement('div');
     actions.className = 'settings-actions';
@@ -1928,17 +1749,12 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     save.className = 'settings-btn primary';
     save.textContent = '保存';
     save.addEventListener('click', () => {
-      // 清掉空行 / 不完整的 custom (避免存进配置)
-      const cleanCustoms = draftCustoms
-        .map((c) => ({ id: (c.id || '').trim(), label: (c.label || '').trim(), tag: (c.tag || '').trim() }))
-        .filter((c) => c.id && c.label && c.tag);
-      // 同步 enabled (清掉草稿里残留的、已不在 cleanCustoms 也不在 builtin 的 id)
-      const validIds = new Set(['home', ...builtin.map((b) => b.id), ...cleanCustoms.map((c) => c.id)]);
+      // 兜底: enabled 只保留 builtin 里的 id (home + builtin)
+      const validIds = new Set(['home', ...builtin.map((b) => b.id)]);
       const cleanEnabled = Array.from(draftEnabled).filter((id) => validIds.has(id));
       vscode.postMessage({
         type: 'saveSettings',
         enabled: cleanEnabled,
-        customs: cleanCustoms,
       });
       closeSettings();
     });
@@ -1962,12 +1778,6 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     label.className = 'row-label';
     label.textContent = s.label;
     row.appendChild(label);
-    if (s.id !== 'home' && s.verified === false) {
-      const b = document.createElement('span');
-      b.className = 'row-badge unverified';
-      b.textContent = '未验证';
-      row.appendChild(b);
-    }
     return row;
   }
 

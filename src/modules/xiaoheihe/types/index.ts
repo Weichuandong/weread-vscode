@@ -26,8 +26,8 @@
  *   - 其它:   各游戏板块, 字符串走 vscode 配置 / globalState key, 跟 SectionMeta.id 一致
  *
  * 注意:
- *   - 这里用 string 而不是 union literal — 用户可以在 settings 里加 customSections,
- *     编译期我们不知道有哪些, 用 string 包容; 内置板块的 id 在 BUILTIN_SECTIONS 里维护
+ *   - 这里用 string 而不是 union literal — 内置板块的 id 在 BUILTIN_SECTIONS 里维护
+ *     (运行时还可能新增, 比如字典发现的板块), 用 string 包容更省心
  *   - 旧版本叫 XiaoheiheGameId, 保留 alias 兼容 (现有 client/types 还在引用)
  */
 export type XiaoheiheSectionId = string;
@@ -48,14 +48,36 @@ export interface XiaoheiheSectionMeta {
   /** 给前端 UI 用的中文短名 (tab 文案) */
   label: string;
   /**
-   * 打到服务端 /bbs/app/feeds/news 的 tag 字段值.
+   * 打到服务端 APP 协议 /bbs/app/feeds/news 的 tag 字段值 (字符串, 如 'overwatchtwo').
    * 主页 (id='home') 这里填空字符串, fetch 时走 fetchHomeFeed 不走 tag.
+   * 在没有 topicId 或登录态获取推荐失败时, 这条 tag 路径是最终兜底.
    */
   tag: string;
-  /** 是否抓包验证过 tag 有效 — 未验证的在 UI 上加角标提示 */
+  /**
+   * 打到服务端 web 协议 /bbs/app/topic/feeds 的 topic_id 字段值 (数字字符串, 如 '23563').
+   *
+   * 这是 v2.2.6 新增的"分板块推荐流" 入口 — 真实抓包确认 https://www.xiaoheihe.cn
+   * 单板块页走的是 /bbs/app/topic/feeds?topic_id=<数字> 接口, 服务端按 pkey 个性化
+   * 推荐排序 (跟 /bbs/app/feeds 主页推荐同源, 只是多一个 topic_id 过滤维度).
+   *
+   * 取值: 必须是数字字符串, 跟小黑盒"话题/板块"内部数字 id 一致. 获取方式:
+   *   抓 https://www.xiaoheihe.cn/app/bbs/<slug> 首屏 XHR 请求, query 里 topic_id.
+   *
+   * 仅"已登录态"下生效 — 未登录时 web 协议无 pkey, 接口会返回非法请求.
+   * 缺失 (undefined) 时该板块完全走老 APP tag 路径 (匿名, 无推荐, 按时间序).
+   *
+   * 内置已知 topicId 一览 (待补全):
+   *   - ow:   '563627' (守望先锋, 用户 2026/06 抓单板块 feeds 响应里 link.topics[0].topic_id 确认;
+   *                     早期 v2.2.6 草稿误写过 '23563' 实为别的页面 query 错认, 已修正)
+   *   - sjz / csgo / apex / lol / pubg: TODO 待抓包 (也可走运行时自动累积, 见 globalState
+   *     'xiaoheihe.topicMap' 字典 — feeds 响应 link.topics[] 旁路累积, 零额外请求)
+   */
+  topicId?: string;
+  /**
+   * 是否抓包验证过 tag 有效 — 仅作为内部元数据 (维护参考),
+   * UI 不再露出此字段 (历史曾在 tab/设置面板加 "?" / "未验证" 角标, 已移除).
+   */
   verified: boolean;
-  /** 是否为用户自定义板块 (来自 customSections 配置); UI 在标签后加 "自定义" 区别 */
-  custom?: boolean;
 }
 /** @deprecated 旧名, 用 XiaoheiheSectionMeta */
 export type XiaoheiheGameMeta = XiaoheiheSectionMeta;
@@ -84,32 +106,182 @@ export const HOME_SECTION_META: XiaoheiheSectionMeta = {
  *
  * tag 约定:
  *   - 大小写敏感, 跟服务端约定一致 (实测 csgo / APEX / lol / PUBG 大小写不统一)
- *   - 三角洲的 tag 是 'topic_611472' — 这是小黑盒 APP 内部话题 id, 没独立 slug, 抓包结果, 不要改
+ *   - 三角洲的 tag 是 'topic_611472' — 这是小黑盒 APP 内部话题 id, 没独立 slug, 抓包结果
+ *   - "话题派生" 板块 (id 形如 't<topicId>'): tag 统一用 'topic_<topicId>' 兜底 —
+ *     真实 slug 没抓包确认, 推荐流接口失败时 fallback 到 APP tag 路径有概率成功
+ *     (sjz 验证过 'topic_611472' 这套约定有效), 不成功则前端弹空页 + tag 错提示
  *
  * verified 区分原则:
  *   - 原参考实现 (vscode-maxPlus 1.5.0, 2026/02) 验证过的 6 个 → verified: true
- *   - 其它是基于"小黑盒 APP 游戏圈"页面常见命名猜的 → verified: false, 用户启用后自行验证
- *     (做不到 verified: true 不是技术原因, 是我手上没有 APK 抓包环境跑完整覆盖)
+ *   - 其它都未独立抓 tag 验证 → verified: false, 用户启用后自行验证;
+ *     登录态下走 topicId 推荐流通常可用, 未登录态走 APP tag 路径可能空页
+ *
+ * topicId 来源:
+ *   - 原 6 个 + 部分常见游戏: 用户 2026/06 实测抓 link.topics[].topic_id 确认
+ *     (具体值见 globalState 字典 'xiaoheihe.topicMap' 导出 + 文档)
+ *   - 其余字典补全的 116 项: 来自用户运行时累积的 topicMap 字典硬编码, 让新用户
+ *     不依赖运行时累积也能"开箱即用走推荐流". 这部分都用 id='t<topicId>' 命名,
+ *     一眼能跟"手维护英文 slug" 板块区分开.
+ *
+ * 注: 数据量虽大但都是声明式数据, BUILTIN_SECTIONS 默认只承担"反查 topicId" 角色;
+ * UI 默认 tab 由 DEFAULT_ENABLED_SECTIONS 决定 (7 个), 其余板块用户在 ⚙ 里勾或
+ * 通过 'xiaoheihe.switchToTopic' 命令快速搜索切换.
  */
 export const BUILTIN_SECTIONS: readonly XiaoheiheSectionMeta[] = [
-  // ---- 已验证 (vscode-maxPlus 原版同款) ----
-  { id: 'ow',          label: '守望先锋',         tag: 'overwatchtwo',  verified: true },
-  { id: 'sjz',         label: '三角洲行动',       tag: 'topic_611472',  verified: true },
-  { id: 'csgo',        label: 'CS:GO',           tag: 'csgo',          verified: true },
-  { id: 'apex',        label: 'APEX英雄',        tag: 'APEX',          verified: true },
-  { id: 'lol',         label: '英雄联盟',         tag: 'lol',           verified: true },
-  { id: 'pubg',        label: '绝地求生',         tag: 'PUBG',          verified: true },
-  // ---- 未验证 (社区高频, tag 猜的; 用户启用后可自行验证) ----
-  { id: 'yuanshen',    label: '原神',             tag: 'yuanshen',      verified: false },
-  { id: 'naraka',      label: '永劫无间',         tag: 'naraka',        verified: false },
-  { id: 'valorant',    label: '无畏契约',         tag: 'valorant',      verified: false },
+  // ============================================================
+  // ---- 已验证 (vscode-maxPlus 原版同款 + 用户抓 topicId) ----
+  // ============================================================
+  // topicId 字段全部已 2026/06 抓包验证 (出现在用户字典里 = 服务端能正常返回 link.topics).
+  { id: 'ow',          label: '守望先锋',         tag: 'overwatchtwo',  topicId: '563627', verified: true },
+  { id: 'sjz',         label: '三角洲行动',       tag: 'topic_611472',  topicId: '611472', verified: true },
+  { id: 'csgo',        label: 'CS:GO',           tag: 'csgo',          topicId: '43',     verified: true },
+  { id: 'apex',        label: 'APEX英雄',        tag: 'APEX',          topicId: '57602',  verified: true },
+  { id: 'lol',         label: '英雄联盟',         tag: 'lol',           topicId: '55058',  verified: true },
+  { id: 'pubg',        label: '绝地求生',         tag: 'PUBG',          topicId: '7216',   verified: true },
+  // ============================================================
+  // ---- 未验证 (社区高频, tag 猜的; topicId 字典命中后补全) ----
+  // ============================================================
+  // 这一段 id 是"英文 slug 手维护", 跟下面"话题派生" 段的 't<topicId>' 区分.
+  // topicId 都从用户 2026/06 字典里反查出来 (能命中字典 = 服务端真有这个板块).
+  { id: 'yuanshen',    label: '原神',             tag: 'yuanshen',      topicId: '68834',  verified: false },
+  { id: 'naraka',      label: '永劫无间',         tag: 'naraka',        topicId: '72984',  verified: false },
+  { id: 'valorant',    label: '无畏契约',         tag: 'valorant',      topicId: '235709', verified: false },
   { id: 'dota2',       label: 'DOTA2',           tag: 'dota2',         verified: false },
-  { id: 'eldenring',   label: '艾尔登法环',       tag: 'eldenring',     verified: false },
-  { id: 'pubgm',       label: '和平精英',         tag: 'pubgm',         verified: false },
+  { id: 'eldenring',   label: '艾尔登法环',       tag: 'eldenring',     topicId: '442871', verified: false },
+  { id: 'pubgm',       label: '和平精英',         tag: 'pubgm',         topicId: '21419',  verified: false },
   { id: 'gta5',        label: 'GTA5',            tag: 'gta5',          verified: false },
-  { id: 'diablo4',     label: '暗黑破坏神4',      tag: 'diablo4',       verified: false },
+  { id: 'diablo4',     label: '暗黑破坏神4',      tag: 'diablo4',       topicId: '429033', verified: false },
   { id: 'genshin',     label: '崩坏:星穹铁道',    tag: 'sr',            verified: false },
-  { id: 'wuthering',   label: '鸣潮',             tag: 'wuthering',     verified: false },
+  { id: 'wuthering',   label: '鸣潮',             tag: 'wuthering',     topicId: '667910', verified: false },
+
+  // ============================================================
+  // ---- 话题派生板块 (用户字典硬编码, 共 116 项, 按 topicId 升序) ----
+  // ============================================================
+  // 来源: 2026/06 用户运行时 'xiaoheihe.topicMap' 字典导出 (含 133 项, 去掉上面 17 项重叠后剩 116).
+  // 命名: id='t<topicId>', tag='topic_<topicId>' — 都从 topicId 派生, 没有手维护成本.
+  //   - topicId 是真实抓包确认过的 (来自 link.topics[]), 登录态下走推荐流接口 100% 命中
+  //   - tag 是按 sjz 那套 'topic_<id>' 约定猜的兜底, 未登录态可能空页, 但不会破坏入参校验
+  // verified=false: 这些都没抓独立 tag, 只能算"半验证" (topicId 验证 + tag 推测).
+  { id: 't1',       label: 'PC游戏',                       tag: 'topic_1',       topicId: '1',       verified: false },
+  { id: 't1210',    label: '僵尸毁灭工程',                  tag: 'topic_1210',    topicId: '1210',    verified: false },
+  { id: 't1646',    label: '数字战斗模拟：世界',             tag: 'topic_1646',    topicId: '1646',    verified: false },
+  { id: 't1709',    label: '欧洲卡车模拟2',                  tag: 'topic_1709',    topicId: '1709',    verified: false },
+  { id: 't1747',    label: '星际战甲',                       tag: 'topic_1747',    topicId: '1747',    verified: false },
+  { id: 't1763',    label: '英雄连2',                        tag: 'topic_1763',    topicId: '1763',    verified: false },
+  { id: 't1844',    label: '战争雷霆',                       tag: 'topic_1844',    topicId: '1844',    verified: false },
+  { id: 't3618',    label: '雨世界',                         tag: 'topic_3618',    topicId: '3618',    verified: false },
+  { id: 't3738',    label: '模拟火车：新时代',               tag: 'topic_3738',    topicId: '3738',    verified: false },
+  { id: 't5220',    label: '彩虹六号：围攻X',                tag: 'topic_5220',    topicId: '5220',    verified: false },
+  { id: 't5457',    label: 'Blender',                       tag: 'topic_5457',    topicId: '5457',    verified: false },
+  { id: 't5772',    label: '黑暗之魂3',                      tag: 'topic_5772',    topicId: '5772',    verified: false },
+  { id: 't6382',    label: '战术小队',                       tag: 'topic_6382',    topicId: '6382',    verified: false },
+  { id: 't6950',    label: '命运石之门',                     tag: 'topic_6950',    topicId: '6950',    verified: false },
+  { id: 't6958',    label: '星露谷物语',                     tag: 'topic_6958',    topicId: '6958',    verified: false },
+  { id: 't7214',    label: '盒友杂谈',                       tag: 'topic_7214',    topicId: '7214',    verified: false },
+  { id: 't11635',   label: 'Wallpaper Engine',              tag: 'topic_11635',   topicId: '11635',   verified: false },
+  { id: 't16370',   label: '装机模拟器',                     tag: 'topic_16370',   topicId: '16370',   verified: false },
+  { id: 't17268',   label: '骑马与砍杀2：霸主',              tag: 'topic_17268',   topicId: '17268',   verified: false },
+  { id: 't17276',   label: '刺客信条：起源',                 tag: 'topic_17276',   topicId: '17276',   verified: false },
+  { id: 't18745',   label: '数码硬件',                       tag: 'topic_18745',   topicId: '18745',   verified: false },
+  { id: 't18845',   label: '猎杀：对决 1896',                tag: 'topic_18845',   topicId: '18845',   verified: false },
+  { id: 't21325',   label: '手机游戏',                       tag: 'topic_21325',   topicId: '21325',   verified: false },
+  { id: 't21972',   label: '影视',                           tag: 'topic_21972',   topicId: '21972',   verified: false },
+  { id: 't21983',   label: '魔兽世界',                       tag: 'topic_21983',   topicId: '21983',   verified: false },
+  { id: 't22892',   label: '王者荣耀',                       tag: 'topic_22892',   topicId: '22892',   verified: false },
+  { id: 't23563',   label: '主机游戏',                       tag: 'topic_23563',   topicId: '23563',   verified: false },
+  { id: 't23799',   label: '明日方舟',                       tag: 'topic_23799',   topicId: '23799',   verified: false },
+  { id: 't23825',   label: 'BanG Dream! 少女乐团派对!',      tag: 'topic_23825',   topicId: '23825',   verified: false },
+  { id: 't47779',   label: '黑暗之魂：重制版',               tag: 'topic_47779',   topicId: '47779',   verified: false },
+  { id: 't49446',   label: '怪物猎人：世界',                 tag: 'topic_49446',   topicId: '49446',   verified: false },
+  { id: 't49557',   label: '刺客信条：奥德赛',               tag: 'topic_49557',   topicId: '49557',   verified: false },
+  { id: 't53575',   label: '荒野大镖客：救赎2',              tag: 'topic_53575',   topicId: '53575',   verified: false },
+  { id: 't57326',   label: '深海迷航：零度之下',             tag: 'topic_57326',   topicId: '57326',   verified: false },
+  { id: 't65410',   label: '命运2',                          tag: 'topic_65410',   topicId: '65410',   verified: false },
+  { id: 't65429',   label: '博德之门3',                       tag: 'topic_65429',   topicId: '65429',   verified: false },
+  { id: 't65513',   label: '赛博朋克2077',                    tag: 'topic_65513',   topicId: '65513',   verified: false },
+  { id: 't66739',   label: 'PS',                             tag: 'topic_66739',   topicId: '66739',   verified: false },
+  { id: 't68079',   label: '动漫',                           tag: 'topic_68079',   topicId: '68079',   verified: false },
+  { id: 't70761',   label: '十字军之王3',                    tag: 'topic_70761',   topicId: '70761',   verified: false },
+  { id: 't73361',   label: '毕业之后',                       tag: 'topic_73361',   topicId: '73361',   verified: false },
+  { id: 't73907',   label: '沙雕日常',                       tag: 'topic_73907',   topicId: '73907',   verified: false },
+  { id: 't74104',   label: '千恋＊万花',                     tag: 'topic_74104',   topicId: '74104',   verified: false },
+  { id: 't77779',   label: '家庭战斗员',                     tag: 'topic_77779',   topicId: '77779',   verified: false },
+  { id: 't416158',  label: '情投一盒',                       tag: 'topic_416158',  topicId: '416158',  verified: false },
+  { id: 't416618',  label: '战地风云1',                       tag: 'topic_416618',  topicId: '416618',  verified: false },
+  { id: 't417657',  label: '雀魂麻将',                       tag: 'topic_417657',  topicId: '417657',  verified: false },
+  { id: 't419037',  label: '周边',                           tag: 'topic_419037',  topicId: '419037',  verified: false },
+  { id: 't419470',  label: '萌宠',                           tag: 'topic_419470',  topicId: '419470',  verified: false },
+  { id: 't425422',  label: 'Steam',                          tag: 'topic_425422',  topicId: '425422',  verified: false },
+  { id: 't428481',  label: '电脑集团（测试版）',             tag: 'topic_428481',  topicId: '428481',  verified: false },
+  { id: 't428513',  label: '碧蓝档案-日服',                  tag: 'topic_428513',  topicId: '428513',  verified: false },
+  { id: 't430505',  label: '仙剑奇侠传三',                   tag: 'topic_430505',  topicId: '430505',  verified: false },
+  { id: 't430534',  label: '小说',                           tag: 'topic_430534',  topicId: '430534',  verified: false },
+  { id: 't431073',  label: '困兽之国',                       tag: 'topic_431073',  topicId: '431073',  verified: false },
+  { id: 't431100',  label: '仙剑奇侠传',                     tag: 'topic_431100',  topicId: '431100',  verified: false },
+  { id: 't441867',  label: 'Steam Deck Deposit',             tag: 'topic_441867',  topicId: '441867',  verified: false },
+  { id: 't445015',  label: 'Red Dead Redemption',            tag: 'topic_445015',  topicId: '445015',  verified: false },
+  { id: 't448724',  label: '怪物猎人：崛起',                 tag: 'topic_448724',  topicId: '448724',  verified: false },
+  { id: 't449891',  label: '战神',                           tag: 'topic_449891',  topicId: '449891',  verified: false },
+  { id: 't450671',  label: '碧蓝档案',                       tag: 'topic_450671',  topicId: '450671',  verified: false },
+  { id: 't454622',  label: '弧光猎人',                       tag: 'topic_454622',  topicId: '454622',  verified: false },
+  { id: 't454996',  label: '刺客信条',                       tag: 'topic_454996',  topicId: '454996',  verified: false },
+  { id: 't455400',  label: '绘画',                           tag: 'topic_455400',  topicId: '455400',  verified: false },
+  { id: 't459272',  label: '微软飞行模拟',                   tag: 'topic_459272',  topicId: '459272',  verified: false },
+  { id: 't461250',  label: '游戏王：大师决斗',                tag: 'topic_461250',  topicId: '461250',  verified: false },
+  { id: 't475487',  label: '杂谈吐槽',                       tag: 'topic_475487',  topicId: '475487',  verified: false },
+  { id: 't475500',  label: 'OW攻略讨论',                     tag: 'topic_475500',  topicId: '475500',  verified: false },
+  { id: 't476880',  label: '使命召唤®',                      tag: 'topic_476880',  topicId: '476880',  verified: false },
+  { id: 't478674',  label: '鸦卫奇旅',                       tag: 'topic_478674',  topicId: '478674',  verified: false },
+  { id: 't484227',  label: '街头霸王6',                       tag: 'topic_484227',  topicId: '484227',  verified: false },
+  { id: 't486313',  label: '生化危机4 重制版',                 tag: 'topic_486313',  topicId: '486313',  verified: false },
+  { id: 't486620',  label: '犹格索托斯的庭院',               tag: 'topic_486620',  topicId: '486620',  verified: false },
+  { id: 't486783',  label: '铁拳8',                          tag: 'topic_486783',  topicId: '486783',  verified: false },
+  { id: 't549999',  label: '校园生活',                       tag: 'topic_549999',  topicId: '549999',  verified: false },
+  { id: 't550000',  label: '职场工作',                       tag: 'topic_550000',  topicId: '550000',  verified: false },
+  { id: 't563101',  label: '万词破 - 单词女友 WCP Word',      tag: 'topic_563101',  topicId: '563101',  verified: false },
+  { id: 't564905',  label: '5050',                           tag: 'topic_564905',  topicId: '564905',  verified: false },
+  { id: 't568547',  label: '黑神话：悟空',                   tag: 'topic_568547',  topicId: '568547',  verified: false },
+  { id: 't570910',  label: 'WRC',                            tag: 'topic_570910',  topicId: '570910',  verified: false },
+  { id: 't581822',  label: '侠盗猎车手 6',                    tag: 'topic_581822',  topicId: '581822',  verified: false },
+  { id: 't583653',  label: '怪物猎人：荒野',                 tag: 'topic_583653',  topicId: '583653',  verified: false },
+  { id: 't590409',  label: '逆战：未来',                     tag: 'topic_590409',  topicId: '590409',  verified: false },
+  { id: 't590990',  label: '学生时代',                       tag: 'topic_590990',  topicId: '590990',  verified: false },
+  { id: 't600812',  label: '天国：拯救2',                    tag: 'topic_600812',  topicId: '600812',  verified: false },
+  { id: 't600897',  label: '暗区突围：无限（PC）',           tag: 'topic_600897',  topicId: '600897',  verified: false },
+  { id: 't610368',  label: '真・三国无双 起源',              tag: 'topic_610368',  topicId: '610368',  verified: false },
+  { id: 't615783',  label: '游戏开发',                       tag: 'topic_615783',  topicId: '615783',  verified: false },
+  { id: 't632593',  label: '无主之地4',                       tag: 'topic_632593',  topicId: '632593',  verified: false },
+  { id: 't640844',  label: '荒野大镖客：救赎',               tag: 'topic_640844',  topicId: '640844',  verified: false },
+  { id: 't642313',  label: 'Subnautica 2：异星水域',         tag: 'topic_642313',  topicId: '642313',  verified: false },
+  { id: 't643838',  label: '失落星船：马拉松',               tag: 'topic_643838',  topicId: '643838',  verified: false },
+  { id: 't647773',  label: '刺客信条：影',                   tag: 'topic_647773',  topicId: '647773',  verified: false },
+  { id: 't651390',  label: '逃离鸭科夫',                     tag: 'topic_651390',  topicId: '651390',  verified: false },
+  { id: 't651663',  label: '艾尔登法环 黑夜君临',             tag: 'topic_651663',  topicId: '651663',  verified: false },
+  { id: 't651702',  label: '鬼武者：剑之道',                  tag: 'topic_651702',  topicId: '651702',  verified: false },
+  { id: 't658481',  label: '追曙',                           tag: 'topic_658481',  topicId: '658481',  verified: false },
+  { id: 't660778',  label: 'R.E.P.O.',                       tag: 'topic_660778',  topicId: '660778',  verified: false },
+  { id: 't661934',  label: '剑星',                           tag: 'topic_661934',  topicId: '661934',  verified: false },
+  { id: 't668697',  label: 'F1® 25',                         tag: 'topic_668697',  topicId: '668697',  verified: false },
+  { id: 't670476',  label: '燕云十六声',                     tag: 'topic_670476',  topicId: '670476',  verified: false },
+  { id: 't679883',  label: '识质存在',                       tag: 'topic_679883',  topicId: '679883',  verified: false },
+  { id: 't679891',  label: '胜利女神：新的希望',             tag: 'topic_679891',  topicId: '679891',  verified: false },
+  { id: 't686823',  label: 'NBA 2K26',                       tag: 'topic_686823',  topicId: '686823',  verified: false },
+  { id: 't687991',  label: 'EA SPORTS FC™ 26',               tag: 'topic_687991',  topicId: '687991',  verified: false },
+  { id: 't702066',  label: '战地风云™ 6',                    tag: 'topic_702066',  topicId: '702066',  verified: false },
+  { id: 't712538',  label: '足球经理26',                     tag: 'topic_712538',  topicId: '712538',  verified: false },
+  { id: 't714349',  label: '逃离塔科夫',                     tag: 'topic_714349',  topicId: '714349',  verified: false },
+  { id: 't716382',  label: '极限竞速：地平线 6',             tag: 'topic_716382',  topicId: '716382',  verified: false },
+  { id: 't717591',  label: '刺客信条IV：黑旗',                tag: 'topic_717591',  topicId: '717591',  verified: false },
+  { id: 't719027',  label: '宝可梦Pokopia',                  tag: 'topic_719027',  topicId: '719027',  verified: false },
+  { id: 't722821',  label: '四合 Quadrangle',                tag: 'topic_722821',  topicId: '722821',  verified: false },
+  { id: 't737442',  label: '罪金游戏',                       tag: 'topic_737442',  topicId: '737442',  verified: false },
+  { id: 't756571',  label: '女王的游戏：盛世天下 女帝篇',     tag: 'topic_756571',  topicId: '756571',  verified: false },
+  { id: 't756617',  label: '盛世天下：女帝篇',               tag: 'topic_756617',  topicId: '756617',  verified: false },
+  { id: 't756734',  label: '守望先锋®',                      tag: 'topic_756734',  topicId: '756734',  verified: false },
+  { id: 't758884',  label: '刺客信条:黑旗 记忆重置',          tag: 'topic_758884',  topicId: '758884',  verified: false },
+  { id: 't759761',  label: '地球Online',                     tag: 'topic_759761',  topicId: '759761',  verified: false },
+  { id: 't767376',  label: '漫威金刚狼',                     tag: 'topic_767376',  topicId: '767376',  verified: false },
+  { id: 't768116',  label: 'Stellar Blade: BLOOD',           tag: 'topic_768116',  topicId: '768116',  verified: false },
 ] as const;
 
 /**
@@ -166,9 +338,79 @@ export interface XiaoheiheRawLink {
   share_url?: string;
   comment_num?: number;
   link_award_num?: number;
+  /**
+   * 该 link 关联的"板块/话题" 元信息数组 (2026/06 抓单板块 feeds 响应确认).
+   *
+   * 每条帖子可能挂多个板块 (例如同一篇守望先锋视频既挂"守望先锋" 又挂"PC游戏"),
+   * 服务端在 link 维度自带完整 topic 元信息 (topic_id / name / pic_url / app_id / game_type)
+   * — 这是我们"零成本自动发现 topicId" 的数据源:
+   *
+   *   feeds 响应 → 每条 link.topics[] → 旁路累积到 globalState 'xiaoheihe.topicMap'
+   *
+   * 跟 hashtags 区别:
+   *   - hashtags: 话题标签 (UI 角标用, hashtag_id 不能打 topic/feeds 接口)
+   *   - topics:   板块/游戏圈 (topic_id 可直接打 /bbs/app/topic/feeds 拉推荐流)
+   */
+  topics?: XiaoheiheRawTopic[];
   /** 服务端可能塞的其他字段, 一律保留不读 */
   [key: string]: unknown;
 }
+
+/**
+ * 服务端 link.topics[] 单元素的字段子集 (2026/06 抓包确认).
+ *
+ * 字段命名按 web 协议响应原样保留 (snake_case), 进入插件层的 globalState 字典前
+ * 经 XiaoheiheClient.extractTopicsFromLinks 归一化成 XiaoheiheTopicMeta (camelCase).
+ */
+export interface XiaoheiheRawTopic {
+  /** 板块数字 id, 可直接打 /bbs/app/topic/feeds?topic_id= */
+  topic_id?: number | string;
+  /** 板块中文名 (用作 globalState 字典 key) */
+  name?: string;
+  /** 板块封面图 (UI 展示用) */
+  pic_url?: string;
+  /** 关联 Steam appid (PC 游戏才有, 主机/手游缺) */
+  app_id?: number;
+  /** 平台类型: 'pc' / 'console' / 'mobile' / ... */
+  game_type?: string;
+  /** 服务端打的热度分 (排序参考, 业务用不上) */
+  hot_value_v2?: number;
+  [key: string]: unknown;
+}
+
+/**
+ * 板块/话题元信息 (插件层归一化版本, 写入 globalState 'xiaoheihe.topicMap').
+ *
+ * 跟 XiaoheiheRawTopic 的差异:
+ *   - 字段名 camelCase (跟插件层其他类型对齐)
+ *   - topicId 强制 string (跟 XiaoheiheSectionMeta.topicId 类型对齐)
+ *   - 只保留业务可能用到的字段, 服务端排序分等丢弃
+ *
+ * globalState 存储结构: Record<topicName, XiaoheiheTopicMeta>
+ *   key 用 topic.name (中文名), 因为 fetchFeed 反查时只能拿到 section.label 中文名
+ *   (section.tag 是 'overwatchtwo' 这种英文 slug, 跟 topic.name 不对齐, 不能做主键).
+ */
+export interface XiaoheiheTopicMeta {
+  topicId: string;
+  name: string;
+  picUrl?: string;
+  appId?: number;
+  gameType?: string;
+}
+
+/**
+ * globalState 存放"运行时自动发现的板块 topicId 字典" 的 key.
+ *
+ * 累积时机: 每次 fetchTopicRecommendFeed / fetchRecommendFeed / fetchHomeFeed 返回
+ * link 数组后, 旁路扫描 link.topics[] 把 (name → meta) 写进字典. fetchFeed 找不到
+ * 硬编码 topicId 时反查这个字典作为 fallback — 用户用得越多, 字典越完整, 越多板块
+ * 自动获得"推荐流" 待遇.
+ *
+ * 字典只增不减 (除非用户手动清, 见 xiaoheihe.clearTopicMap 命令, 待加): 板块下线
+ * 的概率极低, 即使下线了用旧 topicId 打接口最坏也就是返回空, fetchFeed 自动 fallback
+ * 老 APP tag 路径.
+ */
+export const TOPIC_MAP_STORAGE_KEY = 'xiaoheihe.topicMap';
 
 /** /bbs/app/feeds/news 的响应外壳 */
 export interface XiaoheiheNewsResponse {
