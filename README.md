@@ -2,7 +2,7 @@
 
 > 在 VSCode 侧边栏看书 + 刷推荐流 + 看游戏资讯的"摸鱼"套件。微信读书、知乎、小黑盒一个插件搞定，**零跳转、零打扰、零上传**。
 
-[![Version](https://img.shields.io/badge/version-3.0.0-blue.svg)](https://github.com/Weichuandong/weread-vscode/releases)
+[![Version](https://img.shields.io/badge/version-3.1.0-blue.svg)](https://github.com/Weichuandong/weread-vscode/releases)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 ---
@@ -25,7 +25,8 @@
 | 🎨 **5 维排版自定义** | 字号 / 行距 / 段距 / 页宽 / 字体五个维度共 20 档，CSS 变量驱动**零闪烁**实时切换，每个人都能找到自己的阅读舒适区 |
 | 🚫 **智能四层去重（知乎）** | session_token 轮替 + read 上报 + 会话内 Set + 持久化 targetKey，刷推荐流**不重不漏**，跨重启都不会刷到看过的 |
 | 💡 **精准想法 popover** | 微信读书正文 inline 划线点击后，按 weread 字符 offset range 精准拉对应想法（而非全章 markText 模糊匹配），命中率显著提升 |
-| ⌨️ **键盘党友好** | 阅读页 ↑/↓/PgUp/PgDn/Space 翻页，←/→ 切章，Home/End 跳本章首尾，**视线不离正文** |
+| ⌨️ **键盘党友好** | 微信读书阅读页 ↑/↓/PgUp/PgDn/Space 翻页 + ←/→ 切章 + Home/End 跳本章首尾；其它视图统一支持 ↑/↓ 小步走、Space 翻底、Shift+Space 翻顶，**视线不离正文** |
+| 🔍 **图片一键放大** | 三模块共享 lightbox：任意图片点击即放大，**滚轮缩放 / 拖拽平移 / 双击 1x↔2x / ←→ 上下张 / Esc 关闭**，头像和小图自动跳过 |
 | 🍃 **摸鱼细节** | 图片默认关闭（同事路过看不到知乎封面图 / 小黑盒游戏图），A-/A+ 调字号，分段加载长回答，开关一律持久到 workspaceState 不同项目可不同 |
 | 🩺 **诊断工具齐全** | `weread.diagnoseCookie` 现场实测 Cookie 续命健康度，`weread.chapterCacheStats` 下钻浏览缓存，`xiaoheihe.dumpTopicMap` 把跑出来的板块字典一键导出反馈 |
 
@@ -128,7 +129,8 @@
 - 📋 **卡片列表** —— 封面 + 标题 + 摘要 + 作者 + 标签 + 评论/点赞数 + 发布时间 + 视频角标 ▶ + 来源板块角标（home 混排时显示"来自 守望先锋"）
 - 📖 **正文 inline 展开** —— 点卡片就地展开正文（图文混排，`[IMG:url]` 占位符按原位渲染），标题 **sticky 置顶**贴在 tab-bar 下方，长贴下滑也不丢上下文
 - 💬 **评论分页** —— 展开后点"查看评论 (N)"加载主楼层，每页 N 条，"加载更多"按服务端分页累加，含点赞数 / IP 属地 / 楼层号 / 楼中楼条数
-- 🖼️ **图片摸鱼默认关** —— 卡片图 / 正文图 / 评论图全部默认隐藏占位符，老板路过零暴露，工具栏 🖼️ 按钮一键全局开图
+- 🖼️ **图片摸鱼默认关 + 一键放大** —— 卡片图 / 正文图 / 评论图全部默认隐藏占位符，老板路过零暴露，工具栏 🖼️ 按钮一键全局开图；显示出来的图都可以点击放大（滚轮缩放 / ←→ 切上下张）
+- 💬 **楼中楼分页** —— 主评论默认展示服务端预加载的前 N 条子评论（缩进 + 左竖线 + 头像略小），超出部分点"查看更多回复 (X/N)"按钮走游标接口分页累加
 - 🔄 **滚到底自动加载** —— 距底 200px 自动追加，不用手动点；会话内 linkid 去重，服务端偶发重复也不会展示两次
 
 #### 登录（可选）
@@ -145,6 +147,7 @@
 #### 板块字典反馈机制
 
 - 📊 **自动累积** —— 每次拉 feeds 时旁路扫描响应里 `link.topics[]`，把"中文板块名 → topicId" 写进本地 globalState 字典，刷得越多字典越完整
+- 🔔 **被动发现新板块通知** —— 服务端返回的板块在 BUILTIN_SECTIONS 和本地字典里都没有时，**3s debounce 合并多次累积 + 30 分钟冷却**后弹一条提示，点"切换查看"直达 QuickPick 限定本次新发现的板块
 - 📤 **`Arena: 导出板块 topicMap 字典` 命令** —— 把当前字典格式化成 JSON / Markdown 输出到 VSCode 新文档，发 Issue 给作者补进下个版本的 BUILTIN_SECTIONS 内置池
 - ⚠ **不在内置池的板块切不过去** —— `Arena: 切换到任意板块` 命中字典里有但 BUILTIN 没有的话题时，会弹通知引导走 `dumpTopicMap` 反馈（v3.0.0 起明确移除了"手写自定义板块" 配置，避免用户自己猜 tag 出空页）
 
@@ -200,9 +203,9 @@
 ### Arena（小黑盒）
 
 1. 点击 Activity Bar 左侧 🎮 图标
-2. 资讯流自动加载（无需登录）
-3. 顶部 tab 切换游戏；滚到底自动加载更多
-4. 点卡片在浏览器中查看详情（视频帖也走浏览器）
+2. 资讯流自动加载（无需登录）；顶部 tab 切换板块，⚙ 按钮勾选要在 tab 栏显示的板块
+3. 点卡片就地展开正文，"查看评论 (N)" 加载评论分页（含楼中楼子评论）
+4. 滚到底自动追加；任意图片可点击放大；↑/↓ 小步走，Space 翻底 / Shift+Space 翻顶
 
 ---
 
@@ -244,7 +247,6 @@
 | `xiaoheihe.dumpTopicMap` | Arena: 导出板块 topicMap 字典 (复制 + 打开预览) |
 | `xiaoheihe.importCookie` | Arena: 导入 Cookie 登录 (启用个性化推荐流) |
 | `xiaoheihe.logout` | Arena: 退出登录 |
-| `xiaoheihe.openInBrowser` | Arena: 在浏览器中打开 |
 | `xiaoheihe.resetImei` | Arena: 重置设备 ID (解除小黑盒风控) |
 
 ---

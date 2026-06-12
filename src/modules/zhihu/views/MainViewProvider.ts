@@ -2,6 +2,12 @@ import * as vscode from 'vscode';
 import type { ZhihuAuthService } from '../auth/AuthService';
 import type { ZhihuClient } from '../api/ZhihuClient';
 import type { ZhihuCardForView, ZhihuFeedItem } from '../types';
+import {
+  getImageLightboxCss,
+  getImageLightboxHtml,
+  getImageLightboxScript,
+} from '../../../core/imageLightbox';
+import { getKeyboardScrollScript } from '../../../core/keyboardScroll';
 
 /**
  * 知乎推荐流的 webview view。
@@ -1528,6 +1534,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   @keyframes spin {
     to { transform: rotate(360deg); }
   }
+${getImageLightboxCss()}
 </style>
 </head>
 <body>
@@ -3225,7 +3232,10 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   // 通知 extension 已挂载
   vscode.postMessage({ type: 'ready' });
 })();
+${getImageLightboxScript()}
+${getKeyboardScrollScript()}
 </script>
+${getImageLightboxHtml()}
 </body>
 </html>`;
   }

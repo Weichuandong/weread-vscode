@@ -509,10 +509,17 @@ export interface XiaoheiheDetailForView {
 }
 
 /**
- * 单条主评论 (楼层) 的视图数据.
+ * 单条评论的视图数据 (主评论 + 楼中楼共用同一个类型).
  *
- * 服务端 result.comments[i].comment[0] (comment 是数组, 0 是主评论, 后面是楼中楼回复;
- * v1 不展开楼中楼, 只标记"还有 N 条回复"提示用户去 web 看).
+ * 服务端结构: result.comments[i].comment 是数组, [0] 是主评论, [1..] 是楼中楼
+ * 预加载片段 (只给前几条, child_num 是楼中楼总数, has_more 标记是否还有更多).
+ *
+ * 归一化时:
+ *   - 主评论会把 [1..] 转成同类型放进 children, 在 UI 上缩进展示
+ *   - 楼中楼自身的 children 一定是空数组 (服务端不会嵌套两层楼中楼; 即使有, 我们
+ *     按业务上不存在处理 — 跟 zhihu/B站二级评论模型一致)
+ *   - hasMoreChildren = children.length < childNum, 表示有剩余子评论未下发,
+ *     UI 上挂"查看更多回复 (X/N)"按钮, 点击走 fetchSubCommentsPage 继续游标分页.
  */
 export interface XiaoheiheCommentForView {
   /** 评论 id (前端去重 + 后续翻子评论用) */
@@ -531,10 +538,43 @@ export interface XiaoheiheCommentForView {
   up: number;
   /** IP 属地 ("湖北" / "陕西"); 空则前端隐藏 */
   ipLocation: string;
-  /** 子评论数, >0 时前端显示 "N 条回复" 但 v1 不点开 */
+  /** 子评论总数 (服务端 child_num), 含未下发的; UI 用来跟 children.length 对比 */
   childNum: number;
   /** 是否置顶 (官方/楼主置顶) */
   isTop: boolean;
+  /**
+   * 楼中楼 (子评论) 列表. 仅主评论可能非空; 楼中楼自身的 children 总是空数组.
+   * 来自服务端预加载片段 result.comments[i].comment[1..], 不再发请求.
+   */
+  children: XiaoheiheCommentForView[];
+  /**
+   * 是否还有未下发的子评论 (childNum > children.length).
+   * UI 上显示 "查看更多回复 (X/N)" 按钮, 点击走 /bbs/app/comment/sub/comments
+   * 接口游标分页继续拉.
+   */
+  hasMoreChildren: boolean;
+}
+
+/**
+ * 子评论分页响应 (/bbs/app/comment/sub/comments).
+ *
+ * 协议特点:
+ *   - 游标分页, 不是 page+limit. lastVal 传 "上一批最后一条的 commentid",
+ *     服务端返回严格大于该游标的下一批 (首次请求 = 已展示的最后一条 commentid).
+ *   - 锚定 rootCommentId (主评论 id), linkId 当前抓包未观察到必填 — 防御性保留.
+ *   - 不嵌套楼中楼 (子评论本身不再有 children), 响应里的 comments 是扁平数组.
+ *
+ * 字段约定:
+ *   - lastVal 是 string (服务端 commentid 可能很大, 别用 number 防精度丢失)
+ *   - hasMore false 表示已无更多, 前端把按钮收起来
+ */
+export interface XiaoheiheSubCommentsPage {
+  /** 本批子评论 (扁平, children 必为空) */
+  comments: XiaoheiheCommentForView[];
+  /** 下次请求要传的 lastVal (本批最后一条 commentid). 已无更多时仍可携带, 前端按 hasMore 决定要不要再请求 */
+  nextLastVal: string;
+  /** 是否还有更多 */
+  hasMore: boolean;
 }
 
 /**

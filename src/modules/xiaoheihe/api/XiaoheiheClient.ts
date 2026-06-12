@@ -16,6 +16,7 @@ import type {
   XiaoheiheRawLink,
   XiaoheiheSectionId,
   XiaoheiheSectionMeta,
+  XiaoheiheSubCommentsPage,
   XiaoheiheTopicMeta,
 } from '../types';
 
@@ -793,12 +794,12 @@ export class XiaoheiheClient {
       ? data.result!.comments!
       : [];
     // result.comments 是 [{ comment: [主评论, 子1, 子2, ...] }, ...] 嵌套结构.
-    // v1 只取每楼的 comment[0] 主评论, 子评论以 "N 条回复" 提示, 不实际渲染.
+    // 每楼的 comment[0] 是主评论, [1..] 是楼中楼预加载片段 (服务端只塞前几条,
+    // 跟 child_num/has_more 配合用 — 见 normalizeCommentFloor).
     const comments: XiaoheiheCommentForView[] = [];
     for (const floor of rawFloors) {
-      const main = floor?.comment?.[0];
-      if (!main || !main.commentid) continue;
-      comments.push(this.normalizeComment(main));
+      if (!floor?.comment?.[0]?.commentid) continue;
+      comments.push(this.normalizeCommentFloor(floor.comment));
     }
 
     const hasMore =
@@ -808,6 +809,115 @@ export class XiaoheiheClient {
       typeof data?.result?.total_page === 'number' ? data.result.total_page : 0;
 
     return { comments, page, totalPage, hasMore };
+  }
+
+  /**
+   * 拉一批子评论 (楼中楼分页). 走 /bbs/app/comment/sub/comments, 不同于 link/tree.
+   *
+   * 接口特点 (基于浏览器抓包验证, 2026/06):
+   *   - URL: GET /bbs/app/comment/sub/comments?root_comment_id=...&lastval=...
+   *   - 游标分页, 不是 page+limit: lastval 传"上一批最后一条 commentid", 服务端
+   *     返回严格大于该游标的下一批. 首次请求传 0 也行, 但更稳的做法是传"已展示
+   *     的最后一条子评论 commentid" — 因为 link/tree 已经预加载了前 2 条, 用 0
+   *     会把这 2 条重新拿一遍, 前端再去重很恶心.
+   *   - 不需要 link_id 字段 (抓包确认), 服务端通过 root_comment_id 反查所属帖子.
+   *   - 签名 / 环境参数族跟 link/tree 完全一致 (web 协议), 复用 signedGetLinkTree
+   *     (其实是个通用 web/app 双协议 helper, 名字是历史遗留, 没必要重命名再 churn 一遍).
+   *
+   * 响应结构 (假设, 基于小黑盒同类接口经验; 实测发现差异再调):
+   *   - result.comments: RawComment[] (扁平, 没有 link/tree 那种 {comment:[...]} 嵌套)
+   *   - result.last_val:  下一次请求要传的游标. 没有时取本批最后一条 commentid 兜底.
+   *   - result.has_more / remaining / has_more_comment: 是否还有更多 (字段名不定, 防御性多查几个)
+   *
+   * @param rootCommentId  主评论 id (锚定)
+   * @param lastVal        游标 = 上一批最后一条 commentid; 首次传 "已展示最后一条 commentid",
+   *                       完全没展示时传 '0'
+   */
+  public async fetchSubCommentsPage(
+    rootCommentId: string,
+    lastVal: string,
+  ): Promise<XiaoheiheSubCommentsPage> {
+    if (!rootCommentId) throw new Error('rootCommentId 为空');
+    const business: Record<string, string> = {
+      root_comment_id: rootCommentId,
+      lastval: lastVal || '0',
+    };
+    // 响应结构防御性弱类型, 字段名按抓包 + 经验值多兜几个备选.
+    interface SubCommentsResp {
+      status?: string | number;
+      msg?: string;
+      message?: string;
+      result?: {
+        // 扁平数组场景 (子评论接口最常见)
+        comments?: XiaoheiheRawComment[];
+        // 嵌套场景兜底 ({comment: [...]} 跟 link/tree 一样); 极少见, 防御性兜.
+        comments_wrap?: Array<{ comment?: XiaoheiheRawComment[] }>;
+        last_val?: string | number;
+        lastval?: string | number;
+        has_more?: number | boolean;
+        remaining?: number;
+        has_more_comment?: number | boolean;
+      };
+    }
+    const data = await this.signedGetLinkTree<SubCommentsResp>(
+      '/bbs/app/comment/sub/comments',
+      business,
+    );
+
+    // 解析 comments — 优先扁平, 兜底嵌套
+    const raws: XiaoheiheRawComment[] = [];
+    const flat = data?.result?.comments;
+    if (Array.isArray(flat)) {
+      for (const c of flat) {
+        if (c && c.commentid) raws.push(c);
+      }
+    }
+    // 极少见兜底: 如果服务端把字段塞到了 comments_wrap (跟 link/tree 同款)
+    const wrapped = data?.result?.comments_wrap;
+    if (raws.length === 0 && Array.isArray(wrapped)) {
+      for (const item of wrapped) {
+        const arr = item?.comment;
+        if (Array.isArray(arr)) {
+          for (const c of arr) {
+            if (c && c.commentid) raws.push(c);
+          }
+        }
+      }
+    }
+    const comments = raws.map((r) => this.normalizeComment(r));
+
+    // nextLastVal: 优先服务端字段, 没有就用本批最后一条 commentid 兜底.
+    // 如果两者都没有 (本批空), nextLastVal 回退到调用方传入的 lastVal, 让上层
+    // 自己决定要不要再请求 (理论上配合 hasMore=false 就不会再请求, 但防御不亏).
+    const r = data?.result;
+    let nextLastVal = '';
+    if (r?.last_val !== undefined && r.last_val !== null) {
+      nextLastVal = String(r.last_val);
+    } else if (r?.lastval !== undefined && r.lastval !== null) {
+      nextLastVal = String(r.lastval);
+    } else if (comments.length > 0) {
+      nextLastVal = comments[comments.length - 1].commentId;
+    } else {
+      nextLastVal = lastVal;
+    }
+
+    // hasMore: 字段名多种命名都见过, 任何一个为 true/1/>0 都算"还有".
+    // 兜底: 字段全缺时, 只要本批拿到了数据就保守假设可能还有 (= true), 让用户再点
+    // 一次按钮决定 — 服务端不太可能返回空且 hasMore=true, 那种情况上层一次拉空后
+    // 前端自己会判 comments.length===0 收起按钮.
+    const hasMoreFlag =
+      r?.has_more === true ||
+      r?.has_more === 1 ||
+      r?.has_more_comment === true ||
+      r?.has_more_comment === 1 ||
+      (typeof r?.remaining === 'number' && r.remaining > 0);
+    const hasMoreFieldExists =
+      r?.has_more !== undefined ||
+      r?.has_more_comment !== undefined ||
+      r?.remaining !== undefined;
+    const hasMore = hasMoreFieldExists ? hasMoreFlag : comments.length > 0;
+
+    return { comments, nextLastVal, hasMore };
   }
 
   /**
@@ -968,7 +1078,41 @@ export class XiaoheiheClient {
       ipLocation: (raw.ip_location ?? '').trim(),
       childNum: typeof raw.child_num === 'number' ? raw.child_num : 0,
       isTop: raw.is_top === 1,
+      // 默认空: normalizeComment 单条归一化时不负责挂楼中楼, 由 normalizeCommentFloor
+      // 处理整楼数组时回填. 这样这个函数仍是无状态纯函数, 主+子评论都能复用.
+      children: [],
+      hasMoreChildren: false,
     };
+  }
+
+  /**
+   * 把"一整楼"评论数组 (主+楼中楼预加载) 归一化成带 children 的主评论视图.
+   *
+   * 入参约定 (服务端 result.comments[i].comment 直接传进来):
+   *   arr[0]    主评论 (必须存在且 commentid 有效, 调用方已校验)
+   *   arr[1..]  楼中楼预加载片段, 服务端只塞前几条, 总数看 arr[0].child_num
+   *
+   * 输出: 主评论 view, children 为 [1..] 段过滤+归一化后的结果;
+   *       hasMoreChildren = children.length < childNum (有更多没下发).
+   *
+   * 为什么不嵌套调用 normalizeCommentFloor 处理 children?
+   *   服务端楼中楼是扁平结构 (只有两层), 不会出现"楼中楼的楼中楼". 即使将来出现,
+   *   v1 也按业务上不存在处理 — UI 侧 buildComment 虽然能递归渲染, 但 children
+   *   字段在第二层必为空, 不会无限展开.
+   */
+  private normalizeCommentFloor(
+    arr: readonly XiaoheiheRawComment[],
+  ): XiaoheiheCommentForView {
+    const main = this.normalizeComment(arr[0]);
+    const kids: XiaoheiheCommentForView[] = [];
+    for (let i = 1; i < arr.length; i++) {
+      const c = arr[i];
+      if (!c || !c.commentid) continue;
+      kids.push(this.normalizeComment(c));
+    }
+    main.children = kids;
+    main.hasMoreChildren = kids.length < main.childNum;
+    return main;
   }
 
   /**

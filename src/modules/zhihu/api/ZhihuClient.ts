@@ -1053,6 +1053,17 @@ function stripHtmlPreserveBreaks(html: string, preserveImages = false): string {
   let text = html;
   if (preserveImages) {
     text = text
+      // 关键: 先剥掉 <noscript>...</noscript> 整段 (含内部 img).
+      // 知乎正文 HTML 里图片节点常见形态是:
+      //   <figure>
+      //     <noscript><img src="...小图缩略.jpg"></noscript>
+      //     <img src="...小图.jpg" data-original="...大图.jpg" data-actualsrc="...大图.jpg">
+      //   </figure>
+      // 不剥 noscript 的话, 主 <img> 命中 data-original 正则 → 生成 [IMG:大图], 紧接着
+      // noscript 内的 <img src> 又命中第二个正则 → 又生成 [IMG:小图], 同一张图就会被
+      // 渲染成两个 inline-img 节点 (webview 上视觉上能看见同图重复 — 这是用户反馈的 bug).
+      // noscript 本是给禁用 JS 环境的回退, webview 里有 JS, 不需要它.
+      .replace(/<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi, '')
       // 优先取 data-original / data-actualsrc 这类高清图字段, 再退到 src.
       .replace(
         /<img\b[^>]*?\b(?:data-original|data-actualsrc)=["']([^"']+)["'][^>]*>/gi,
@@ -1072,6 +1083,14 @@ function stripHtmlPreserveBreaks(html: string, preserveImages = false): string {
           const src = extractCommentImageUrl(attrs);
           return src ? imgPlaceholder(src) : full;
         },
+      )
+      // 兜底: 即使剥了 noscript, 服务端仍可能下发其它形态把同一张图重复一次
+      // (比如 <picture> 多个 <source> + fallback img, 或者 figure 内插了 poster).
+      // 这里把"完全相同且相邻 (中间只有空白/换行) 的 [IMG:url]" 合并成一个.
+      // 严格相邻+完全同 url 才合并, 避免误杀业务里"故意贴两次同图"的极端场景.
+      .replace(
+        /(\[IMG:[^\]]+\])(\s*\1)+/g,
+        (_full: string, first: string) => first,
       );
   }
   return text

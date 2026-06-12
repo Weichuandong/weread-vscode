@@ -13,6 +13,12 @@ import {
 } from '../types';
 import { getBookReaderUrl, getChapterReaderUrl } from '../api/wereadUrl';
 import {
+  getImageLightboxCss,
+  getImageLightboxHtml,
+  getImageLightboxScript,
+} from '../../../core/imageLightbox';
+import { getKeyboardScrollScript } from '../../../core/keyboardScroll';
+import {
   DEFAULT_READING_PREFS,
   FONT_FAMILY_STEPS,
   FONT_SIZE_STEPS,
@@ -1165,11 +1171,15 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
 <meta charset="UTF-8" />
 ${csp}
 <style>${this.buildCss()}</style>
+<style>${getImageLightboxCss()}</style>
 ${prefsBlock}
 </head>
 <body>
   ${body}
+  ${getImageLightboxHtml()}
   <script>${this.buildScript()}</script>
+  <script>${getImageLightboxScript()}</script>
+  <script>${getKeyboardScrollScript()}</script>
 </body>
 </html>`;
   }
@@ -3601,10 +3611,12 @@ ${prefsBlock}
       // ===== 阅读 tab 键盘快捷键 =====
       //
       // 用键盘当 "翻书手", 视觉焦点不离正文:
-      //   ↓ / PageDown / Space  — 向下翻一页 (留 60px 余量, 让上一屏底部 ~3 行内容
+      //   ↓ / ↑                 — 小步滚动 100px (~4-5 行), 跟知乎/小黑盒手感一致,
+      //                            适合一边看一边推进, 不会一下子刷掉整屏
+      //   PageDown / Space      — 向下翻一页 (留 60px 余量, 让上一屏底部 ~3 行内容
       //                            继续出现在新视窗顶部, 类似纸书 "上一页底过渡到这页头"
       //                            的承接感, 避免读者刚看到关键句结尾就被翻走)
-      //   ↑ / PageUp            — 向上翻一页
+      //   PageUp                — 向上翻一页
       //   ←                     — 上一章 (复用现有 post('prev'))
       //   →                     — 下一章 (复用现有 post('next'))
       //   Home / End            — 跳到本章首 / 尾
@@ -3624,6 +3636,7 @@ ${prefsBlock}
         if (!readerBody) return; // 非 reader tab: 不绑
 
         const PAGE_OVERLAP_PX = 60; // 留余量, 上一屏底部 ~3 行还能瞄到
+        const STEP_PX = 100;        // ↑/↓ 单次小步, 跟公共 keyboardScroll 对齐 (~4-5 行正文)
 
         // 让 .reader-body 可被键盘 focus (用户点正文区域可获得焦点, 体验更顺;
         // 不主动 focus 以免抢用户编辑器/终端的焦点)
@@ -3659,6 +3672,15 @@ ${prefsBlock}
           }
         }
 
+        // 方向键: 小步滚 (100px), 不"翻页"; 让阅读节奏更细腻
+        function stepBy(direction) {
+          try {
+            readerBody.scrollBy({ top: direction * STEP_PX, behavior: 'smooth' });
+          } catch (e) {
+            readerBody.scrollBy(0, direction * STEP_PX);
+          }
+        }
+
         document.addEventListener('keydown', function(e) {
           if (e.ctrlKey || e.metaKey || e.altKey) return;
           if (isTypingTarget(e.target)) return;
@@ -3666,12 +3688,18 @@ ${prefsBlock}
 
           switch (e.key) {
             case 'ArrowDown':
+              e.preventDefault();
+              stepBy(1);
+              break;
+            case 'ArrowUp':
+              e.preventDefault();
+              stepBy(-1);
+              break;
             case 'PageDown':
             case ' ': // Space 翻页 — 跟纸书 "按一下空格往下翻" 的肌肉记忆一致
               e.preventDefault();
               pageBy(1);
               break;
-            case 'ArrowUp':
             case 'PageUp':
               e.preventDefault();
               pageBy(-1);

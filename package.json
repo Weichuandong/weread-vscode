@@ -205,11 +205,6 @@
         "icon": "$(list-selection)"
       },
       {
-        "command": "xiaoheihe.openInBrowser",
-        "title": "Arena: 在浏览器中打开",
-        "icon": "$(link-external)"
-      },
-      {
         "command": "xiaoheihe.resetImei",
         "title": "Arena: 重置设备 ID (解除小黑盒风控)",
         "icon": "$(refresh)"

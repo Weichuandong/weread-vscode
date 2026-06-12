@@ -2,6 +2,47 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)，所有重要变更都会记录在这里。
 
+## [3.1.0] - 2026-06-12
+
+> **三模块统一升级体验：图片一键放大查看 + 键盘滚动快捷键 + 小黑盒楼中楼分页 + 摸鱼场景去除"在浏览器打开"按钮。** 同时修复知乎正文图片在 `<figure><noscript>` 结构下重复显示的 bug，新增小黑盒"被动发现全新板块"通知。
+
+### Added — 三模块共享 (新增 `src/core/` 公共组件)
+
+- 🔍 **图片一键放大查看器** —— 新增 [`src/core/imageLightbox.ts`](src/core/imageLightbox.ts) 公共组件，weread / zhihu / xiaoheihe 三模块全部接入。任意可放大图片点击后弹模态层：
+  - **滚轮缩放**，以鼠标位置为缩放原点（PDF 阅读器同款体验）
+  - **拖拽平移**（放大态下 `cursor: grab`），**双击切换 1x ↔ 2x**
+  - **工具栏**：关闭 × / 缩小 − / 还原 ⤢ / 放大 + ；**键盘**：Esc 关 / +/- 缩放 / 0 还原 / ←/→ 上下张
+  - **左下"缩放百分比"提示** + **顶部"X / N"计数**，同帖多图时清晰知道在第几张
+  - **智能黑名单**：头像 / 小封面 / 工具按钮图标 / 脚注小图标 / `data-no-lightbox` / 自然尺寸 < 60px 一律跳过，避免误触
+  - **CSP 兼容**：纯 `addEventListener`、无 inline 事件 / 无外链资源，在 zhihu / xiaoheihe 的 `script-src 'nonce-xxx'` 严格策略下也能跑
+- ⌨️ **键盘滚动快捷键** —— 新增 [`src/core/keyboardScroll.ts`](src/core/keyboardScroll.ts) 公共组件，三模块统一接入：
+  - **↑ / ↓** 平滑滚动一段固定距离（100px，约 4-5 行正文）—— "小步走" 体感，跟 webview 原生方向键滚动手感接近但走 smooth 平滑过渡
+  - **Space** 平滑滚到 *最底部*（长贴快速跳到评论尾巴）
+  - **Shift + Space** 平滑滚到 *最顶部*（跟 Web 端 PageDown / PageUp 一对的直觉）
+  - **自动让位**：焦点在 input / textarea / contentEditable / 带 Ctrl/Meta/Alt 修饰键 / lightbox 模态打开中 / weread 阅读 tab（有更精细的章节切换逻辑）—— 一律不抢
+
+### Added — Arena (小黑盒)
+
+- 💬 **楼中楼（子评论）分页展示** —— 主评论原本只显示"💬 N 条回复"提示，现在直接渲染服务端预加载的前 N 条子评论（缩进 + 左竖线 + 头像/正文略小拉开层级感）；超出预加载部分挂"💬 查看更多回复 (X/N)" 按钮，点击走 [`fetchSubCommentsPage`](src/modules/xiaoheihe/api/XiaoheiheClient.ts:836-921) 游标接口 `/bbs/app/comment/sub/comments` 分页累加：
+  - 新增类型 [`XiaoheiheSubCommentsPage`](src/modules/xiaoheihe/types/index.ts:571-578) + [`XiaoheiheCommentForView.children`](src/modules/xiaoheihe/types/index.ts:546-549) / `hasMoreChildren` 字段
+  - 游标分页：`lastVal` 传容器内最后一条 commentId，服务端返回严格大于该游标的下一批 append 到末尾
+  - 失败容错：reqId 路由按"楼-加载按钮"粒度独立维护（`subCommentReqIdMap`），切板块/折叠卡片时回包过期直接丢弃；加载失败按钮文案改"加载失败, 点击重试"
+- 🔔 **被动发现全新板块通知** —— 用户浏览过程中服务端 `link.topics[]` 出现 BUILTIN_SECTIONS 没收录、字典里也没有的全新板块时，攒一波（**3s debounce 合并多次累积** + **30 分钟冷却**避免打扰）后弹一条 information："发现新板块 XX、YY、ZZ ... 等 N 个, 是否切换查看?"，点"切换查看"直接进入 `xiaoheihe.switchToTopic` QuickPick 限定本次新发现的板块
+
+### Changed — Arena (小黑盒)
+
+- 🚪 **移除详情区"在浏览器打开"按钮** —— 卡片就地展开后底部 `actions` 区不再放"在浏览器打开"按钮（**摸鱼场景禁忌**，老板路过侧栏弹出全屏知乎更刺激）；详情区无正文的视频/图集帖文案也去掉"可点 在浏览器打开 查看"引导，改为简洁的"该帖子无正文文本 (可能是视频或图集帖)"
+
+### Fixed — Curio (知乎)
+
+- 🖼️ **正文同一张图重复渲染** —— 知乎正文 HTML 内 `<figure>` 常见形态是 `<noscript><img src="小图缩略"></noscript>` + 同级 `<img src="小图" data-original="大图">`。此前 [`stripHtmlPreserveBreaks`](src/modules/zhihu/api/ZhihuClient.ts:1053-1100) 没剥 noscript，主 `<img>` 命中 `data-original` 正则生成 `[IMG:大图]`、紧接着 noscript 内的 `<img src>` 又命中第二个正则生成 `[IMG:小图]`，同一张图被渲染成两个 inline-img 节点（webview 上视觉重复）。现修复为：
+  - **先剥 noscript 整段** —— `<noscript>` 本是给禁用 JS 环境的回退，webview 里有 JS 不需要
+  - **兜底合并相邻同 url 占位符** —— 严格"完全相邻 + 完全同 url"才合并（`/(\[IMG:[^\]]+\])(\s*\1)+/g`），避免误杀业务里"故意贴两次同图"的极端场景
+
+### Removed
+
+- ❌ **`xiaoheihe.openInBrowser` 命令** —— v3.0.0 卡片就地展开 + 评论分页落地后该命令实际已无入口（详情区也已去除按钮），从 [`package.json`](package.json) `contributes.commands` 移除该条目；旧用户配置自动忽略不报错
+
 ## [3.0.0] - 2026-06-11
 
 > **小黑盒 (Arena) 模块大升级：133 个内置板块 + 主页本地混排 + 卡片就地展开 + 评论分页 + 登录态个性化推荐。** 同时移除 v2.x 草稿态的"手写自定义板块"配置，统一改走"反馈到内置池"路径，避免乱填 tag 触发服务端风控。

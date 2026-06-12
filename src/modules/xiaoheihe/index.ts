@@ -26,7 +26,6 @@ import {
  * 命令:
  *   - xiaoheihe.switchGame     选择板块 (走 QuickPick — 含主页 + 所有内置板块)
  *   - xiaoheihe.refresh        刷新当前板块
- *   - xiaoheihe.openInBrowser  在浏览器打开指定 url (供 webview 调用)
  *   - xiaoheihe.resetImei      重置设备 IMEI (被风控 show_captcha 后的逃生口)
  *   - xiaoheihe.importCookie   导入 cookie 登录 (启用个性化推荐流)
  *   - xiaoheihe.logout         退出登录 (主页回落本地混排)
@@ -249,15 +248,6 @@ const xiaoheiheModule: Module = {
         });
         if (picked) {
           await view.switchSection(picked.sectionId);
-        }
-      }),
-
-      // 给 webview / 其它扩展用: 传 url 直接外部打开
-      vscode.commands.registerCommand('xiaoheihe.openInBrowser', async (url?: string) => {
-        if (typeof url === 'string' && url) {
-          await vscode.env.openExternal(vscode.Uri.parse(url));
-        } else {
-          await vscode.env.openExternal(vscode.Uri.parse('https://www.xiaoheihe.cn/'));
         }
       }),
 

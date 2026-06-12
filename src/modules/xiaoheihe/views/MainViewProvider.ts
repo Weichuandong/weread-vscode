@@ -14,6 +14,12 @@ import {
   HOME_SECTION_ID,
   HOME_SECTION_META,
 } from '../types';
+import {
+  getImageLightboxCss,
+  getImageLightboxHtml,
+  getImageLightboxScript,
+} from '../../../core/imageLightbox';
+import { getKeyboardScrollScript } from '../../../core/keyboardScroll';
 
 /**
  * 小黑盒资讯流的侧边栏 webview view (Arena 模块).
@@ -38,7 +44,10 @@ import {
  *   3. 不需要登录 — 走伪 imei + 签名访问公开 API, 视图永远直接可用, 不存在 cookie 失效.
  *   4. 去重只做"会话内 set" (按 linkid), 切板块 / 刷新清空. 单游戏数据量大,
  *      跨重启持久化去重没必要; 主页混排时同一篇 (主页 vs. 子板块) 也只会出一次.
- *   5. 子评论不展开 — v1 只显示主楼层 + "N 条回复" 提示, 二期再说.
+ *   5. 楼中楼 (子评论) 展开 — 服务端 link/tree 响应里 result.comments[i].comment[1..]
+ *      已预加载前 N 条, 直接缩进展示 (零额外网络). childNum > 已加载数时给
+ *      "还有 N 条回复" 提示文案, 不引导跳浏览器 (摸鱼场景一致). 没接独立子评论
+ *      分页接口 (缺抓包数据).
  *
  * 数据流:
  *
@@ -59,7 +68,9 @@ import {
  *                     <--postMessage--    'detail' { reqId, detail }
  *  点 "查看评论":       --postMessage-->  'comments' { reqId, linkId, page }
  *                     <--postMessage--    'commentsPage' { reqId, comments, hasMore, page }
- *  右上 "在浏览器打开": --postMessage-->  'openExternal' { url }     -->  vscode.env.openExternal
+ *
+ * 摸鱼场景原则: 视图内不出现任何"在浏览器打开"按钮 — 一旦带浏览器跳转, 旁观者一眼
+ * 能看到你刚才在 vscode 里看小黑盒游戏论坛, 完全破坏摸鱼伪装. zhihu 模块同款决策.
  */
 export class MainViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'xiaoheiheVscode.main';
@@ -359,10 +370,39 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
         return;
       }
 
-      case 'openExternal': {
-        const url = typeof msg.url === 'string' ? msg.url : '';
-        if (!url) return;
-        await vscode.env.openExternal(vscode.Uri.parse(url));
+      case 'subComments': {
+        // 楼中楼分页 — 走 /bbs/app/comment/sub/comments 游标接口.
+        // reqId 在前端是"按主评论 id 派发的子 reqId" (跟 'comments' 的 reqId 不一样,
+        // 因为同一帖子里多条主评论的子评论按钮可能同时点开, 必须按楼分别路由回包).
+        // 前端用 reqId + rootCommentId 一起定位 DOM (reqId 是"展开会话"的 id,
+        // 失效场景: 用户卡片折叠又重开, reqId 变了, 这次回包就被丢弃 — 故意的).
+        const reqId = typeof msg.reqId === 'string' ? msg.reqId : '';
+        const rootCommentId =
+          typeof msg.rootCommentId === 'string' ? msg.rootCommentId : '';
+        const lastVal = typeof msg.lastVal === 'string' ? msg.lastVal : '0';
+        if (!reqId || !rootCommentId) return;
+        try {
+          const r = await this.client.fetchSubCommentsPage(
+            rootCommentId,
+            lastVal,
+          );
+          this.post({
+            type: 'subCommentsPage',
+            reqId,
+            rootCommentId,
+            comments: r.comments,
+            nextLastVal: r.nextLastVal,
+            hasMore: r.hasMore,
+          });
+        } catch (e) {
+          const m = e instanceof Error ? e.message : String(e);
+          this.post({
+            type: 'subCommentsError',
+            reqId,
+            rootCommentId,
+            message: m,
+          });
+        }
         return;
       }
 
@@ -992,6 +1032,65 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     color: var(--vscode-descriptionForeground);
     text-align: center;
   }
+  /* ------ 楼中楼 (子评论) ------
+     主评论的 buildComment 里, 若 cm.children.length>0 直接渲染 .comment-children
+     容器 (服务端 link/tree 预加载的前 2 条, 跟网页/APP 行为对齐: 默认就展示
+     一小部分让用户瞥到回复氛围, 不用点). 若 cm.hasMoreChildren=true, 容器末尾
+     挂一个 .comment-children-loadmore 按钮, 点击走 /bbs/app/comment/sub/comments
+     游标接口分页 append. 视觉: 缩进 + 左竖线 + 头像/正文略小, 拉开层级感. */
+  .comment-children {
+    margin-top: 6px;
+    margin-left: 36px;       /* = 头像 28 + gap 8, 让子评论左边缘与主评论正文对齐 */
+    padding-left: 10px;
+    border-left: 2px solid var(--vscode-widget-border, rgba(128,128,128,0.25));
+  }
+  /* 子评论内部的 .comment-item 不需要顶部分隔线 (跟 .comment-children 容器的
+     左竖线视觉重复); padding 也压小. */
+  .comment-children .comment-item {
+    padding: 6px 0;
+    border-top: 1px dashed var(--vscode-widget-border, rgba(128,128,128,0.12));
+  }
+  .comment-children .comment-item:first-child { border-top: none; }
+  /* 子评论头像和正文略小, 拉开层级感 */
+  .comment-children .comment-avatar {
+    width: 22px;
+    height: 22px;
+  }
+  .comment-children .comment-text {
+    font-size: 11.5px;
+  }
+  /* "查看更多回复 (X/N)" 按钮 — 全宽虚线按钮风格, 跟外层 .comments-loadmore
+     视觉呼应但更紧凑 (font-size 11px / padding 4px). disabled 时透明度降, 用于
+     "加载中…" / "已加载全部" 终止态. */
+  .comment-children-loadmore {
+    display: block;
+    width: 100%;
+    margin: 4px 0 2px 0;
+    padding: 4px 0;
+    font-size: 11px;
+    background: transparent;
+    color: var(--vscode-textLink-foreground, var(--vscode-descriptionForeground));
+    border: 1px dashed var(--vscode-widget-border, rgba(128,128,128,0.25));
+    border-radius: 3px;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .comment-children-loadmore:hover {
+    background: var(--vscode-list-hoverBackground);
+    color: var(--vscode-textLink-activeForeground, var(--vscode-foreground));
+  }
+  .comment-children-loadmore[disabled] {
+    opacity: 0.55;
+    cursor: default;
+  }
+  /* 子评论加载失败提示 — 红色细字, 跟 detail-status.error 同款语义, 但内嵌在
+     .comment-children 容器里不占整行 (用 margin 跟按钮区分开). */
+  .comment-children-error {
+    margin: 4px 0;
+    padding: 2px 4px;
+    font-size: 11px;
+    color: var(--vscode-errorForeground, #f48771);
+  }
 
   /* ------ 状态条 ------ */
   .status {
@@ -1129,6 +1228,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   .settings-btn.secondary:hover {
     background: var(--vscode-button-secondaryHoverBackground, rgba(128,128,128,0.25));
   }
+${getImageLightboxCss()}
 </style>
 </head>
 <body>
@@ -1191,6 +1291,19 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   /** reqId -> wrap DOM, 路由 detail/comments 异步回包 */
   const reqIdToWrap = new Map();
 
+  /**
+   * 子评论分页 reqId -> { kidsContainer, btn, rootCommentId }, 路由
+   * /bbs/app/comment/sub/comments 异步回包.
+   *
+   * 跟 reqIdToWrap 分开维护, 因为:
+   *   - reqIdToWrap 是"卡片展开会话"粒度 (一帖一 reqId)
+   *   - subCommentReqIdMap 是"楼-加载按钮"粒度 (一帖里多条主评论同时展开各自子评论时
+   *     按楼分别路由; 同一条主评论多次点"查看更多回复"是独立 reqId, 每次都注册一遍,
+   *     回包后从 Map 摘掉)
+   * 切板块时同 reqIdToWrap 一起 clear (DOM 都没了, 留 Map entry 没意义).
+   */
+  const subCommentReqIdMap = new Map();
+
   function genReqId() {
     return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
   }
@@ -1208,6 +1321,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
         updateActiveTab();
         $list.innerHTML = '';
         reqIdToWrap.clear();
+        subCommentReqIdMap.clear();
         reachedEnd = false;
         updateLoadMore();
         break;
@@ -1215,6 +1329,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
         if (msg.replace) {
           $list.innerHTML = '';
           reqIdToWrap.clear();
+          subCommentReqIdMap.clear();
           reachedEnd = false;
         }
         appendCards(msg.cards || []);
@@ -1256,6 +1371,12 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
         break;
       case 'commentsError':
         onCommentsError(msg.reqId, msg.page, msg.message);
+        break;
+      case 'subCommentsPage':
+        onSubCommentsPage(msg);
+        break;
+      case 'subCommentsError':
+        onSubCommentsError(msg);
         break;
       case 'sectionsCatalog':
         openSettingsPanel(msg.builtin || [], msg.enabled || []);
@@ -1424,13 +1545,15 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     } else {
       const e = document.createElement('div');
       e.className = 'detail-status';
-      e.textContent = '该帖子无正文文本 (可能是视频或图集帖, 可点 "在浏览器打开" 查看)';
+      // 不引导用户跳浏览器 (摸鱼场景禁忌), 也不放"在浏览器打开"按钮; 视频/图集帖
+      // 就直接告知, 用户自己判断要不要去 APP/网页, 我们不主动推门
+      e.textContent = '该帖子无正文文本 (可能是视频或图集帖)';
       $detail.appendChild(e);
     }
 
+    // 评论按钮 — 详情区下方唯一的操作按钮 (摸鱼场景已删"在浏览器打开", 详见类头部注释)
     const actions = document.createElement('div');
     actions.className = 'detail-actions';
-
     const cmtBtn = document.createElement('button');
     cmtBtn.className = 'detail-btn';
     const cmtNum = typeof detail.commentCount === 'number' ? detail.commentCount : 0;
@@ -1440,18 +1563,6 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       toggleComments(wrap, cmtBtn);
     });
     actions.appendChild(cmtBtn);
-
-    if (card.shareUrl) {
-      const extBtn = document.createElement('button');
-      extBtn.className = 'detail-btn';
-      extBtn.textContent = '在浏览器打开';
-      extBtn.addEventListener('click', (ev) => {
-        ev.stopPropagation();
-        vscode.postMessage({ type: 'openExternal', url: card.shareUrl });
-      });
-      actions.appendChild(extBtn);
-    }
-
     $detail.appendChild(actions);
   }
 
@@ -1607,10 +1718,132 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     const foot = document.createElement('div');
     foot.className = 'comment-foot';
     if (cm.up > 0) foot.appendChild(makeText('👍 ' + cm.up));
-    if (cm.childNum > 0) foot.appendChild(makeText('💬 ' + cm.childNum + ' 条回复'));
     if (foot.children.length > 0) body.appendChild(foot);
+
+    // 楼中楼 (子评论) — 跟网页/APP 行为对齐:
+    //   - 服务端 link/tree 已预加载前 N 条 (实测每楼 2 条) 在 cm.children, 默认就渲染,
+    //     让用户瞥到回复氛围, 不需要点
+    //   - cm.hasMoreChildren=true 时, 容器末尾挂 "查看更多回复 (X/N)" 按钮, 点击走
+    //     /bbs/app/comment/sub/comments 游标接口, 用 lastVal=当前已展示最后一条 commentId
+    //     拉下一批 append 到容器末尾 (按钮重排到最后)
+    //   - 极少数兜底: 服务端说"有 N 条回复"但一条都没下发 (childNum>0 && children 空 &&
+    //     hasMoreChildren), 直接出一个按钮让用户主动拉
+    const hasKids = !!(cm.children && cm.children.length > 0);
+    const total =
+      typeof cm.childNum === 'number' && cm.childNum > 0
+        ? cm.childNum
+        : (hasKids ? cm.children.length : 0);
+    if (hasKids || (total > 0 && cm.hasMoreChildren)) {
+      const kids = document.createElement('div');
+      kids.className = 'comment-children';
+      kids.dataset.rootCommentId = cm.commentId;
+      if (hasKids) {
+        cm.children.forEach((ck) => kids.appendChild(buildComment(ck)));
+      }
+      if (cm.hasMoreChildren) {
+        const shown = hasKids ? cm.children.length : 0;
+        const more = makeSubCommentsLoadMoreBtn(cm.commentId, total);
+        more.textContent = subLoadMoreLabel(shown, total);
+        kids.appendChild(more);
+      }
+      body.appendChild(kids);
+    }
+
     item.appendChild(body);
     return item;
+  }
+
+  /** 子评论"查看更多回复"按钮的文案统一生成 — shown 是容器内 .comment-item 当前条数. */
+  function subLoadMoreLabel(shown, total) {
+    return '💬 查看更多回复 (' + shown + '/' + total + ')';
+  }
+
+  /**
+   * 创建子评论"查看更多回复"按钮. total 写到 dataset 以便回包刷新文案时复用.
+   * 不传 kidsContainer — 按钮挂到 kids 后, 通过 btn.parentElement 反向取容器, 避免
+   * 闭包持有引用导致回收问题 (用户折叠卡片时整段 DOM 都被移除).
+   */
+  function makeSubCommentsLoadMoreBtn(rootCommentId, total) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'comment-children-loadmore';
+    btn.dataset.rootCommentId = rootCommentId;
+    btn.dataset.total = String(total);
+    btn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      if (btn.disabled) return;
+      const kids = btn.parentElement;
+      if (!kids) return;
+      // 旧错误提示清掉 (重试场景)
+      const prevErr = kids.querySelector(':scope > .comment-children-error');
+      if (prevErr) prevErr.remove();
+      btn.disabled = true;
+      btn.textContent = '加载中…';
+      // lastVal = 容器里最后一条 .comment-item 的 commentId; 空则 '0' (首次)
+      const items = kids.querySelectorAll(':scope > .comment-item');
+      const last = items[items.length - 1];
+      const lastVal = last && last.dataset.commentId ? last.dataset.commentId : '0';
+      const reqId = genReqId();
+      subCommentReqIdMap.set(reqId, { kidsContainer: kids, btn, rootCommentId });
+      vscode.postMessage({
+        type: 'subComments',
+        reqId,
+        rootCommentId,
+        lastVal,
+      });
+    });
+    return btn;
+  }
+
+  /**
+   * 子评论分页回包: 把 msg.comments append 到对应 kidsContainer 末尾, 按钮重排到最末.
+   * hasMore=true 重置按钮可点 + 刷新 X/N 文案; hasMore=false 移除按钮 (跟主评论加载更多
+   * "没数据就消失"对齐, 不放"已全部加载"占位).
+   *
+   * 容错: reqId 找不到 entry 直接丢弃 (用户已折叠卡片或切板块, 回包过期); 容器已被
+   * 摘出 DOM 也直接丢弃.
+   */
+  function onSubCommentsPage(msg) {
+    const entry = subCommentReqIdMap.get(msg.reqId);
+    if (!entry) return;
+    subCommentReqIdMap.delete(msg.reqId);
+    const { kidsContainer, btn } = entry;
+    if (!kidsContainer || !kidsContainer.isConnected) return;
+    // 按钮先摘出来 — append 子评论后再决定要不要追加回末尾
+    if (btn && btn.parentElement === kidsContainer) {
+      btn.remove();
+    }
+    (msg.comments || []).forEach((cm) =>
+      kidsContainer.appendChild(buildComment(cm)),
+    );
+    if (msg.hasMore) {
+      const total = Number(btn.dataset.total || '0');
+      const shown = kidsContainer.querySelectorAll(':scope > .comment-item').length;
+      btn.disabled = false;
+      btn.textContent = subLoadMoreLabel(shown, total);
+      kidsContainer.appendChild(btn);
+    }
+    // hasMore=false: 按钮已 remove, 自然消失
+  }
+
+  /**
+   * 子评论分页错误回包: 按钮文案改"加载失败, 点击重试", 启用 disabled=false.
+   * 不在容器里挂红色错误条 (按钮自带提示文案就够了, 避免视觉污染).
+   */
+  function onSubCommentsError(msg) {
+    const entry = subCommentReqIdMap.get(msg.reqId);
+    if (!entry) return;
+    subCommentReqIdMap.delete(msg.reqId);
+    const { kidsContainer, btn } = entry;
+    if (!btn || !kidsContainer || !kidsContainer.isConnected) return;
+    btn.disabled = false;
+    const total = Number(btn.dataset.total || '0');
+    const shown = kidsContainer.querySelectorAll(':scope > .comment-item').length;
+    btn.textContent =
+      '加载失败, 点击重试 (' + shown + '/' + total + ') — ' +
+      (msg.message ? String(msg.message).slice(0, 40) : '未知错误');
+    // 按钮已经在末尾 (onSubCommentsPage 失败前没动过它的位置 — 因为我们是先 disabled
+    // 再 postMessage, btn 没被 remove); 不需要重新 appendChild
   }
 
   function showStatus(text, isError) {
@@ -1948,7 +2181,10 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
 
   // ---------- ready ----------
   vscode.postMessage({ type: 'ready' });
+${getImageLightboxScript()}
+${getKeyboardScrollScript()}
 </script>
+${getImageLightboxHtml()}
 </body>
 </html>`;
   }
