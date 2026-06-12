@@ -2,6 +2,16 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)，所有重要变更都会记录在这里。
 
+## [3.1.1] - 2026-06-12
+
+> **Folio (微信读书) Cookie 失效横幅可手动关闭 + 视觉压缩。** 老版本一旦 cookie 失效, banner 就一直贴在 tabbar 顶部占阅读区高度且无法消除, 本版本加 × 关闭按钮并把整条 banner 压扁一截。
+
+### Changed — Folio (微信读书)
+
+- ❎ **Cookie 失效横幅新增 × 关闭按钮** —— [`buildInvalidBannerHtml()`](src/modules/weread/views/MainViewProvider.ts:1242-1255) 右上角新增关闭按钮, 点击后会话内不再显示; 新增字段 [`MainViewProvider.invalidBannerDismissed`](src/modules/weread/views/MainViewProvider.ts:108-120) 跟踪用户已关闭状态。当 [`AuthService.onDidChangeCookieValidity`](src/modules/weread/auth/AuthService.ts:43-44) 再次 fire (cookie 状态从失效→有效, 或有效→再次失效) 时自动重置标记, 保证"新一轮失效"能再次提示一次, 不会被上一轮的 dismiss 状态吞掉
+- 📐 **横幅视觉压缩** —— padding 从 `6px 10px` 收紧到 `3px 6px 3px 8px`, 字号 12→11, 行高 1.4→1.3, 文本超长改 `ellipsis` 省略避免折行; 整条 banner 高度比之前低近一半, 阅读区可视高度损失明显减小
+- 🔁 **handleMessage 新增 `dismissInvalidBanner` 动作** —— 复用现有 `[data-act]` 通用事件分发, 前端 script 无需改动
+
 ## [3.1.0] - 2026-06-12
 
 > **三模块统一升级体验：图片一键放大查看 + 键盘滚动快捷键 + 小黑盒楼中楼分页 + 摸鱼场景去除"在浏览器打开"按钮。** 同时修复知乎正文图片在 `<figure><noscript>` 结构下重复显示的 bug，新增小黑盒"被动发现全新板块"通知。

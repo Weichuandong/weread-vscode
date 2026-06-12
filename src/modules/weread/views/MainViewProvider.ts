@@ -106,6 +106,19 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
    */
   private isOfflineMode = false;
   /**
+   * Cookie 失效横幅的"用户已主动关闭"标记 (会话级, 不持久化).
+   *
+   * 设计动机:
+   *   - 老版本 banner 一旦 cookie 失效就一直贴在 tabbar 顶部, 占用阅读区可视高度,
+   *     不少用户反馈"看见过一次就够了, 不想每次切 tab/重画都还在那杵着".
+   *   - 给 banner 加一个 × 关闭按钮, 点完落到这个标记上, buildHtml 重画时跳过 banner.
+   *
+   * 重置时机: AuthService 的 onDidChangeCookieValidity 事件触发时统一清零 —
+   *   - 从失效 → 有效: 标记没意义了, 顺手清掉, 下次再失效要重新显示.
+   *   - 从有效 → 失效: 这是个"新事件", 必须再次提示用户一次, 不能因为上一次失效被 dismiss 过就一直闷着.
+   */
+  private invalidBannerDismissed = false;
+  /**
    * 离线模式下已缓存的 chapterUid 集合 (字符串形态, 与文件名一致).
    * 用于目录抽屉里给每章打 "✓ 已缓存" / "○ 未缓存" 标记.
    * 仅在 isOfflineMode=true 时填充, 在线时为空集.
@@ -216,6 +229,9 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     // 用事件驱动而不是仅在 resolveWebviewView 推一次, 是因为 retainContextWhenHidden=true
     // 时切走切回不会重新 resolve, 而 cookie 期间可能从有效跌到失效, 必须收到事件实时刷.
     auth.onDidChangeCookieValidity(() => {
+      // 状态翻转(失效→有效 或 有效→失效)时, 清掉"用户已关闭横幅"的标记 —
+      // 新一轮失效必须重新提示一次, 不能继承上一轮的 dismiss 状态.
+      this.invalidBannerDismissed = false;
       this.render();
     });
   }
@@ -1058,6 +1074,13 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       case 'login':
         void vscode.commands.executeCommand('weread.importCookie');
         break;
+      case 'dismissInvalidBanner':
+        // 用户点 banner 右上角的 ×: 仅会话内隐藏, 不持久化 — 重启 vscode 或 cookie 状态再翻转都会重新出现.
+        if (!this.invalidBannerDismissed) {
+          this.invalidBannerDismissed = true;
+          this.render();
+        }
+        break;
       case 'switchReviewsTab': {
         const next = (msg.payload as { tab?: ReviewsTab })?.tab;
         if (next === 'chapter' || next === 'hotmarks' || next === 'book') {
@@ -1153,7 +1176,8 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     // cookie 已知失效时, 在 tabbar 上方插一条被动提示横幅.
     // isCookieKnownInvalid() 内部已 && isLoggedIn(), 未登录时永远返回 false,
     // 所以这里不会出现"未登录态也挂个 banner"的尴尬情况.
-    const bannerHtml = this.auth.isCookieKnownInvalid()
+    // 用户主动 × 关掉 banner 后 invalidBannerDismissed=true, 这里就不再插; 等下次 cookie 状态翻转重置标记.
+    const bannerHtml = this.auth.isCookieKnownInvalid() && !this.invalidBannerDismissed
       ? this.buildInvalidBannerHtml()
       : '';
     const body = !loggedIn
@@ -1230,11 +1254,14 @@ ${prefsBlock}
    *     post('login') → handleMessage `case 'login'` → executeCommand('weread.importCookie').
    */
   private buildInvalidBannerHtml(): string {
+    // dismiss 按钮: data-act="dismissInvalidBanner" → 通用动作分发会 post 到 extension 端,
+    // handleMessage case 'dismissInvalidBanner' 置位 invalidBannerDismissed 并 render(), banner 就此从 DOM 消失.
     return /* html */ `
       <div class="invalid-banner" role="alert">
         <span class="invalid-banner-icon" aria-hidden="true">⚠️</span>
         <span class="invalid-banner-text">微信读书 Cookie 已失效或被服务器拒绝, 部分内容可能加载失败</span>
         <button class="invalid-banner-btn" type="button" data-act="login">重新导入</button>
+        <button class="invalid-banner-close" type="button" data-act="dismissInvalidBanner" title="关闭提示" aria-label="关闭提示">×</button>
       </div>
     `;
   }
@@ -3019,24 +3046,28 @@ ${prefsBlock}
       .invalid-banner {
         display: flex;
         align-items: center;
-        gap: 8px;
-        padding: 6px 10px;
+        gap: 6px;
+        padding: 3px 6px 3px 8px;
         background: var(--vscode-inputValidation-warningBackground, rgba(244, 130, 31, 0.12));
         color: var(--vscode-inputValidation-warningForeground, var(--vscode-foreground));
         border-bottom: 1px solid var(--vscode-inputValidation-warningBorder, rgba(244, 130, 31, 0.35));
-        font-size: 12px;
-        line-height: 1.4;
+        font-size: 11px;
+        line-height: 1.3;
       }
       .invalid-banner-icon {
         flex: 0 0 auto;
+        font-size: 11px;
       }
       .invalid-banner-text {
         flex: 1 1 auto;
         min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
       }
       .invalid-banner-btn {
         flex: 0 0 auto;
-        padding: 2px 8px;
+        padding: 1px 6px;
         background: var(--vscode-button-secondaryBackground, transparent);
         color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
         border: 1px solid var(--vscode-button-border, var(--vscode-contrastBorder, transparent));
@@ -3047,6 +3078,30 @@ ${prefsBlock}
       }
       .invalid-banner-btn:hover {
         background: var(--vscode-button-secondaryHoverBackground, var(--vscode-list-hoverBackground));
+      }
+      /* 右上角 × 关闭按钮: 无边框, 弱化存在感, 跟 vscode notification 风格保持一致.
+         点击后 extension 端把 invalidBannerDismissed 置 true, banner 直接消失. */
+      .invalid-banner-close {
+        flex: 0 0 auto;
+        width: 18px;
+        height: 18px;
+        padding: 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        background: transparent;
+        color: inherit;
+        border: none;
+        border-radius: 3px;
+        cursor: pointer;
+        font-size: 14px;
+        line-height: 1;
+        opacity: 0.7;
+        font-family: inherit;
+      }
+      .invalid-banner-close:hover {
+        background: var(--vscode-toolbar-hoverBackground, rgba(255, 255, 255, 0.1));
+        opacity: 1;
       }
     `;
   }
