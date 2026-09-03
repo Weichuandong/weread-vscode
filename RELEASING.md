@@ -67,6 +67,72 @@ ovsx create-namespace weichuandong
 
 > 如果不配，workflow 只发 GitHub Release，跳过 Open VSX（不会失败）。
 
+### 5.（可选，**当前未启用**）微软官方 Visual Studio Marketplace
+
+> **现状（2026-09）：本项目只发 GitHub Release + Open VSX，没有上微软 Marketplace。**
+> [`release.yml`](.github/workflows/release.yml) 里的 `vsce publish` 步骤已经写好但处于休眠状态 —— 只要没配 `VSCE_PAT` secret 就自动跳过，不影响现有发布链路。将来想发，配上 secret 即刻生效，不用改代码。
+
+Open VSX 与微软官方 Marketplace 是**两个完全独立的市场**，没有任何同步机制，同一个 vsix 要各发一份。原版 VSCode 的扩展面板只读微软的那个。
+
+#### ⛔ 两个劝退点（决定暂不发布的原因）
+
+**其一：中国区账号建不了 Azure DevOps 组织。** `vsce` 的 PAT 必须来自 Azure DevOps 组织，而中国大陆区域的 Microsoft 账号（如 QQ 邮箱注册的）创建组织时会被要求**先绑定 Azure 订阅**：
+
+```
+Select an Azure subscription for billing
+To create an Azure DevOps organization, you need to link it to an Azure subscription.
+We couldn't find any subscriptions you have access to.
+```
+
+国际版免费层本来不需要订阅，这是地区限制（跟的是**账号注册国家**，不是 IP，改机房区域没用）。绕过办法只有三条，都有成本：
+1. 去 https://signup.live.com 新注册一个 outlook 账号，**注册时国家/地区选美国**（注册后再改会牵扯付款信息，很难）——免费但多一个要长期保管的账号，publisher 会绑死在它上面
+2. 开 Azure 免费订阅 https://azure.microsoft.com/free ——需要**国际信用卡**验证（银联通常不认），预授权 1 美元后退回
+3. 被别人邀请加入一个已有组织
+
+**其二：合规风险。** 微软 Marketplace 的审核明显严于 Open VSX，本插件存在这些敏感点：调用微信读书 / 知乎 / 小黑盒的**非公开接口**、要求用户**粘贴 Cookie**、对受版权保护的图书正文做**解密渲染**、名字直接叫"摸鱼套件"。这些都可能撞上 Marketplace Terms 里"规避第三方服务限制 / 侵犯版权"的条款，存在**被拒审或上架后下架**的可能，且被投诉时受影响的是**整个 publisher**（名下所有扩展）。
+
+权衡下来：Open VSX 已经覆盖 Cursor / VSCodium / Gitpod，原版 VSCode 用户走 vsix 离线安装 + [`UpdateChecker`](src/modules/weread/services/UpdateChecker.ts) 主动提醒更新，体验差距不大，不值得为这点曝光承担上述风险。
+
+---
+
+**以下是将来真要发时的操作步骤，留档备用。**
+
+#### ① 建 Azure DevOps 组织 + 生成 PAT
+
+1. 用 Microsoft 账号登录 https://dev.azure.com ，随便建一个组织（名字不重要，只是 PAT 的挂靠点）
+2. 右上角头像 → **Personal access tokens** → **New Token**
+   - **Organization**: 必须选 **All accessible organizations**（选具体某个组织会 401，这是最常见的坑）
+   - **Expiration**: 最长 1 年（到期后 CI 会 401，需要重新生成并更新 secret）
+   - **Scopes**: 点 **Show all scopes** → 勾 **Marketplace → Manage**
+3. 复制 token（只显示一次）
+
+#### ② 创建 publisher
+
+打开 https://marketplace.visualstudio.com/manage/createpublisher
+
+- **ID 必须填 `weichuandong`** —— 要与 [`package.json`](package.json) 的 `publisher` 字段完全一致。扩展的全局唯一 ID 是 `<publisher>.<name>`，改了 ID 就等于换了个插件，老用户不会收到更新
+- 万一 `weichuandong` 已被占用，只能改 `package.json` 的 publisher 重新发一个新扩展，Open VSX 那边的老用户就断更了 —— 提前确认
+
+#### ③ 配 secret（走 CI 自动发布）
+
+repo → **Settings → Secrets and variables → Actions** → **New repository secret**
+
+- Name: `VSCE_PAT`
+- Secret: 粘贴 ① 里的 token
+
+配好后下次 push tag，[`release.yml`](.github/workflows/release.yml) 会自动多跑一步 `vsce publish --packagePath *.vsix`（复用同一个 vsix，保证两边字节一致）。没配则跳过，不会让 workflow 变红。
+
+#### ④ 手动补发某个已有版本
+
+已经发过的版本（例如 3.2.0 发完才想起要上 Marketplace），不用重打 tag：
+
+```bash
+# 从 GitHub Release 下载 vsix, 或本地 npx @vscode/vsce package 现打一个
+npx @vscode/vsce publish --packagePath weread-vscode-3.2.0.vsix --pat <你的PAT>
+```
+
+首次发布后扩展会进入 **verification（病毒扫描 + 元数据校验）**，几分钟到几小时不等，期间扩展页显示 pending，扫描通过才对外可见。
+
 ---
 
 ## 🚀 每次发版的标准流程
@@ -184,8 +250,9 @@ npm run install-local
 | 7 | 抠 CHANGELOG | 用 awk 提取对应版本段 |
 | 8 | 建 GitHub Release | 用 softprops/action-gh-release@v2, 上传 vsix |
 | 9 | ovsx publish | 如配置了 OVSX_PAT secret 则同步发到 Open VSX |
+| 10 | vsce publish | 如配置了 VSCE_PAT secret 则同步发到微软 Marketplace |
 
-第 9 步即使失败也不阻塞第 8 步（`continue-on-error: true`），所以 Open VSX 偶尔抽风不会影响 GitHub Release。
+第 9、10 步即使失败也不阻塞第 8 步（`continue-on-error: true`），所以某个市场抽风 / PAT 过期不会影响 GitHub Release。
 
 ---
 
@@ -211,6 +278,10 @@ npm run install-local
 | `vsce package` 失败 | LICENSE / icon 缺失 | 补齐 |
 | `Resource not accessible by integration` (release 步骤) | GitHub Actions 权限 | 已在 workflow 配 `permissions: contents: write`，正常不会有；如果出现，检查 repo Settings → Actions → General → Workflow permissions 是否设为 `Read and write` |
 | `Unauthorized` / `unverified namespace` (ovsx 步骤) | OVSX_PAT 错了 / namespace 没创建 | 重新生成 token + 更新 secret + 本地跑 `ovsx create-namespace weichuandong` |
+| `401 Unauthorized` (vsce 步骤) | PAT 的 Organization 没选 "All accessible organizations", 或 PAT 已过期 (最长 1 年) | 按上面 ①  重新生成 PAT, 更新 `VSCE_PAT` secret |
+| `The Personal Access Token used has expired` | 同上 | 同上 |
+| `Extension 'xxx' not found` / publisher 不匹配 | Marketplace 上没建 publisher, 或 ID 与 package.json 的 `publisher` 不一致 | 到 https://marketplace.visualstudio.com/manage 建同名 publisher |
+| `Version 3.2.0 already exists` | 该版本已发过 | Marketplace 同 Open VSX 一样不允许覆盖, 只能递增版本号重发 |
 
 ### 撤销一次发布
 

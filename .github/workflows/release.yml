@@ -101,3 +101,31 @@ jobs:
             echo "::warning::OVSX_PAT secret is not set, skip Open VSX publish."
             echo "To enable, add OVSX_PAT secret in: Settings → Secrets and variables → Actions"
           fi
+
+      # 微软官方 Visual Studio Marketplace (原版 VSCode 扩展面板搜到的就是这里)
+      #
+      # 与 Open VSX 的关系: 两边是**完全独立**的市场, 同一个 vsix 各发一份即可,
+      # 不存在同步机制。这里复用上面 vsce package 出的同一个 vsix, 保证两边字节一致。
+      #
+      # 前置条件 (缺任一都会 401/403, 详见 RELEASING.md):
+      #   1. Azure DevOps 里生成 PAT, Organization 选 "All accessible organizations",
+      #      Scope 选 Marketplace → Manage
+      #   2. 在 https://marketplace.visualstudio.com/manage 建 publisher, ID 必须
+      #      与 package.json 的 publisher 字段一致 (weichuandong)
+      #   3. 把 PAT 存成 repo secret VSCE_PAT
+      #
+      # continue-on-error: 跟 Open VSX 同样处理 —— 市场抽风/PAT 过期不该让已经
+      # 建好的 GitHub Release 变成红叉。
+      - name: Publish to Visual Studio Marketplace (optional)
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        continue-on-error: true
+        run: |
+          if [ -n "$VSCE_PAT" ]; then
+            echo "Publishing to Visual Studio Marketplace..."
+            # --packagePath 复用已打好的 vsix, 不重新打包
+            npx --yes @vscode/vsce publish --packagePath *.vsix --pat "$VSCE_PAT"
+          else
+            echo "::warning::VSCE_PAT secret is not set, skip Visual Studio Marketplace publish."
+            echo "To enable, add VSCE_PAT secret in: Settings → Secrets and variables → Actions"
+          fi
