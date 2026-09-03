@@ -193,10 +193,10 @@ git push --follow-tags
 
 ### Step 5：在 Actions 看进度
 
-打开 `https://github.com/weichuandong/weread-vscode/actions`，约 1~2 分钟后看到绿勾 ✓。
+打开 `https://github.com/Weichuandong/weread-vscode/actions`，约 1~2 分钟后看到绿勾 ✓。
 
 完成后：
-- 📦 GitHub Release: `https://github.com/weichuandong/weread-vscode/releases/tag/v0.0.5`
+- 📦 GitHub Release: `https://github.com/Weichuandong/weread-vscode/releases/tag/v0.0.5`
 - 🛒 Open VSX: `https://open-vsx.org/extension/weichuandong/weread-vscode`
 
 ### Step 6：本地 VSCode 装新版本 🆕
@@ -310,8 +310,8 @@ git push origin :v0.0.5
 
 ## 🔗 相关链接
 
-- GitHub repo: https://github.com/weichuandong/weread-vscode
-- GitHub Releases: https://github.com/weichuandong/weread-vscode/releases
+- GitHub repo: https://github.com/Weichuandong/weread-vscode
+- GitHub Releases: https://github.com/Weichuandong/weread-vscode/releases
 - Open VSX 插件页: https://open-vsx.org/extension/weichuandong/weread-vscode
 - Eclipse 账号设置: https://accounts.eclipse.org/user
 - Open VSX 文档: https://github.com/eclipse/openvsx/wiki/Publishing-Extensions

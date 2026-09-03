@@ -2,6 +2,19 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)，所有重要变更都会记录在这里。
 
+## [3.2.1] - 2026-09-03
+
+> **仓库地址跟进改名 + README 徽章改为动态。** 纯元数据维护，无功能改动。
+
+### Fixed
+
+- 🔗 **仓库地址大小写跟进** —— GitHub 仓库已从 `weichuandong/weread-vscode` 迁到 `Weichuandong/weread-vscode`（首字母大写），此前靠 GitHub 重定向撑着。现已更新 [`package.json`](package.json) 的 `repository` / `bugs` / `homepage` 三处与 [`RELEASING.md`](RELEASING.md) 里的链接。
+  - 注意 **Open VSX 的 namespace 仍是小写 `weichuandong`**（那是发布时创建的 namespace，与 GitHub 用户名无关），[`UpdateChecker`](src/modules/weread/services/UpdateChecker.ts) 里的 `open-vsx.org/api/weichuandong/...` 不能跟着改，否则版本检查会 404
+
+### Changed
+
+- 🏷️ **README 版本徽章改为动态** —— 原来是写死的 `version-3.1.1` badge，发版时经常忘了同步（3.2.0 发完还挂着 3.1.1）。现改成两个自动跟随最新版本的徽章：`shields.io/github/v/release`（GitHub Release）与 `shields.io/open-vsx/v`（Open VSX），以后发版无需手改
+
 ## [3.2.0] - 2026-09-03
 
 > **Folio (微信读书) 新增「书城」—— 搜书、逛榜单、加书架，一个 tab 全搞定。** 此前插件只能读"已经在书架里的书"，想找新书必须跳浏览器；本版本补上发现侧的完整闭环，且**搜索与榜单都不需要 Cookie**，未登录也能逛。

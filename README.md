@@ -2,7 +2,8 @@
 
 > 在 VSCode 侧边栏看书 + 刷推荐流 + 看游戏资讯的"摸鱼"套件。微信读书、知乎、小黑盒一个插件搞定，**零跳转、零打扰、零上传**。
 
-[![Version](https://img.shields.io/badge/version-3.1.1-blue.svg)](https://github.com/Weichuandong/weread-vscode/releases)
+[![Release](https://img.shields.io/github/v/release/Weichuandong/weread-vscode?color=blue)](https://github.com/Weichuandong/weread-vscode/releases)
+[![Open VSX](https://img.shields.io/open-vsx/v/weichuandong/weread-vscode?label=open%20vsx&color=purple)](https://open-vsx.org/extension/weichuandong/weread-vscode)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 ---

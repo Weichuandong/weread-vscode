@@ -11,12 +11,12 @@
   "icon": "resources/icon.png",
   "repository": {
     "type": "git",
-    "url": "https://github.com/weichuandong/weread-vscode.git"
+    "url": "https://github.com/Weichuandong/weread-vscode.git"
   },
   "bugs": {
-    "url": "https://github.com/weichuandong/weread-vscode/issues"
+    "url": "https://github.com/Weichuandong/weread-vscode/issues"
   },
-  "homepage": "https://github.com/weichuandong/weread-vscode#readme",
+  "homepage": "https://github.com/Weichuandong/weread-vscode#readme",
   "engines": {
     "vscode": "^1.80.0"
   },
