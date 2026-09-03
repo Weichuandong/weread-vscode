@@ -4,6 +4,7 @@ import { AuthService } from '../auth/AuthService';
 import { getBookReaderUrl } from './wereadUrl';
 import { calcHash, sign, currentTime } from './wereadSign';
 import { chk, dH, dS, dT } from './wereadDecrypt';
+import { normalizeStoreBook, parseCategoryBooks, parseCategoryTree } from './wereadStore';
 import {
   BestBookmark,
   BookProgress,
@@ -13,6 +14,9 @@ import {
   ChapterUnderline,
   Review,
   ReviewAuthor,
+  StoreBook,
+  StoreCategoryTree,
+  StoreSearchResult,
   WereadArchive,
   WereadBook,
   WereadChapter,
@@ -129,6 +133,26 @@ export class WereadClient {
    * 不上 LRU: 一本书的图片总数有限(几百张顶天), 切书也罕见到要清, 简单 Map 够用。
    */
   private imageDataUrlCache: Map<string, Promise<string | null>> = new Map();
+
+  /**
+   * 书城榜单/分类的内存缓存: categoryId → { 拉取时刻, 书单 }。
+   *
+   * 榜单要拉一整张 SSR 页面 (600KB+), 但内容变化以天计, 用户在 chip 之间来回切
+   * 不该反复打网络。TTL 10 分钟, 顶部"刷新"按钮走 force 绕过。
+   * 进程级缓存, 不落盘 — 重启 VSCode 自然失效, 不需要考虑陈旧数据治理。
+   */
+  private categoryCache: Map<string, { at: number; books: StoreBook[] }> = new Map();
+  private static readonly CATEGORY_TTL_MS = 10 * 60 * 1000;
+
+  /**
+   * 书城分类树缓存 (GET /web/categories 的解析结果)。
+   *
+   * 那个接口一次 430KB, 但内容是"微信读书有哪些分类", 属于半年都不带变的元数据,
+   * 所以缓存 6 小时。UI 侧还会先用内置常量把 chips 画出来, 树到了再无感替换,
+   * 用户永远不会对着空白等这 430KB。
+   */
+  private categoryTreeCache: { at: number; tree: StoreCategoryTree } | null = null;
+  private static readonly CATEGORY_TREE_TTL_MS = 6 * 60 * 60 * 1000;
 
   constructor(private readonly auth: AuthService) {
     this.http = this.buildHttpClient();
@@ -1300,5 +1324,192 @@ export class WereadClient {
       });
     }
     return out;
+  }
+
+  // ============================================================
+  // 书城(发现): 搜索 / 榜单分类 / 加入书架
+  // ============================================================
+
+  /**
+   * 全局搜索图书。
+   *
+   * 接口: GET /web/search/global?keyword=&maxIdx=&fragmentSize=&count=
+   * 返回: { books: [{ bookInfo, searchIdx, readingCount, ... }], totalCount, hasMore }
+   *
+   * 特点(实测):
+   *   - **不需要登录** 也能搜 — 未导入 cookie 时同样返回完整结果, 因此这里不 ensureLogin,
+   *     用户可以先逛后登录 (真正要"读"时才需要 cookie)。
+   *   - maxIdx 就是"已拿到的条数", 传 20 拿第 21 条起, 配合 hasMore 做无限加载。
+   *   - fragmentSize 只影响服务端返回的高亮片段长度, 我们不用高亮, 给个常规值即可。
+   */
+  public async searchBooks(
+    keyword: string,
+    maxIdx = 0,
+    count = 20,
+  ): Promise<StoreSearchResult> {
+    const kw = (keyword ?? '').trim();
+    if (!kw) {
+      return { books: [], totalCount: 0, hasMore: false, nextMaxIdx: 0 };
+    }
+    try {
+      const res = await this.http.get('/web/search/global', {
+        params: { keyword: kw, maxIdx, fragmentSize: 120, count },
+        headers: this.buildHeaders(),
+      });
+      if (res.status >= 400) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      const data = (res.data ?? {}) as Record<string, unknown>;
+      const rawList = Array.isArray(data.books) ? (data.books as Array<Record<string, unknown>>) : [];
+      const books: StoreBook[] = [];
+      for (const item of rawList) {
+        const book = normalizeStoreBook(item?.bookInfo, {
+          rank: typeof item?.searchIdx === 'number' ? (item.searchIdx as number) : undefined,
+          readingCount:
+            typeof item?.readingCount === 'number' ? (item.readingCount as number) : undefined,
+        });
+        if (book) books.push(book);
+      }
+      const totalCount = typeof data.totalCount === 'number' ? data.totalCount : books.length;
+      // hasMore 服务端给的是 0/1; 再叠一层"这一页真的拿到东西了"的保护, 防止 hasMore 恒 1 导致死循环
+      const hasMore = (data.hasMore === 1 || data.hasMore === true) && books.length > 0;
+      console.log(
+        `[weread-vscode] 书城搜索 "${kw}" maxIdx=${maxIdx} → ${books.length} 条 (total=${totalCount}, hasMore=${hasMore})`,
+      );
+      return { books, totalCount, hasMore, nextMaxIdx: maxIdx + books.length };
+    } catch (e) {
+      this.handleError('搜索图书', e);
+    }
+  }
+
+  /**
+   * 拉完整的书城分类树: 7 个榜单 + 22 个一级分类(每个带 2~21 个二级分类)。
+   *
+   * 接口: GET /web/categories → { synckey, data: [ { categories: [...] }, ... ] }
+   * 无需登录。响应 430KB 但属于元数据, 缓存 6 小时 (见 categoryTreeCache)。
+   *
+   * 失败不抛错而是返回 null —— 分类树只是"导航增强", 拿不到时 UI 会退回内置常量清单,
+   * 用户照样能点飙升榜/精品小说, 不该因为导航拉不到就把整个书城判死。
+   */
+  public async getCategoryTree(force = false): Promise<StoreCategoryTree | null> {
+    const cached = this.categoryTreeCache;
+    if (!force && cached && Date.now() - cached.at < WereadClient.CATEGORY_TREE_TTL_MS) {
+      return cached.tree;
+    }
+    try {
+      const res = await this.http.get('/web/categories', { headers: this.buildHeaders() });
+      if (res.status >= 400) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      const tree = parseCategoryTree(res.data);
+      const subTotal = tree.categories.reduce((a, c) => a + (c.children?.length ?? 0), 0);
+      console.log(
+        `[weread-vscode] 书城分类树: ${tree.ranks.length} 个榜单 / ${tree.categories.length} 个一级分类 / ${subTotal} 个二级分类`,
+      );
+      if (tree.ranks.length === 0 && tree.categories.length === 0) {
+        return null;
+      }
+      this.categoryTreeCache = { at: Date.now(), tree };
+      return tree;
+    } catch (e) {
+      console.warn('[weread-vscode] 获取书城分类树失败, 将回落到内置清单:', (e as Error)?.message);
+      return null;
+    }
+  }
+
+  /**
+   * 拉某个榜单 / 分类下的书 (固定 20 条, 服务端直出的首屏量)。
+   *
+   * 微信读书 web 端没有给榜单开 JSON 接口 (社区流传的 /web/bookListInCategory 等全 404),
+   * 列表数据塞在页面 https://weread.qq.com/web/category/{id} 的 `window.__INITIAL_STATE__` 里。
+   * 所以这里按 text 拉 HTML, 再交给 parseCategoryBooks 抠数据。
+   *
+   * 因为一次响应 600KB+ 且榜单变化很慢, 内存里按 categoryId 缓存 10 分钟,
+   * 用户来回切 chip 不会反复打网络; 顶部"刷新"按钮走 force=true 绕过缓存。
+   */
+  public async getCategoryBooks(categoryId: string, force = false): Promise<StoreBook[]> {
+    const id = (categoryId ?? '').trim();
+    if (!id) return [];
+
+    const cached = this.categoryCache.get(id);
+    if (!force && cached && Date.now() - cached.at < WereadClient.CATEGORY_TTL_MS) {
+      console.log(`[weread-vscode] 书城榜单 ${id} 命中内存缓存 (${cached.books.length} 本)`);
+      return cached.books;
+    }
+
+    try {
+      const res = await this.http.get(`/web/category/${encodeURIComponent(id)}`, {
+        headers: this.buildHeaders({ Accept: 'text/html,application/xhtml+xml' }),
+        responseType: 'text',
+        transformResponse: [(d) => d],
+      });
+      if (res.status >= 400) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      const html = typeof res.data === 'string' ? res.data : '';
+      const books = parseCategoryBooks(html);
+      console.log(
+        `[weread-vscode] 书城榜单 ${id} 拉取完成: HTML ${html.length} 字符 → ${books.length} 本`,
+      );
+      if (books.length === 0) {
+        // 页面结构变了 / 被风控挡了 — 明确抛错, 让 UI 展示"重试"而不是一个空白列表
+        throw new Error('未能从页面解析出书单 (接口结构可能已变更)');
+      }
+      this.categoryCache.set(id, { at: Date.now(), books });
+      return books;
+    } catch (e) {
+      this.handleError('获取书城榜单', e);
+    }
+  }
+
+  /**
+   * 把书加入我的书架。
+   *
+   * 接口: POST /web/shelf/add  body: { bookIds: [...] } → { succ: 1 }
+   * (路径与 payload 取自 weread web 端 app.js 里的 FETCH_ADD_SHELF_FORCE 分支)
+   *
+   * 必须登录; 失败时抛错让 UI 提示, 因为这是用户主动触发的写操作, 静默失败最糟。
+   */
+  public async addBooksToShelf(bookIds: string[]): Promise<boolean> {
+    this.ensureLogin();
+    const ids = (bookIds ?? []).filter((x) => !!x);
+    if (ids.length === 0) return false;
+    try {
+      const res = await this.http.post(
+        '/web/shelf/add',
+        { bookIds: ids },
+        {
+          headers: this.buildHeaders({
+            'Content-Type': 'application/json',
+            Origin: 'https://weread.qq.com',
+            Referer: 'https://weread.qq.com/',
+          }),
+        },
+      );
+      const data = (res.data ?? {}) as Record<string, unknown>;
+      const errCode = data.errCode ?? data.errcode;
+      const ok = res.status >= 200 && res.status < 300 && errCode === undefined;
+      console.log(
+        `[weread-vscode] 加入书架 ${ok ? 'OK' : 'FAIL'} status=${res.status} ids=${ids.join(',')}` +
+          (errCode !== undefined ? ` errCode=${errCode} errMsg=${data.errMsg ?? ''}` : ''),
+      );
+      if (!ok) {
+        throw new Error(
+          typeof data.errMsg === 'string' && data.errMsg
+            ? String(data.errMsg)
+            : `服务端拒绝 (status=${res.status}${errCode !== undefined ? `, errCode=${errCode}` : ''})`,
+        );
+      }
+      // 加入书架会改变榜单里的 isBookInMyShelf, 缓存里的旧值就地更新一下,
+      // 免得切回榜单还显示"加入书架"按钮。
+      for (const entry of this.categoryCache.values()) {
+        for (const b of entry.books) {
+          if (ids.includes(b.bookId)) b.inShelf = true;
+        }
+      }
+      return true;
+    } catch (e) {
+      this.handleError('加入书架', e);
+    }
   }
 }

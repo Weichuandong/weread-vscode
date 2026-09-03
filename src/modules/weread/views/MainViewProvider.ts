@@ -7,11 +7,21 @@ import {
   BookProgress,
   ChapterUnderline,
   Review,
+  StoreBook,
+  StoreCategoryTree,
   WereadArchive,
   WereadBook,
   WereadChapter,
 } from '../types';
 import { getBookReaderUrl, getChapterReaderUrl } from '../api/wereadUrl';
+import {
+  DEFAULT_STORE_CATEGORY,
+  FALLBACK_CATEGORY_TREE,
+  findCategoryNode,
+  formatCount,
+  formatRating,
+  getStoreCategoryTitle,
+} from '../api/wereadStore';
 import {
   getImageLightboxCss,
   getImageLightboxHtml,
@@ -32,9 +42,41 @@ import {
   saveReadingPrefs,
 } from './readingPrefs';
 
-type Tab = 'shelf' | 'reader';
+type Tab = 'shelf' | 'store' | 'reader';
 /** "想法"抽屉里 3 个 tab */
 type ReviewsTab = 'chapter' | 'hotmarks' | 'book';
+/** 书城当前展示的是榜单还是搜索结果 */
+type StoreMode = 'rank' | 'search';
+/**
+ * 书城结果排序方式。
+ *
+ * 全部是**客户端排序** —— 实测 /web/search/global 完全忽略 sort / sortType / orderBy /
+ * filterType 等参数 (传与不传返回的 bookId 序列一模一样), 微信读书 web 端自己也只传
+ * keyword / maxIdx / fragmentSize / count / sid, 服务端没开排序能力。
+ *
+ *   default  接口原序 — 搜索是相关度, 榜单是官方名次
+ *   rating   评分高→低 (newRating, 同分看评分人数)
+ *   readers  当下在读人数高→低 (readingCount)
+ *   popular  累计读过打分人数高→低 (newRatingCount)
+ *   price    价格低→高 (无价/未标价的沉底)
+ *
+ * 为什么"在读"和"热度"要分成两个:
+ *   readingCount  = 此刻有多少人在读 — 反映当下热度 (三体全集 10797)
+ *   newRatingCount= 累计多少人读完打过分 — 反映口碑体量 (三体全集 295143)
+ * 两者常常给出完全不同的排名 (新书在读高但评分人数少, 老经典反之), 合成一个
+ * "人气"反而两边都不像; 而且搜索的默认相关度本身就近似按在读人数排,
+ * 只留"在读"会让用户觉得"点了跟没点一样"。
+ */
+type StoreSort = 'default' | 'rating' | 'readers' | 'popular' | 'price';
+
+/** 排序 chips 的展示定义 */
+const STORE_SORTS: { key: StoreSort; label: string; tip: string }[] = [
+  { key: 'default', label: '综合', tip: '接口默认顺序（搜索=相关度，榜单=官方名次）' },
+  { key: 'rating', label: '评分', tip: '按微信读书评分从高到低；同分时评分人数多的靠前' },
+  { key: 'readers', label: '在读', tip: '按“当前在读人数”从高到低 — 当下热度' },
+  { key: 'popular', label: '热度', tip: '按“参与评分人数”从高到低 — 累计读过的体量，老经典占优' },
+  { key: 'price', label: '价格', tip: '按价格从低到高；未标价 / 会员免费书排最后' },
+];
 
 /**
  * 本地 globalState 里缓存的"最近在读"快照, 仅用作首屏占位,
@@ -49,6 +91,39 @@ interface LastReadSnapshot {
 }
 const KEY_LAST_READ = 'weread.lastRead';
 const KEY_TAB = 'weread.tab';
+/** 书架视图偏好(分组方式 / 排序), 用户级持久化 */
+const KEY_SHELF_VIEW = 'weread.shelfView';
+
+/**
+ * 书架分组方式 — 全部基于**真实数据**的视图切换, 不引入插件自造的分类概念。
+ *
+ * 'archive' 是微信读书 APP 里用户自建的云端分组, 这里只读: web 端没有分组管理写接口
+ * (`/web/shelf/archive/:archiveId` 只是前端路由, JS 里 shelf 相关 API 只有 sync / add / bookIds),
+ * 所以插件不提供"新建分组 / 移动书籍"能力 —— 分组请在微信读书 APP 里改, 这边刷新即可看到。
+ *
+ * 也刻意**不做**"插件本地标签": 那会造出一套跟 APP 对不上、又同步不回去的第二套分类,
+ * 用户很容易误以为自己整理的是真书架, 换台设备就傻眼 — 误导大于价值。
+ */
+type ShelfGroupBy = 'archive' | 'status' | 'none';
+/** 书架排序方式 */
+type ShelfSortBy = 'default' | 'recent' | 'progress' | 'title';
+
+const SHELF_GROUPS: { key: ShelfGroupBy; label: string; tip: string }[] = [
+  {
+    key: 'archive',
+    label: '云端分组',
+    tip: '按微信读书 APP 里自建的分组（archive）分桶；分组本身请到 APP 里管理，这里刷新即可同步',
+  },
+  { key: 'status', label: '阅读状态', tip: '按 在读 / 已读完 / 未开始 分桶' },
+  { key: 'none', label: '不分组', tip: '所有书平铺一个列表' },
+];
+
+const SHELF_SORTS: { key: ShelfSortBy; label: string; tip: string }[] = [
+  { key: 'default', label: '默认', tip: '接口返回顺序' },
+  { key: 'recent', label: '最近', tip: '按云端最近阅读时间从新到旧' },
+  { key: 'progress', label: '进度', tip: '按阅读进度从高到低' },
+  { key: 'title', label: '书名', tip: '按书名拼音/字典序' },
+];
 
 /**
  * 唯一的侧栏 Webview 视图: 整合书架与阅读两个功能。
@@ -91,6 +166,74 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   private pendingShelfLoad = false;
   /** 当前已展开的分组名集合(默认全部折叠) */
   private expandedGroups = new Set<string>();
+  /**
+   * 云端阅读进度索引 (bookId → 进度), 来自 /web/shelf/sync。
+   * 书架"最近阅读"排序靠它的 updateTime, 之前这份数据拉完就丢了。
+   */
+  private progressMap = new Map<string, BookProgress>();
+  /** 书架搜索词(本地过滤, 不打接口) */
+  private shelfKeyword = '';
+  /** 书架分组方式, 持久化到 globalState */
+  private shelfGroupBy: ShelfGroupBy = 'archive';
+  /** 书架排序方式, 持久化到 globalState */
+  private shelfSortBy: ShelfSortBy = 'default';
+  /** 渲染后是否把光标放回书架搜索框(同书城, 整页重建会丢焦点) */
+  private shelfFocusSearch = false;
+
+  // ---- 书城状态 ----
+  /**
+   * 书城是"发现新书"的入口, 与书架(我的书)彻底分开:
+   *   - rank   模式: 展示某个榜单/分类的 20 本 (数据来自 SSR 页面解析, 见 wereadStore.ts)
+   *   - search 模式: 展示 /web/search/global 的结果, 支持 maxIdx 翻页加载更多
+   * 两种模式共用 storeBooks 这一个列表, 由 storeMode 决定标题栏与"加载更多"的行为。
+   */
+  private storeMode: StoreMode = 'rank';
+  /** 当前选中的榜单/分类 id */
+  private storeCategoryId: string = DEFAULT_STORE_CATEGORY;
+  /** 当前搜索词(search 模式下非空) */
+  private storeKeyword = '';
+  private storeBooks: StoreBook[] = [];
+  private storeLoading = false;
+  /** "加载更多"进行中 — 与首屏 loading 区分, 避免整列表被骨架屏替换 */
+  private storeLoadingMore = false;
+  private storeError: string | null = null;
+  private storeHasMore = false;
+  private storeNextMaxIdx = 0;
+  private storeTotalCount = 0;
+  /** 书城异步请求 token, 丢弃过期回包(用户快速切 chip / 连续搜索) */
+  private storeToken = 0;
+  /** 首次进入书城前不预拉数据, 由 tab 切换/命令触发, 这里记录"是否已拉过" */
+  private storeInitialized = false;
+  /**
+   * 下一次渲染后是否把光标放回搜索框。
+   *
+   * 本视图是"整页重建"模式(render() 直接覆盖 webview.html), 输入框会连同焦点一起没掉。
+   * 用户按回车搜完往往还想改关键词, 所以搜索/清空这类由输入框发起的动作会置位这个标记,
+   * 前端脚本看到 data-autofocus="1" 就把焦点+光标恢复到末尾。
+   */
+  private storeFocusSearch = false;
+  /**
+   * 本会话内已成功"加入书架"的 bookId。
+   *
+   * 加书架后不强制刷新书架列表(那是一次多余的全量请求), 用这个集合让按钮立刻变成
+   * "已在书架", 给用户即时反馈; 下次真正刷新书架时自然会对上。
+   */
+  private storeAddedBookIds = new Set<string>();
+  /**
+   * 官方完整分类树 (7 榜单 + 22 一级分类 + 100 多个二级分类)。
+   *
+   * null 表示还没拉到 / 拉失败, 此时 chips 用 FALLBACK_CATEGORY_TREE 兜底 —— 用户
+   * 打开书城的第一帧就能看到并点击常用入口, 树到了再无感替换成完整版。
+   */
+  private storeTree: StoreCategoryTree | null = null;
+  /** 一级分类 chips 是否展开全部 (22 个全铺开会占掉半屏, 默认只露一行多) */
+  private storeCatsExpanded = false;
+  /**
+   * 当前排序方式。注意 storeBooks 永远保持**服务端原序**, 排序只在渲染时派生
+   * (见 sortedStoreBooks) —— 否则"加载更多"往一个已被打乱的数组尾部追加,
+   * 再切回"综合"就永远拿不回原始顺序了。
+   */
+  private storeSort: StoreSort = 'default';
 
   // ---- 阅读状态 ----
   private currentBook: WereadBook | undefined;
@@ -207,8 +350,19 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       this.pendingRestoreChapterUid = snap.chapterUid;
     }
     const savedTab = context.globalState.get<Tab>(KEY_TAB);
-    if (savedTab === 'shelf' || savedTab === 'reader') {
+    if (savedTab === 'shelf' || savedTab === 'reader' || savedTab === 'store') {
       this.tab = savedTab;
+    }
+
+    // ---- 书架视图偏好 + 本地标签 ----
+    const savedView = context.globalState.get<{ groupBy?: string; sortBy?: string }>(
+      KEY_SHELF_VIEW,
+    );
+    if (SHELF_GROUPS.some((g) => g.key === savedView?.groupBy)) {
+      this.shelfGroupBy = savedView!.groupBy as ShelfGroupBy;
+    }
+    if (SHELF_SORTS.some((s) => s.key === savedView?.sortBy)) {
+      this.shelfSortBy = savedView!.sortBy as ShelfSortBy;
     }
 
     // 加载阅读偏好 (字号/行距/...). 无效字段会被 loadReadingPrefs 回落到默认值。
@@ -258,6 +412,11 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       void this.loadBookInternal(this.currentBook);
     }
 
+    // 上次停在书城 → 把榜单拉起来 (榜单不依赖登录态, 未登录也能逛)
+    if (this.tab === 'store' && !this.storeInitialized) {
+      void this.loadStoreCategory(this.storeCategoryId);
+    }
+
     this.render();
   }
 
@@ -269,6 +428,36 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     this.shelfError = null;
     this.pendingShelfLoad = true;
     await this.loadShelfIfNeeded(true);
+  }
+
+  /**
+   * 命令入口: 打开书城并搜索关键词。
+   *
+   * keyword 为空时只切到书城(展示当前榜单), 非空则直接跑一次搜索。
+   * 与 webview 内的搜索框走同一份 runStoreSearch, 行为完全一致。
+   */
+  public async openStore(keyword?: string): Promise<void> {
+    if (!this.view) {
+      try {
+        await vscode.commands.executeCommand('wereadVscode.main.focus');
+      } catch {
+        await vscode.commands.executeCommand('workbench.view.extension.wereadVscode');
+      }
+    }
+    this.view?.show?.(true);
+    this.tab = 'store';
+    void this.context.globalState.update(KEY_TAB, this.tab);
+
+    const kw = (keyword ?? '').trim();
+    if (kw) {
+      await this.runStoreSearch(kw);
+      return;
+    }
+    if (!this.storeInitialized) {
+      await this.loadStoreCategory(this.storeCategoryId);
+      return;
+    }
+    this.render();
   }
 
   /** OutputChannel 复用一份, dispose 跟随 context */
@@ -420,6 +609,14 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       const shelf = await this.client.getBookshelf();
       this.books = shelf.books;
       this.archives = shelf.archives;
+      // 留住进度索引 — 书架"最近阅读"排序要用它的 updateTime
+      this.progressMap = shelf.progressMap;
+
+      // 书架刚拉到 → 顺手校正书城列表的"已在书架"标记
+      // (常见路径: 用户先逛书城再登录, 或在手机上加过书)
+      if (this.storeBooks.length > 0) {
+        this.storeBooks = this.markShelfState(this.storeBooks);
+      }
 
       // 拉到书架后, 如果本地还没有任何最近在读快照, 用云端的 lastReadBookId 补一个,
       // 这样新设备首次安装、登录后立刻就能看到"在读"tab 是活的, 多端真正打通。
@@ -461,6 +658,227 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       this.shelfLoading = false;
       this.render();
     }
+  }
+
+  /** 持久化书架视图偏好(分组/排序) */
+  private persistShelfView(): void {
+    void this.context.globalState.update(KEY_SHELF_VIEW, {
+      groupBy: this.shelfGroupBy,
+      sortBy: this.shelfSortBy,
+    });
+  }
+
+  // ---------------- 书城数据加载 ----------------
+
+  /**
+   * 切到某个榜单/分类并拉数据。
+   *
+   * 榜单一次就是 20 本 (服务端直出的首屏量, 没有翻页接口), 所以没有"加载更多"。
+   * force=true 时绕过 client 的 10min 内存缓存 (顶部刷新按钮用)。
+   */
+  /**
+   * 拉官方分类树 (fire-and-forget)。
+   *
+   * 与榜单请求并行, 不阻塞首屏: chips 先用内置兜底清单画出来, 树到了再 render 一次
+   * 换成完整版 (22 个一级分类 + 二级分类)。失败就一直用兜底清单, 不打扰用户。
+   */
+  private async loadStoreTree(force = false): Promise<void> {
+    if (this.storeTree && !force) return;
+    try {
+      const tree = await this.client.getCategoryTree(force);
+      if (!tree) return;
+      this.storeTree = tree;
+      // 只在书城页面才需要重画 (用户可能已经切走了)
+      if (this.tab === 'store') this.render();
+    } catch {
+      /* 分类树属于增强能力, 失败静默回落内置清单 */
+    }
+  }
+
+  /** 当前生效的分类树: 官方树优先, 没有就用内置兜底清单 */
+  private get storeCategoryTree(): StoreCategoryTree {
+    return this.storeTree ?? FALLBACK_CATEGORY_TREE;
+  }
+
+  private async loadStoreCategory(categoryId: string, force = false): Promise<void> {
+    const token = ++this.storeToken;
+    this.storeInitialized = true;
+    // 与榜单请求并行, 首屏不等它
+    void this.loadStoreTree(force);
+    this.storeMode = 'rank';
+    this.storeCategoryId = categoryId;
+    this.storeKeyword = '';
+    this.storeLoading = true;
+    this.storeLoadingMore = false;
+    this.storeError = null;
+    this.storeHasMore = false;
+    this.storeNextMaxIdx = 0;
+    this.storeTotalCount = 0;
+    this.storeBooks = [];
+    this.render();
+
+    try {
+      const books = await this.client.getCategoryBooks(categoryId, force);
+      if (token !== this.storeToken) return;
+      this.storeBooks = this.markShelfState(books);
+      this.storeTotalCount = books.length;
+    } catch (e) {
+      if (token !== this.storeToken) return;
+      this.storeError = e instanceof Error ? e.message : String(e);
+      this.storeBooks = [];
+    } finally {
+      if (token === this.storeToken) {
+        this.storeLoading = false;
+        this.render();
+      }
+    }
+  }
+
+  /** 执行一次搜索(重置到第一页) */
+  private async runStoreSearch(keyword: string): Promise<void> {
+    const kw = (keyword ?? '').trim();
+    if (!kw) {
+      // 空关键词等价于"退出搜索, 回到当前榜单"
+      await this.loadStoreCategory(this.storeCategoryId);
+      return;
+    }
+    const token = ++this.storeToken;
+    this.storeInitialized = true;
+    void this.loadStoreTree();
+    this.storeMode = 'search';
+    this.storeKeyword = kw;
+    this.storeLoading = true;
+    this.storeLoadingMore = false;
+    this.storeError = null;
+    this.storeBooks = [];
+    this.storeHasMore = false;
+    this.storeNextMaxIdx = 0;
+    this.storeTotalCount = 0;
+    // 搜完把光标还给搜索框, 方便连续改词再搜
+    this.storeFocusSearch = true;
+    this.render();
+
+    try {
+      const res = await this.client.searchBooks(kw, 0);
+      if (token !== this.storeToken) return;
+      this.storeBooks = this.markShelfState(res.books);
+      this.storeHasMore = res.hasMore;
+      this.storeNextMaxIdx = res.nextMaxIdx;
+      this.storeTotalCount = res.totalCount;
+    } catch (e) {
+      if (token !== this.storeToken) return;
+      this.storeError = e instanceof Error ? e.message : String(e);
+    } finally {
+      if (token === this.storeToken) {
+        this.storeLoading = false;
+        this.render();
+      }
+    }
+  }
+
+  /** 搜索结果"加载更多"(榜单模式没有更多可加载) */
+  private async loadStoreMore(): Promise<void> {
+    if (this.storeMode !== 'search' || !this.storeHasMore) return;
+    if (this.storeLoading || this.storeLoadingMore) return;
+    const token = ++this.storeToken;
+    this.storeLoadingMore = true;
+    this.render();
+
+    try {
+      const res = await this.client.searchBooks(this.storeKeyword, this.storeNextMaxIdx);
+      if (token !== this.storeToken) return;
+      // 去重: 服务端偶尔会在翻页边界重复给同一本
+      const seen = new Set(this.storeBooks.map((b) => b.bookId));
+      const fresh = this.markShelfState(res.books).filter((b) => !seen.has(b.bookId));
+      this.storeBooks = [...this.storeBooks, ...fresh];
+      this.storeHasMore = res.hasMore && fresh.length > 0;
+      this.storeNextMaxIdx = res.nextMaxIdx;
+    } catch (e) {
+      if (token !== this.storeToken) return;
+      this.storeError = e instanceof Error ? e.message : String(e);
+      this.storeHasMore = false;
+    } finally {
+      if (token === this.storeToken) {
+        this.storeLoadingMore = false;
+        this.render();
+      }
+    }
+  }
+
+  /**
+   * 给书城列表打上"已在我的书架"标记。
+   *
+   * 三个来源合并:
+   *   1) 榜单接口自带的 isBookInMyShelf
+   *   2) 已加载的书架列表 this.books
+   *   3) 本会话内刚点过"加入书架"的 storeAddedBookIds
+   */
+  private markShelfState(books: StoreBook[]): StoreBook[] {
+    const shelfIds = new Set(this.books.map((b) => b.bookId));
+    return books.map((b) => ({
+      ...b,
+      inShelf: b.inShelf === true || shelfIds.has(b.bookId) || this.storeAddedBookIds.has(b.bookId),
+    }));
+  }
+
+  /** 书城点击"加入书架" */
+  private async addStoreBookToShelf(bookId: string): Promise<void> {
+    const book = this.storeBooks.find((b) => b.bookId === bookId);
+    if (!book || book.inShelf) return;
+    if (!this.auth.isLoggedIn()) {
+      const pick = await vscode.window.showInformationMessage(
+        '加入书架需要先登录微信读书',
+        '导入 Cookie',
+      );
+      if (pick === '导入 Cookie') {
+        await vscode.commands.executeCommand('weread.importCookie');
+      }
+      return;
+    }
+    try {
+      await this.client.addBooksToShelf([bookId]);
+      this.storeAddedBookIds.add(bookId);
+      book.inShelf = true;
+      // 让书架下次打开时能看到这本新书
+      this.pendingShelfLoad = true;
+      this.render();
+      vscode.window.showInformationMessage(`已加入书架：${book.title}`);
+    } catch (e) {
+      vscode.window.showErrorMessage(
+        `加入书架失败：${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+  }
+
+  /**
+   * 书城点击书 → 直接进阅读。
+   *
+   * 微信读书对"未加入书架的书"同样允许 web 端阅读(试读/会员), 所以这里不强制先加书架,
+   * 直接把 StoreBook 降级成 WereadBook 交给现有的 openBook 流程 (章节目录/进度/缓存全复用)。
+   */
+  private async openStoreBook(bookId: string): Promise<void> {
+    const b = this.storeBooks.find((x) => x.bookId === bookId);
+    if (!b) return;
+    if (!this.auth.isLoggedIn()) {
+      const pick = await vscode.window.showInformationMessage(
+        '阅读需要先登录微信读书（书城浏览/搜索无需登录）',
+        '导入 Cookie',
+        '在浏览器打开',
+      );
+      if (pick === '导入 Cookie') {
+        await vscode.commands.executeCommand('weread.importCookie');
+      } else if (pick === '在浏览器打开') {
+        await vscode.env.openExternal(vscode.Uri.parse(getBookReaderUrl(bookId)));
+      }
+      return;
+    }
+    await this.openBook({
+      bookId: b.bookId,
+      title: b.title,
+      author: b.author,
+      cover: b.cover,
+      intro: b.intro,
+    });
   }
 
   private async loadBookInternal(book: WereadBook): Promise<void> {
@@ -987,12 +1405,17 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     switch (msg.type) {
       case 'switchTab': {
         const next = (msg.payload as { tab?: Tab })?.tab;
-        if (next === 'shelf' || next === 'reader') {
+        if (next === 'shelf' || next === 'reader' || next === 'store') {
           this.tab = next;
           void this.context.globalState.update(KEY_TAB, this.tab);
           // 切到"在读"且只有占位的 currentBook 但还没拉过章节 → 触发加载
           if (next === 'reader' && this.currentBook && this.currentChapters.length === 0) {
             void this.loadBookInternal(this.currentBook);
+            return;
+          }
+          // 首次进书城 → 拉默认榜单 (之后切回来直接用内存里的结果, 不重复请求)
+          if (next === 'store' && !this.storeInitialized) {
+            void this.loadStoreCategory(this.storeCategoryId);
             return;
           }
           if (next === 'shelf' && this.books.length === 0 && this.auth.isLoggedIn()) {
@@ -1001,6 +1424,67 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
           } else {
             this.render();
           }
+        }
+        break;
+      }
+      // ---- 书城 ----
+      case 'storeSearch': {
+        const kw = (msg.payload as { keyword?: string })?.keyword ?? '';
+        void this.runStoreSearch(kw);
+        break;
+      }
+      case 'storeClearSearch':
+        // 清空搜索框 → 回到上次看的榜单, 并把焦点还给输入框
+        this.storeFocusSearch = true;
+        void this.loadStoreCategory(this.storeCategoryId);
+        break;
+      case 'storeSelectCategory': {
+        const id = (msg.payload as { id?: string })?.id;
+        if (typeof id === 'string' && id) {
+          void this.loadStoreCategory(id);
+        }
+        break;
+      }
+      case 'storeLoadMore':
+        void this.loadStoreMore();
+        break;
+      case 'storeToggleMoreCats':
+        // 一级分类"更多/收起" — 纯 UI 状态, 不碰数据
+        this.storeCatsExpanded = !this.storeCatsExpanded;
+        this.render();
+        break;
+      case 'storeSort': {
+        // 纯客户端排序: 不重新请求, 只换渲染顺序 (服务端不支持排序参数)
+        const key = (msg.payload as { key?: string })?.key;
+        const hit = STORE_SORTS.find((s) => s.key === key);
+        if (hit && this.storeSort !== hit.key) {
+          this.storeSort = hit.key;
+          this.render();
+        }
+        break;
+      }
+      case 'storeRefresh':
+        if (this.storeMode === 'search') {
+          void this.runStoreSearch(this.storeKeyword);
+        } else {
+          // force: 同时绕过榜单书单缓存和分类树缓存
+          void this.loadStoreCategory(this.storeCategoryId, true);
+        }
+        break;
+      case 'storeOpenBook': {
+        const bookId = (msg.payload as { bookId?: string })?.bookId;
+        if (bookId) void this.openStoreBook(bookId);
+        break;
+      }
+      case 'storeAddShelf': {
+        const bookId = (msg.payload as { bookId?: string })?.bookId;
+        if (bookId) void this.addStoreBookToShelf(bookId);
+        break;
+      }
+      case 'storeOpenInBrowser': {
+        const bookId = (msg.payload as { bookId?: string })?.bookId;
+        if (bookId) {
+          void vscode.env.openExternal(vscode.Uri.parse(getBookReaderUrl(bookId)));
         }
         break;
       }
@@ -1050,6 +1534,52 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       case 'refreshShelf':
         void this.refreshShelf();
         break;
+      // ---- 书架视图: 搜索 / 分组 / 排序 / 标签 ----
+      case 'shelfSearch': {
+        // 纯本地过滤: 书架数据全量在内存里, 不打接口
+        const kw = (msg.payload as { keyword?: string })?.keyword ?? '';
+        if (this.shelfKeyword !== kw) {
+          this.shelfKeyword = kw;
+          this.shelfFocusSearch = true;
+          this.render();
+        }
+        break;
+      }
+      case 'shelfClearSearch':
+        if (this.shelfKeyword) {
+          this.shelfKeyword = '';
+          this.shelfFocusSearch = true;
+          this.render();
+        }
+        break;
+      case 'shelfGroupBy': {
+        const key = (msg.payload as { key?: string })?.key;
+        const hit = SHELF_GROUPS.find((g) => g.key === key);
+        if (hit && this.shelfGroupBy !== hit.key) {
+          this.shelfGroupBy = hit.key;
+          // 换了分组维度, 旧的展开状态(按组名记的)已经对不上, 清掉从头来
+          this.expandedGroups.clear();
+          // 桶少的时候直接全展开 — "阅读状态"只有 3 桶、"不分组"只有 1 桶,
+          // 还要用户再点一遍才能看到书就太傻了; 桶多(云端分组/标签)仍保持折叠
+          const groups = this.computeGroups();
+          if (groups.length <= 4) {
+            for (const g of groups) this.expandedGroups.add(g.name);
+          }
+          this.persistShelfView();
+          this.render();
+        }
+        break;
+      }
+      case 'shelfSortBy': {
+        const key = (msg.payload as { key?: string })?.key;
+        const hit = SHELF_SORTS.find((s) => s.key === key);
+        if (hit && this.shelfSortBy !== hit.key) {
+          this.shelfSortBy = hit.key;
+          this.persistShelfView();
+          this.render();
+        }
+        break;
+      }
       case 'toggleGroup': {
         const name = (msg.payload as { name?: string })?.name;
         if (typeof name === 'string') {
@@ -1172,7 +1702,6 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     const cspSource = this.view!.webview.cspSource;
     const csp = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src https: http: data: ${cspSource}; style-src 'unsafe-inline' ${cspSource}; script-src 'unsafe-inline' ${cspSource};" />`;
 
-    const loggedIn = this.auth.isLoggedIn();
     // cookie 已知失效时, 在 tabbar 上方插一条被动提示横幅.
     // isCookieKnownInvalid() 内部已 && isLoggedIn(), 未登录时永远返回 false,
     // 所以这里不会出现"未登录态也挂个 banner"的尴尬情况.
@@ -1180,9 +1709,10 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     const bannerHtml = this.auth.isCookieKnownInvalid() && !this.invalidBannerDismissed
       ? this.buildInvalidBannerHtml()
       : '';
-    const body = !loggedIn
-      ? this.buildLoginCardHtml()
-      : `${bannerHtml}${this.buildTabBarHtml()}${this.buildContentHtml()}`;
+    // v3.2: 未登录时也保留 tabbar —— 书城的搜索/榜单接口不需要 cookie, 未登录用户
+    // 可以先逛书城再决定要不要登录。登录卡片降级为"书架/在读 tab 的内容", 由
+    // buildContentHtml 统一决定, 不再整页霸屏。
+    const body = `${bannerHtml}${this.buildTabBarHtml()}${this.buildContentHtml()}`;
 
     // :root 上注入用户阅读偏好对应的 CSS 变量。
     // 放在主 <style> 之后, 让 .reading { font-size: var(--rd-font-size, 15px) } 能拿到值,
@@ -1228,6 +1758,7 @@ ${prefsBlock}
         <div class="login-actions">
           <button class="primary" data-act="login">导入 Cookie</button>
         </div>
+        <p class="muted">不想登录？也可以先去 <a href="#" data-tab="store">书城</a> 搜书、看榜单。</p>
         <details class="help">
           <summary>如何获取 Cookie?</summary>
           <ol>
@@ -1283,6 +1814,9 @@ ${prefsBlock}
           <button class="tab ${this.tab === 'shelf' ? 'active' : ''}" data-tab="shelf" title="我的书架">
             <span class="icon">📚</span><span class="label">书架</span>
           </button>
+          <button class="tab ${this.tab === 'store' ? 'active' : ''}" data-tab="store" title="书城 — 榜单 / 分类 / 搜索">
+            <span class="icon">🔍</span><span class="label">书城</span>
+          </button>
           <button class="tab tab-reader ${this.tab === 'reader' ? 'active' : ''}" data-tab="reader" title="${escapeAttr(readerTooltip)}" ${readerHasBook ? '' : 'disabled'}>
             <span class="icon">📖</span><span class="label">${readerLabel}</span>
           </button>
@@ -1295,6 +1829,11 @@ ${prefsBlock}
                  <button class="icon-btn" data-act="refreshShelf" title="刷新书架">⟳</button>`
               : ''
           }
+          ${
+            this.tab === 'store'
+              ? `<button class="icon-btn" data-act="storeRefresh" title="刷新书城">⟳</button>`
+              : ''
+          }
           ${this.tab === 'reader' && this.currentBook ? `<button class="icon-btn" data-act="openInBrowser" title="在浏览器打开">↗</button>` : ''}
         </div>
       </nav>
@@ -1302,6 +1841,11 @@ ${prefsBlock}
   }
 
   private buildContentHtml(): string {
+    // 书城不依赖登录态, 未登录也能逛 (真正要"读"的时候才提示登录)
+    if (this.tab === 'store') return this.buildStoreHtml();
+    if (!this.auth.isLoggedIn()) {
+      return `<main class="content">${this.buildLoginCardHtml()}</main>`;
+    }
     if (this.tab === 'shelf') return this.buildShelfHtml();
     return this.buildReaderHtml();
   }
@@ -1349,11 +1893,33 @@ ${prefsBlock}
       return `<main class="content shelf"><div class="empty"><p>书架为空</p></div></main>`;
     }
 
+    const toolbar = this.buildShelfToolbarHtml();
     const groups = this.computeGroups();
+
+    // 搜索把所有书都过滤光了 — 给个明确出口, 别让用户以为书架空了
+    if (groups.length === 0) {
+      return `<main class="content shelf">${toolbar}
+        <div class="empty">
+          <p>没有匹配「${escapeHtml(this.shelfKeyword)}」的书</p>
+          <button class="ghost" data-act="shelfClearSearch">清除搜索</button>
+        </div>
+      </main>`;
+    }
+
+    // 搜索时强制展开: 用户此刻要的是"结果", 不该还要一个个点开分组去找
+    // (只认搜索这一种情况 — 其它场景保留用户自己的折叠状态, 点标题才有反馈)
+    const forceOpen = !!this.shelfKeyword;
+
+    // 选了"云端分组"却一个分组都没有 → 说明用户在 APP 里没建过分组。
+    // 这里明确告诉他分组该去哪建, 免得在插件里到处找"新建分组"按钮 (web 端没这个接口)。
+    const noArchiveHint =
+      this.shelfGroupBy === 'archive' && this.archives.length === 0 && !this.shelfKeyword
+        ? `<div class="shelf-tip">还没有分组。分组需要在微信读书 APP / 网页版里创建，这里点 ⟳ 刷新就能同步过来。</div>`
+        : '';
 
     const sections = groups
       .map((g) => {
-        const expanded = this.expandedGroups.has(g.name);
+        const expanded = forceOpen || this.expandedGroups.has(g.name);
         const arrow = expanded ? '▾' : '▸';
         const body = expanded
           ? `<div class="book-list">${g.books.map((b) => this.bookCardHtml(b)).join('')}</div>`
@@ -1369,42 +1935,160 @@ ${prefsBlock}
       })
       .join('');
 
-    return `<main class="content shelf">${sections}</main>`;
+    return `<main class="content shelf">${toolbar}${noArchiveHint}${sections}</main>`;
   }
 
   /**
-   * 把书架按用户自建分组分桶。
-   *   - 每个 archive 是一个分组(顺序保持服务端给的顺序)
-   *   - 不在任何 archive 中的书 → "未分组"
-   *   - 全空时仍保留"全部"作为兜底, 避免出现"啥都不显示"
+   * 书架工具条: 搜索框 + 分组方式 chips + 排序 chips。
+   *
+   * 与书城工具条同构 (搜索框 sticky / 焦点靠 data-autofocus 恢复), 但这里的搜索是
+   * **纯本地过滤**, 书架数据本来就全量在内存里, 不需要也不该为过滤打接口。
+   */
+  private buildShelfToolbarHtml(): string {
+    const autofocus = this.shelfFocusSearch ? '1' : '0';
+    this.shelfFocusSearch = false;
+    const searching = !!this.shelfKeyword;
+
+    const groupChips = SHELF_GROUPS.map(
+      (g) =>
+        `<button class="sort-chip ${this.shelfGroupBy === g.key ? 'active' : ''}" data-shelf-group="${g.key}" title="${escapeAttr(g.tip)}">${escapeHtml(g.label)}</button>`,
+    ).join('');
+    const sortChips = SHELF_SORTS.map(
+      (s) =>
+        `<button class="sort-chip ${this.shelfSortBy === s.key ? 'active' : ''}" data-shelf-sort="${s.key}" title="${escapeAttr(s.tip)}">${escapeHtml(s.label)}</button>`,
+    ).join('');
+
+    return `
+      <div class="shelf-toolbar">
+        <div class="store-search">
+          <span class="ss-icon" aria-hidden="true">🔎</span>
+          <input id="shelf-search-input" class="ss-input" type="text" spellcheck="false"
+                 placeholder="在书架里找书名 / 作者"
+                 value="${escapeAttr(this.shelfKeyword)}"
+                 data-autofocus="${autofocus}" />
+          ${
+            searching
+              ? `<button class="ss-btn" id="shelf-search-clear" title="清除搜索">✕</button>`
+              : ''
+          }
+        </div>
+        <div class="shelf-view-row">
+          <span class="svr-label">分组</span>
+          <span class="store-sort">${groupChips}</span>
+        </div>
+        <div class="shelf-view-row">
+          <span class="svr-label">排序</span>
+          <span class="store-sort">${sortChips}</span>
+        </div>
+      </div>
+    `;
+  }
+
+  /**
+   * 书架分桶 — 先过滤(搜索词) → 再分组(4 种方式) → 组内排序(4 种方式)。
+   *
+   * 分组方式:
+   *   archive  微信读书 APP 里自建的云端分组(只读), 顺序保持服务端给的顺序
+   *   tag      本插件的本地标签, 一本书有多个标签会**同时出现在多个桶**里(符合标签语义)
+   *   status   在读 / 已读完 / 未开始
+   *   none     全部平铺一个桶
    */
   private computeGroups(): { name: string; books: WereadBook[] }[] {
-    const bookMap = new Map(this.books.map((b) => [b.bookId, b]));
-    const assigned = new Set<string>();
+    const books = this.filteredShelfBooks();
+    if (books.length === 0) return [];
+
     const groups: { name: string; books: WereadBook[] }[] = [];
 
-    for (const a of this.archives) {
-      const items: WereadBook[] = [];
-      for (const id of a.bookIds) {
-        const b = bookMap.get(id);
-        if (b) {
-          items.push(b);
-          assigned.add(id);
-        }
+    if (this.shelfGroupBy === 'none') {
+      // 桶名固定成"全部"(数量走 count 徽章) — expandedGroups 是按组名记的,
+      // 名字里带数字的话每加一本书折叠状态就丢一次
+      groups.push({ name: '全部', books });
+    } else if (this.shelfGroupBy === 'status') {
+      const finished: WereadBook[] = [];
+      const reading: WereadBook[] = [];
+      const untouched: WereadBook[] = [];
+      for (const b of books) {
+        const p = this.bookProgressPercent(b);
+        if (b.finished === true || p >= 100) finished.push(b);
+        else if (p > 0) reading.push(b);
+        else untouched.push(b);
       }
-      if (items.length > 0) {
-        groups.push({ name: a.name, books: items });
+      if (reading.length) groups.push({ name: '在读', books: reading });
+      if (finished.length) groups.push({ name: '已读完', books: finished });
+      if (untouched.length) groups.push({ name: '未开始', books: untouched });
+    } else {
+      // archive: 云端分组
+      const bookMap = new Map(books.map((b) => [b.bookId, b]));
+      const assigned = new Set<string>();
+      for (const a of this.archives) {
+        const items: WereadBook[] = [];
+        for (const id of a.bookIds) {
+          const b = bookMap.get(id);
+          if (b) {
+            items.push(b);
+            assigned.add(id);
+          }
+        }
+        if (items.length > 0) groups.push({ name: a.name, books: items });
+      }
+      const unassigned = books.filter((b) => !assigned.has(b.bookId));
+      if (unassigned.length > 0) {
+        groups.push({
+          name: this.archives.length > 0 ? '未分组' : '全部',
+          books: unassigned,
+        });
       }
     }
 
-    const unassigned = this.books.filter((b) => !assigned.has(b.bookId));
-    if (unassigned.length > 0) {
-      groups.push({
-        name: this.archives.length > 0 ? '未分组' : '全部',
-        books: unassigned,
-      });
+    // 组内排序 (default 保持接口/分组原序, 不动)
+    if (this.shelfSortBy !== 'default') {
+      for (const g of groups) g.books = this.sortShelfBooks(g.books);
     }
     return groups;
+  }
+
+  /** 按搜索词过滤书架 (书名 / 作者, 大小写不敏感) */
+  private filteredShelfBooks(): WereadBook[] {
+    const kw = this.shelfKeyword.trim().toLowerCase();
+    if (!kw) return this.books;
+    return this.books.filter((b) => {
+      const title = (b.title ?? '').toLowerCase();
+      const author = (b.author ?? '').toLowerCase();
+      return title.includes(kw) || author.includes(kw);
+    });
+  }
+
+  /**
+   * 取一本书的阅读进度百分比。
+   *
+   * 书架接口的 book.progress 有时缺失, 但 /web/shelf/sync 平行返回的 bookProgress
+   * 里往往有 — 两处合并取值, 让"按进度排序 / 阅读状态分组"尽量准。
+   */
+  private bookProgressPercent(b: WereadBook): number {
+    if (typeof b.progress === 'number') return b.progress;
+    const p = this.progressMap.get(b.bookId)?.progress;
+    return typeof p === 'number' ? p : 0;
+  }
+
+  /** 组内排序 — 不改原数组 */
+  private sortShelfBooks(books: WereadBook[]): WereadBook[] {
+    const list = [...books];
+    switch (this.shelfSortBy) {
+      case 'recent': {
+        // 云端 updateTime(秒) 越大越近; 没进度记录的沉底
+        const t = (b: WereadBook) => this.progressMap.get(b.bookId)?.updateTime ?? -1;
+        list.sort((a, b) => t(b) - t(a));
+        break;
+      }
+      case 'progress':
+        list.sort((a, b) => this.bookProgressPercent(b) - this.bookProgressPercent(a));
+        break;
+      case 'title':
+        // localeCompare 带 zh-CN 会按拼音排, 比 charCode 直觉得多
+        list.sort((a, b) => (a.title ?? '').localeCompare(b.title ?? '', 'zh-CN'));
+        break;
+    }
+    return list;
   }
 
   /** "全部展开 / 全部折叠"按钮用 */
@@ -1432,6 +2116,301 @@ ${prefsBlock}
           ${progress}
         </div>
       </button>
+    `;
+  }
+
+  // ----- 书城 -----
+
+  /**
+   * 书城页: 顶部搜索框 + 榜单/分类 chips + 书卡列表。
+   *
+   * 与书架的差异:
+   *   - 书架是"我的书", 走分组折叠, 卡片只要书名/作者/进度
+   *   - 书城是"逛新书", 需要评分/在读人数/简介来帮用户决策, 所以卡片更大更详细
+   *
+   * 交互都由 buildScript 的 setupStore 接管, 这里只负责出静态结构。
+   */
+  private buildStoreHtml(): string {
+    const searchBar = this.buildStoreSearchHtml();
+    const chips = this.storeMode === 'search' ? '' : this.buildStoreChipsHtml();
+
+    // 首屏加载: 用骨架屏顶住, 避免闪一片空白
+    if (this.storeLoading) {
+      return `<main class="content store">${searchBar}${chips}<div class="hint">${this.skeletonHtml(6)}</div></main>`;
+    }
+
+    if (this.storeError) {
+      return `<main class="content store">${searchBar}${chips}
+        <div class="error-card">
+          <h4>${this.storeMode === 'search' ? '搜索失败' : '书城加载失败'}</h4>
+          <p>${escapeHtml(this.storeError)}</p>
+          <button class="ghost" data-act="storeRefresh">重试</button>
+        </div>
+      </main>`;
+    }
+
+    if (this.storeBooks.length === 0) {
+      const tip =
+        this.storeMode === 'search'
+          ? `没有找到与「${escapeHtml(this.storeKeyword)}」相关的书`
+          : '这个榜单暂时没有内容';
+      return `<main class="content store">${searchBar}${chips}<div class="empty"><p>${tip}</p></div></main>`;
+    }
+
+    // 结果计数条: 搜索给"共 N 本", 榜单给"榜单名 · N 本"
+    const summary =
+      this.storeMode === 'search'
+        ? `找到 ${this.storeTotalCount || this.storeBooks.length} 本 · 已显示 ${this.storeBooks.length}`
+        : `${getStoreCategoryTitle(this.storeCategoryId, this.storeTree)} · ${this.storeBooks.length} 本`;
+
+    const list = this.sortedStoreBooks()
+      .map((b, i) => this.storeCardHtml(b, i))
+      .join('');
+
+    // 加载更多: 仅搜索模式有 (榜单只有服务端直出的 20 本, 没有翻页接口)
+    const more = this.storeHasMore
+      ? `<div class="store-more">
+           <button class="ghost" data-act="storeLoadMore" ${this.storeLoadingMore ? 'disabled' : ''}>
+             ${this.storeLoadingMore ? '加载中…' : '加载更多'}
+           </button>
+         </div>`
+      : this.storeMode === 'search' && this.storeBooks.length > 0
+      ? `<div class="store-more muted">已经到底啦</div>`
+      : '';
+
+    return `<main class="content store">
+      ${searchBar}
+      ${chips}
+      <div class="store-summary">
+        <span class="ssum-text">${escapeHtml(summary)}</span>
+        ${this.buildStoreSortHtml()}
+      </div>
+      <div class="store-list">${list}</div>
+      ${more}
+    </main>`;
+  }
+
+  /**
+   * 排序 chips (综合 / 评分 / 人气 / 价格)。
+   *
+   * 全是客户端排序, 所以只能排"已经拉到本地的这些条目" —— 搜索还有下一页时明确
+   * 把这句话写进 tooltip, 免得用户以为是"全网按评分排第一"。
+   */
+  private buildStoreSortHtml(): string {
+    const loaded = this.storeBooks.length;
+    const partial = this.storeMode === 'search' && this.storeHasMore;
+    return `<span class="store-sort" ${
+      partial
+        ? `title="${escapeAttr(`排序只作用于已加载的 ${loaded} 条，想更准可以先「加载更多」`)}"`
+        : ''
+    }>
+      ${STORE_SORTS.map(
+        (s) =>
+          `<button class="sort-chip ${this.storeSort === s.key ? 'active' : ''}" data-store-sort="${s.key}" title="${escapeAttr(s.tip)}">${escapeHtml(s.label)}</button>`,
+      ).join('')}
+      ${partial ? `<span class="sort-partial" aria-hidden="true">*</span>` : ''}
+    </span>`;
+  }
+
+  /**
+   * 按当前排序方式派生出要渲染的列表 (不改 storeBooks 本身)。
+   *
+   * `Array.prototype.sort` 在 ES2019 起保证稳定, 所以同分条目会保持服务端原序 —
+   * 例如按评分排时, 两本都是 9.3 分的书仍按相关度先后排列。
+   */
+  private sortedStoreBooks(): StoreBook[] {
+    if (this.storeSort === 'default') return this.storeBooks;
+    const books = [...this.storeBooks];
+    // 缺值一律沉底: 用 -1 表示"没有这个指标", 在降序里天然排最后
+    const rating = (b: StoreBook) => (typeof b.newRating === 'number' ? b.newRating : -1);
+    const ratingCount = (b: StoreBook) =>
+      typeof b.newRatingCount === 'number' ? b.newRatingCount : -1;
+    const readers = (b: StoreBook) =>
+      typeof b.readingCount === 'number' ? b.readingCount : -1;
+
+    switch (this.storeSort) {
+      case 'rating':
+        // 同分时按"评分人数"再排一次 — 10 个人打的 9.3 分不该压过 10 万人打的 9.3 分
+        books.sort((a, b) => rating(b) - rating(a) || ratingCount(b) - ratingCount(a));
+        break;
+      case 'readers':
+        books.sort((a, b) => readers(b) - readers(a));
+        break;
+      case 'popular':
+        books.sort((a, b) => ratingCount(b) - ratingCount(a));
+        break;
+      case 'price': {
+        // price 为 -1 / undefined 表示"接口没给价"(会员书、免费书常见), 排最后
+        const price = (b: StoreBook) =>
+          typeof b.price === 'number' && b.price >= 0 ? b.price : Number.POSITIVE_INFINITY;
+        books.sort((a, b) => price(a) - price(b));
+        break;
+      }
+    }
+    return books;
+  }
+
+  /** 书城搜索框 (回车触发, 右侧按钮做"搜索/清除"两态) */
+  private buildStoreSearchHtml(): string {
+    const searching = this.storeMode === 'search' && !!this.storeKeyword;
+    // 焦点标记要留到"结果那一帧"才消费 —— 一次搜索会渲染两次 (先骨架屏, 后结果),
+    // 若在骨架屏那帧就清掉, 结果渲染重建 DOM 时焦点又没了, 用户还得回去点输入框。
+    const autofocus = this.storeFocusSearch ? '1' : '0';
+    if (!this.storeLoading) {
+      this.storeFocusSearch = false;
+    }
+    return `
+      <div class="store-search">
+        <span class="ss-icon" aria-hidden="true">🔍</span>
+        <input id="store-search-input" class="ss-input" type="text" spellcheck="false"
+               placeholder="搜索书名 / 作者，回车开搜"
+               value="${escapeAttr(this.storeKeyword)}"
+               data-autofocus="${autofocus}" />
+        ${
+          searching
+            ? `<button class="ss-btn" id="store-search-clear" title="清除搜索, 回到榜单">✕</button>`
+            : `<button class="ss-btn" id="store-search-go" title="搜索">搜索</button>`
+        }
+      </div>
+    `;
+  }
+
+  /**
+   * 榜单 / 分类 chips — 三行结构 (搜索模式下整块隐藏, 让结果区更清爽):
+   *
+   *   ① 榜单行:     飙升 / 新书 / 小说榜 / 总榜 / 神作 / 神作潜力 / 热搜榜
+   *   ② 一级分类行: 22 个题材, 默认只露 COLLAPSED_CATS 个 + 「更多 N ▾」, 展开后全铺
+   *   ③ 二级分类行: 仅当选中的是某个题材(或它的子类)时出现, 首项「全部」= 父分类本身
+   *
+   * 数据优先用 /web/categories 拉到的官方树, 还没到/拉失败时用内置兜底清单
+   * (那份没有二级分类, 于是第三行自然不出现, 不会有半残 UI)。
+   */
+  private buildStoreChipsHtml(): string {
+    const tree = this.storeCategoryTree;
+    const current = this.storeCategoryId;
+    const chip = (id: string, title: string, tip?: string) =>
+      `<button class="store-chip ${current === id ? 'active' : ''}" data-store-cat="${escapeAttr(id)}"${
+        tip ? ` title="${escapeAttr(tip)}"` : ''
+      }>${escapeHtml(title)}</button>`;
+
+    // ---- ① 榜单 ----
+    const rankRow = `<div class="store-chips rank-row">${tree.ranks
+      .map((r) => chip(r.id, r.title))
+      .join('')}</div>`;
+
+    // ---- ② 一级分类 (折叠时保证"当前选中的那个"一定可见) ----
+    const COLLAPSED_CATS = 8;
+    const hit = findCategoryNode(tree, current);
+    // 选中二级分类时, 高亮的一级分类是它的父级
+    const activeTopId = hit?.parent?.id ?? (hit && !hit.parent ? hit.node.id : undefined);
+
+    let visibleCats = tree.categories;
+    let moreBtn = '';
+    if (!this.storeCatsExpanded && tree.categories.length > COLLAPSED_CATS) {
+      visibleCats = tree.categories.slice(0, COLLAPSED_CATS);
+      // 当前选中的分类被折叠在后面时, 把它顶上来 — 否则用户看不到自己在哪
+      if (activeTopId && !visibleCats.some((c) => c.id === activeTopId)) {
+        const activeCat = tree.categories.find((c) => c.id === activeTopId);
+        if (activeCat) visibleCats = [...visibleCats.slice(0, COLLAPSED_CATS - 1), activeCat];
+      }
+      moreBtn = `<button class="store-chip more" data-act="storeToggleMoreCats">更多 ${
+        tree.categories.length - visibleCats.length
+      } ▾</button>`;
+    } else if (this.storeCatsExpanded && tree.categories.length > COLLAPSED_CATS) {
+      moreBtn = `<button class="store-chip more" data-act="storeToggleMoreCats">收起 ▴</button>`;
+    }
+
+    const catRow = `<div class="store-chips cat-row">${visibleCats
+      .map((c) =>
+        // 一级分类高亮规则: 选中它本身、或选中它的某个子分类时都算 active
+        `<button class="store-chip ${activeTopId === c.id ? 'active' : ''}" data-store-cat="${escapeAttr(c.id)}"${
+          c.totalCount ? ` title="${escapeAttr(`${c.title} · 共 ${c.totalCount} 本`)}"` : ''
+        }>${escapeHtml(c.title)}</button>`,
+      )
+      .join('')}${moreBtn}</div>`;
+
+    // ---- ③ 二级分类 ----
+    const parent = hit?.parent ?? (hit && !hit.parent ? hit.node : undefined);
+    const children = parent?.children ?? [];
+    const subRow =
+      children.length > 0
+        ? `<div class="store-chips sub-row">
+             <span class="store-sub-label">${escapeHtml(parent!.title)}</span>
+             ${chip(parent!.id, '全部')}
+             ${children.map((s) => chip(s.id, s.title, s.totalCount ? `${s.title} · 共 ${s.totalCount} 本` : undefined)).join('')}
+           </div>`
+        : '';
+
+    return `${rankRow}${catRow}${subRow}`;
+  }
+
+  /**
+   * 书城书卡。
+   *
+   * 一行封面 + 右侧信息(标题/作者/评分/在读人数/简介) + 底部操作行。
+   * 整卡不做点击(避免误触打开书), 明确给"阅读 / 加入书架 / 浏览器" 三个按钮;
+   * 简介点一下就地展开, 纯前端 class 切换, 不惊动 extension 端重渲染。
+   */
+  private storeCardHtml(b: StoreBook, idx: number): string {
+    const cover = typeof b.cover === 'string' && b.cover ? escapeAttr(b.cover) : '';
+    const coverHtml = cover
+      ? `<img class="cover" src="${cover}" alt="" onerror="this.style.display='none';this.parentNode.classList.add('no-cover');" />`
+      : '';
+
+    // 榜单模式给名次角标 (前三名描金), 搜索模式不给。
+    // 用接口给的 rank 而不是渲染下标 —— 换成"按评分/价格"排序后, 角标要继续表达
+    // "它在官方榜单里排第几", 否则数字会跟着重排乱跳, 反而误导。
+    const rankNo = typeof b.rank === 'number' && b.rank > 0 ? b.rank : idx + 1;
+    const rankBadge =
+      this.storeMode === 'rank'
+        ? `<span class="sc-rank ${rankNo <= 3 ? 'top' : ''}" title="${escapeAttr(`榜单第 ${rankNo} 名`)}">${rankNo}</span>`
+        : '';
+
+    const rating = formatRating(b.newRating);
+    // 评分人数塞进 tooltip 而不是再开一个 badge —— 侧栏窄, badges 行超过 3 个就换行了。
+    // 这个数也是"热度"排序的依据, 用户 hover 能对得上号。
+    const ratingCount = formatCount(b.newRatingCount);
+    const ratingHtml = rating
+      ? `<span class="sc-badge rating"${
+          ratingCount ? ` title="${escapeAttr(`${rating} 分 · ${ratingCount}人参与评分`)}"` : ''
+        }>★ ${rating}${b.newRatingTitle ? ' ' + escapeHtml(b.newRatingTitle) : ''}</span>`
+      : '';
+    const readingCount = formatCount(b.readingCount);
+    const readingHtml = readingCount
+      ? `<span class="sc-badge" title="当前在读人数">${readingCount}人在读</span>`
+      : '';
+    // 价格: -1 表示接口没给价(会员书/免费书常见), 不展示避免误导
+    const priceHtml =
+      typeof b.price === 'number' && b.price > 0
+        ? `<span class="sc-badge">¥${b.price.toFixed(2).replace(/\.00$/, '')}</span>`
+        : '';
+    const introHtml = b.intro
+      ? `<div class="sc-intro" title="点击展开/收起简介">${escapeHtml(b.intro)}</div>`
+      : '';
+
+    const shelfBtn = b.inShelf
+      ? `<button class="sc-act done" disabled>✓ 已在书架</button>`
+      : `<button class="sc-act" data-store-add="${escapeAttr(b.bookId)}">+ 加入书架</button>`;
+
+    return `
+      <div class="store-card" data-store-card="${escapeAttr(b.bookId)}">
+        <div class="sc-cover cover-wrap ${cover ? '' : 'no-cover'}">
+          ${coverHtml}
+          <div class="cover-fallback">${escapeHtml((b.title ?? '?').slice(0, 1))}</div>
+          ${rankBadge}
+        </div>
+        <div class="sc-main">
+          <div class="sc-title">${escapeHtml(b.title)}</div>
+          <div class="sc-author">${escapeHtml([b.author, b.publisher].filter(Boolean).join(' · '))}</div>
+          <div class="sc-badges">${ratingHtml}${readingHtml}${priceHtml}</div>
+          ${introHtml}
+          <div class="sc-actions">
+            <button class="sc-act primary" data-store-read="${escapeAttr(b.bookId)}">开始阅读</button>
+            ${shelfBtn}
+            <button class="sc-act icon" data-store-browser="${escapeAttr(b.bookId)}" title="在浏览器打开">↗</button>
+          </div>
+        </div>
+      </div>
     `;
   }
 
@@ -2028,6 +3007,39 @@ ${prefsBlock}
 
       /* ====== 书架 ====== */
       .shelf { padding: 4px 6px 14px; }
+
+      /* --- 书架工具条: 搜索 + 分组方式 + 排序 --- */
+      .shelf-toolbar {
+        position: sticky; top: 0; z-index: 5;
+        padding: 2px 2px 6px;
+        margin-bottom: 2px;
+        background: var(--vscode-sideBar-background);
+        border-bottom: 1px solid var(--vscode-panel-border);
+      }
+      .shelf-toolbar .store-search { position: static; padding: 2px 0 6px; }
+      .shelf-view-row {
+        display: flex; align-items: center; gap: 6px;
+        padding: 1px 2px;
+      }
+      .shelf-view-row .svr-label {
+        flex-shrink: 0;
+        width: 26px;
+        font-size: 10.5px;
+        color: var(--vscode-descriptionForeground);
+        opacity: .85;
+      }
+      .shelf-view-row .store-sort { flex-wrap: wrap; }
+      /* 说明性提示条(如"分组请到 APP 里建"), 弱化处理不抢视线 */
+      .shelf-tip {
+        margin: 6px 4px 2px;
+        padding: 5px 8px;
+        border-left: 2px solid var(--vscode-panel-border);
+        font-size: 11px; line-height: 1.5;
+        color: var(--vscode-descriptionForeground);
+        background: rgba(127,127,127,.07);
+        border-radius: 0 4px 4px 0;
+      }
+
       .shelf-section { margin-top: 2px; }
       .shelf-section-title {
         display: flex; align-items: center; gap: 6px;
@@ -2125,6 +3137,230 @@ ${prefsBlock}
       .offline-shelf-notice button {
         flex-shrink: 0;
         font-size: 11px; padding: 3px 10px;
+      }
+
+      /* ====== 书城 ======
+       * 与书架的视觉关系: 同一套色板/圆角/hover 规则, 但卡片信息密度更高 —
+       * 逛书城需要评分/在读人数/简介来决策, 书架只需要认出"哪本是我的书". */
+      .store { padding: 6px 8px 16px; }
+
+      /* --- 搜索框 --- */
+      .store-search {
+        position: sticky; top: 0; z-index: 5;
+        display: flex; align-items: center; gap: 6px;
+        padding: 4px 2px 8px;
+        background: var(--vscode-sideBar-background);
+      }
+      .store-search .ss-icon { font-size: 12px; opacity: .6; flex-shrink: 0; }
+      .store-search .ss-input {
+        flex: 1; min-width: 0;
+        padding: 5px 9px;
+        background: var(--vscode-input-background);
+        color: var(--vscode-input-foreground);
+        border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+        border-radius: 4px;
+        font-size: 12px; font-family: inherit;
+        outline: none;
+        transition: border-color .12s ease;
+      }
+      .store-search .ss-input:focus { border-color: var(--vscode-focusBorder); }
+      .store-search .ss-btn {
+        flex-shrink: 0;
+        padding: 5px 10px;
+        background: var(--vscode-button-secondaryBackground, transparent);
+        color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
+        border: 1px solid var(--vscode-panel-border);
+        border-radius: 4px;
+        font-size: 11.5px;
+      }
+      .store-search .ss-btn:hover {
+        background: var(--vscode-button-secondaryHoverBackground, var(--vscode-list-hoverBackground));
+      }
+
+      /* --- 榜单/分类 chips (三行: 榜单 / 一级分类 / 二级分类) --- */
+      .store-chips {
+        display: flex; flex-wrap: wrap; align-items: center; gap: 4px;
+        padding: 0 2px 5px;
+      }
+      .store-chips.sub-row {
+        padding: 5px 2px 6px;
+        margin-top: 1px;
+        border-top: 1px dashed var(--vscode-panel-border);
+      }
+      .store-chips.cat-row { padding-bottom: 3px; }
+      /* 二级分类行左侧的父分类标签, 提示"下面这排是谁的子类" */
+      .store-sub-label {
+        font-size: 10.5px;
+        color: var(--vscode-descriptionForeground);
+        opacity: .8;
+        margin-right: 2px;
+      }
+      /* "更多 N ▾" / "收起 ▴" — 弱化成文字按钮, 别跟真分类抢注意力 */
+      .store-chip.more {
+        border-color: transparent;
+        color: var(--vscode-textLink-foreground);
+        opacity: .95;
+      }
+      .store-chip.more:hover { background: var(--vscode-list-hoverBackground); }
+      .store-chip {
+        padding: 2px 9px;
+        background: transparent;
+        color: var(--vscode-foreground);
+        border: 1px solid var(--vscode-panel-border);
+        border-radius: 10px;
+        font-size: 11px;
+        opacity: .8;
+        transition: all .12s ease;
+      }
+      .store-chip:hover:not(.active) {
+        background: var(--vscode-list-hoverBackground);
+        opacity: 1;
+      }
+      .store-chip.active {
+        opacity: 1; font-weight: 600;
+        background: var(--vscode-list-activeSelectionBackground, var(--vscode-button-background));
+        color: var(--vscode-list-activeSelectionForeground, var(--vscode-button-foreground));
+        border-color: var(--vscode-focusBorder, transparent);
+      }
+      /* 结果计数条: 左边"找到 N 本", 右边排序 chips */
+      .store-summary {
+        display: flex; align-items: center; justify-content: space-between;
+        gap: 8px; flex-wrap: wrap;
+        padding: 2px 4px 6px;
+        font-size: 10.5px;
+        color: var(--vscode-descriptionForeground);
+      }
+      .store-summary .ssum-text { min-width: 0; }
+      .store-sort {
+        display: inline-flex; align-items: center; gap: 1px;
+        flex-shrink: 0;
+      }
+      .sort-chip {
+        padding: 1px 7px;
+        background: transparent;
+        color: var(--vscode-descriptionForeground);
+        border: 1px solid transparent;
+        border-radius: 9px;
+        font-size: 10.5px;
+        transition: all .12s ease;
+      }
+      .sort-chip:hover:not(.active) {
+        background: var(--vscode-list-hoverBackground);
+        color: var(--vscode-foreground);
+      }
+      .sort-chip.active {
+        background: var(--vscode-list-activeSelectionBackground, var(--vscode-button-background));
+        color: var(--vscode-list-activeSelectionForeground, var(--vscode-button-foreground));
+        font-weight: 600;
+      }
+      /* 搜索还有下一页时的星号: 提示"排序只覆盖已加载的部分" */
+      .sort-partial {
+        margin-left: 2px;
+        color: var(--vscode-descriptionForeground);
+        opacity: .8;
+      }
+
+      /* --- 书卡 --- */
+      .store-list { display: flex; flex-direction: column; gap: 6px; }
+      .store-card {
+        display: flex; gap: 10px;
+        padding: 8px 9px;
+        border: 1px solid var(--vscode-panel-border);
+        border-radius: 6px;
+        background: var(--vscode-editor-background, transparent);
+        transition: border-color .12s ease, background .12s ease;
+      }
+      .store-card:hover {
+        border-color: var(--vscode-focusBorder, var(--vscode-panel-border));
+      }
+      .store-card .sc-cover {
+        width: 46px; height: 64px;
+      }
+      /* 榜单名次角标: 前三名用暖金色, 其余灰底 */
+      .store-card .sc-rank {
+        position: absolute; left: 0; top: 0;
+        min-width: 16px; height: 15px; padding: 0 3px;
+        display: inline-flex; align-items: center; justify-content: center;
+        font-size: 9.5px; font-weight: 600;
+        font-variant-numeric: tabular-nums;
+        background: rgba(0,0,0,.55); color: #fff;
+        border-radius: 3px 0 4px 0;
+      }
+      .store-card .sc-rank.top { background: rgba(220, 150, 40, .95); }
+      .store-card .sc-main { flex: 1; min-width: 0; }
+      .store-card .sc-title {
+        font-size: 13px; font-weight: 600; line-height: 1.35;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }
+      .store-card .sc-author {
+        margin-top: 1px;
+        font-size: 11px; color: var(--vscode-descriptionForeground);
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }
+      .store-card .sc-badges {
+        display: flex; flex-wrap: wrap; gap: 4px;
+        margin-top: 4px;
+      }
+      .store-card .sc-badge {
+        font-size: 10px; padding: 0 6px;
+        border-radius: 8px;
+        background: rgba(127,127,127,.18);
+        color: var(--vscode-descriptionForeground);
+        font-variant-numeric: tabular-nums;
+      }
+      .store-card .sc-badge.rating {
+        background: rgba(220, 150, 40, .2);
+        color: rgb(210, 145, 35);
+        font-weight: 600;
+      }
+      /* 简介默认两行截断, 点击加 .expanded 展开全文 (纯前端, 不重渲染) */
+      .store-card .sc-intro {
+        margin-top: 5px;
+        font-size: 11.5px; line-height: 1.5;
+        color: var(--vscode-descriptionForeground);
+        cursor: pointer;
+        display: -webkit-box;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+        word-break: break-word;
+      }
+      .store-card .sc-intro.expanded {
+        -webkit-line-clamp: unset;
+        display: block;
+      }
+      .store-card .sc-actions {
+        display: flex; flex-wrap: wrap; gap: 5px;
+        margin-top: 7px;
+      }
+      .store-card .sc-act {
+        padding: 3px 10px;
+        font-size: 11px;
+        border-radius: 4px;
+        background: transparent;
+        color: var(--vscode-foreground);
+        border: 1px solid var(--vscode-panel-border);
+        transition: background .12s ease;
+      }
+      .store-card .sc-act:hover:not([disabled]) { background: var(--vscode-list-hoverBackground); }
+      .store-card .sc-act.primary {
+        background: var(--vscode-button-background);
+        color: var(--vscode-button-foreground);
+        border-color: transparent;
+      }
+      .store-card .sc-act.primary:hover { background: var(--vscode-button-hoverBackground); }
+      .store-card .sc-act.done {
+        color: rgb(60,180,120);
+        border-color: rgba(60,180,120,.4);
+        opacity: .9;
+      }
+      .store-card .sc-act.icon { padding: 3px 8px; }
+
+      .store-more {
+        display: flex; justify-content: center;
+        padding: 10px 0 4px;
+        font-size: 11px;
+        color: var(--vscode-descriptionForeground);
       }
 
       /* ====== 阅读器 ====== */
@@ -3143,6 +4379,147 @@ ${prefsBlock}
           if (name) post('toggleGroup', { name });
         });
       });
+
+      // ===== 书架工具条: 本地搜索 / 分组方式 / 排序 / 打标签 =====
+      // 搜索是纯本地过滤 (书架数据全在 extension 端内存里), 所以敲一下就能出结果;
+      // 但整页重建会丢焦点, 于是跟书城一样走 data-autofocus + 光标回末尾。
+      (function setupShelfToolbar() {
+        const input = document.getElementById('shelf-search-input');
+        if (input) {
+          if (input.getAttribute('data-autofocus') === '1') {
+            setTimeout(function() {
+              try {
+                input.focus();
+                const v = input.value;
+                input.setSelectionRange(v.length, v.length);
+              } catch (e) {}
+            }, 30);
+          }
+          // 防抖 250ms: 每个字符都回传会触发整页重建, 打字会卡
+          let timer = null;
+          input.addEventListener('input', function() {
+            if (timer) clearTimeout(timer);
+            timer = setTimeout(function() { post('shelfSearch', { keyword: input.value }); }, 250);
+          });
+          input.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              if (timer) clearTimeout(timer);
+              post('shelfSearch', { keyword: input.value });
+            } else if (e.key === 'Escape') {
+              e.preventDefault();
+              if (input.value) { input.value = ''; post('shelfClearSearch'); }
+            }
+          });
+        }
+        const clearBtn = document.getElementById('shelf-search-clear');
+        if (clearBtn) clearBtn.addEventListener('click', function() { post('shelfClearSearch'); });
+
+        document.querySelectorAll('[data-shelf-group]').forEach(function(el) {
+          el.addEventListener('click', function() {
+            post('shelfGroupBy', { key: el.getAttribute('data-shelf-group') });
+          });
+        });
+        document.querySelectorAll('[data-shelf-sort]').forEach(function(el) {
+          el.addEventListener('click', function() {
+            post('shelfSortBy', { key: el.getAttribute('data-shelf-sort') });
+          });
+        });
+      })();
+
+      // ===== 书城: 搜索 / 榜单切换 / 书卡操作 =====
+      //
+      // 注意本视图是"整页重建"模式 (extension 端每次 render 覆盖 webview.html),
+      // 所以:
+      //   1) 搜索框内容靠 HTML 的 value 回填, 焦点靠 data-autofocus 恢复
+      //   2) 简介展开这种纯视觉状态故意只在前端 toggle class, 不 post 回去,
+      //      免得一次展开触发整页重绘 (会把列表滚动位置也一起丢掉)
+      (function setupStore() {
+        const input = document.getElementById('store-search-input');
+
+        if (input) {
+          // 恢复焦点 + 光标到末尾 (extension 端在"搜索完 / 清空搜索"后置位)
+          if (input.getAttribute('data-autofocus') === '1') {
+            setTimeout(function() {
+              try {
+                input.focus();
+                const v = input.value;
+                input.setSelectionRange(v.length, v.length);
+              } catch (e) { /* 某些环境不支持 setSelectionRange, 忽略 */ }
+            }, 30);
+          }
+          input.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              post('storeSearch', { keyword: input.value });
+            } else if (e.key === 'Escape') {
+              e.preventDefault();
+              if (input.value) {
+                input.value = '';
+                post('storeClearSearch');
+              }
+            }
+          });
+        }
+
+        const goBtn = document.getElementById('store-search-go');
+        if (goBtn) {
+          goBtn.addEventListener('click', function() {
+            post('storeSearch', { keyword: input ? input.value : '' });
+          });
+        }
+        const clearBtn = document.getElementById('store-search-clear');
+        if (clearBtn) {
+          clearBtn.addEventListener('click', function() { post('storeClearSearch'); });
+        }
+
+        // 榜单 / 分类 chips
+        document.querySelectorAll('.store-chip[data-store-cat]').forEach(function(el) {
+          el.addEventListener('click', function() {
+            post('storeSelectCategory', { id: el.getAttribute('data-store-cat') });
+          });
+        });
+
+        // 排序 chips (综合 / 评分 / 人气 / 价格) — 客户端排序, 不重新请求
+        document.querySelectorAll('.sort-chip[data-store-sort]').forEach(function(el) {
+          el.addEventListener('click', function() {
+            post('storeSort', { key: el.getAttribute('data-store-sort') });
+          });
+        });
+
+        // 书卡: 阅读 / 加入书架 / 浏览器打开 / 简介展开 — 一个事件委托全接了
+        const list = document.querySelector('.store-list');
+        if (list) {
+          list.addEventListener('click', function(e) {
+            const t = e.target;
+            if (!t || !t.closest) return;
+
+            const readBtn = t.closest('[data-store-read]');
+            if (readBtn) {
+              e.preventDefault();
+              post('storeOpenBook', { bookId: readBtn.getAttribute('data-store-read') });
+              return;
+            }
+            const addBtn = t.closest('[data-store-add]');
+            if (addBtn) {
+              e.preventDefault();
+              post('storeAddShelf', { bookId: addBtn.getAttribute('data-store-add') });
+              return;
+            }
+            const browserBtn = t.closest('[data-store-browser]');
+            if (browserBtn) {
+              e.preventDefault();
+              post('storeOpenInBrowser', { bookId: browserBtn.getAttribute('data-store-browser') });
+              return;
+            }
+            const intro = t.closest('.sc-intro');
+            if (intro) {
+              intro.classList.toggle('expanded');
+              return;
+            }
+          });
+        }
+      })();
 
       // ===== 抽屉互斥小工具: 打开一个抽屉前主动关掉另一个 =====
       function closeOtherDrawer(except) {

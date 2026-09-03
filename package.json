@@ -131,6 +131,16 @@
         "icon": "$(refresh)"
       },
       {
+        "command": "weread.openStore",
+        "title": "Folio: 打开书城 (榜单 / 分类)",
+        "icon": "$(library)"
+      },
+      {
+        "command": "weread.searchBooks",
+        "title": "Folio: 搜索书城",
+        "icon": "$(search)"
+      },
+      {
         "command": "weread.openBook",
         "title": "Folio: 打开书籍"
       },
@@ -236,6 +246,16 @@
           "command": "weread.refreshBookshelf",
           "when": "view == wereadVscode.main",
           "group": "navigation@1"
+        },
+        {
+          "command": "weread.searchBooks",
+          "when": "view == wereadVscode.main",
+          "group": "navigation@2"
+        },
+        {
+          "command": "weread.openStore",
+          "when": "view == wereadVscode.main",
+          "group": "1_actions@1"
         },
         {
           "command": "weread.importCookie",

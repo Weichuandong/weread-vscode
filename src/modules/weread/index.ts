@@ -99,6 +99,24 @@ const wereadModule: Module = {
         await mainView.refreshShelf();
       }),
 
+      // 书城: 打开"书城"页 (榜单/分类浏览). 不校验登录 —
+      // /web/search/global 与榜单 SSR 页面都不需要 cookie, 未登录也能逛。
+      vscode.commands.registerCommand('weread.openStore', async () => {
+        await mainView.openStore();
+      }),
+
+      // 书城: 命令面板直接搜书, 省掉"先开侧栏再点搜索框"两步
+      vscode.commands.registerCommand('weread.searchBooks', async () => {
+        const keyword = await vscode.window.showInputBox({
+          title: '书城搜索',
+          prompt: '输入书名 / 作者，回车搜索（搜索无需登录，阅读才需要）',
+          placeHolder: '例如：三体 / 刘慈欣',
+          ignoreFocusOut: true,
+        });
+        if (keyword === undefined) return; // ESC 取消
+        await mainView.openStore(keyword);
+      }),
+
       // 命令式打开某本书（保留以便其他扩展/快捷键调用）
       vscode.commands.registerCommand('weread.openBook', async (book: WereadBook) => {
         if (!book?.bookId) return;

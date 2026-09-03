@@ -111,6 +111,97 @@ export interface WereadUser {
 export type CookieJar = Record<string, string>;
 
 // ============================================================
+// 书城(发现/搜索): 榜单 / 分类 / 搜索结果
+// ============================================================
+
+/**
+ * 书城里的一本书。
+ *
+ * 数据来源有两处, 字段基本同构 (都是微信读书的 bookInfo 结构):
+ *   - 搜索:   GET /web/search/global    → books[].bookInfo
+ *   - 榜单/分类: GET /web/category/{id} 的 SSR __INITIAL_STATE__
+ *              → categoryStoreModule.categoryBookList[].bookInfo
+ *
+ * 与书架用的 WereadBook 故意分开:
+ *   - WereadBook 是"我的书", 关心 progress / finished(读完)
+ *   - StoreBook 是"别人的书", 关心评分 / 在读人数 / 价格 / 是否已在书架
+ * 打开阅读时由 UI 层把 StoreBook 降级成 WereadBook (只取 bookId/title/author/cover)。
+ */
+export interface StoreBook {
+  bookId: string;
+  title: string;
+  author?: string;
+  translator?: string;
+  cover?: string;
+  intro?: string;
+  publisher?: string;
+  /** 价格(元)。-1 表示接口未给价 / 会员免费等特殊情况 */
+  price?: number;
+  /** epub / txt / pdf */
+  format?: string;
+  /** 是否已完结(连载类) */
+  finished?: boolean;
+  /**
+   * 新版评分, 0-1000 的整数(879 = 8.79 分)。
+   * 展示时统一 /100 保留一位小数。
+   */
+  newRating?: number;
+  /** 参与评分的人数 */
+  newRatingCount?: number;
+  /** 评分档位文案: "神作" / "好评如潮" / "值得一读" … */
+  newRatingTitle?: string;
+  /** 多少人在读(榜单接口才有) */
+  readingCount?: number;
+  /** 榜单里的名次(1-based, 榜单接口 searchIdx) */
+  rank?: number;
+  /** 是否已在我的书架。榜单 SSR 直接给; 搜索结果需要本地书架比对补 */
+  inShelf?: boolean;
+  [key: string]: unknown;
+}
+
+/** 书城搜索结果(接口: /web/search/global) */
+export interface StoreSearchResult {
+  books: StoreBook[];
+  /** 服务端报告的命中总数 */
+  totalCount: number;
+  hasMore: boolean;
+  /** 下一页请求要带的 maxIdx(= 已拉到的条数) */
+  nextMaxIdx: number;
+}
+
+/** 书城顶部可切换的榜单 / 分类入口(内置兜底清单用) */
+export interface StoreCategoryDef {
+  /** 接口里的 CategoryId, 直接拼进 /web/category/{id} */
+  id: string;
+  /** 展示名 */
+  title: string;
+  /** rank=排行榜, category=题材分类 — 仅用于分组展示 */
+  kind: 'rank' | 'category';
+}
+
+/** 分类树里的一个节点(榜单 / 一级分类 / 二级分类通用) */
+export interface StoreCategoryNode {
+  /** CategoryId, 一二级都能直接拼 /web/category/{id} (实测二级如 100004 也可用) */
+  id: string;
+  title: string;
+  /** 该分类下的书籍总数, 仅作 tooltip 参考 */
+  totalCount?: number;
+  /** 二级分类(只有一级分类才有) */
+  children?: StoreCategoryNode[];
+}
+
+/**
+ * 完整分类树(来源: GET /web/categories)。
+ *
+ * ranks      排行榜 — 飙升 / 新书 / 小说榜 / 总榜 / 神作 / 神作潜力 / 热搜
+ * categories 题材分类 — 22 个一级, 每个下面挂 2~21 个二级
+ */
+export interface StoreCategoryTree {
+  ranks: StoreCategoryNode[];
+  categories: StoreCategoryNode[];
+}
+
+// ============================================================
 // 社交内容(只读): 想法 / 划线 / 书评
 // ============================================================
 
