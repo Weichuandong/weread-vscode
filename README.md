@@ -1,6 +1,6 @@
 # TouchPlus for VSCode
 
-> 在 VSCode 侧边栏看书 + 刷推荐流 + 看游戏资讯的"摸鱼"套件。微信读书、知乎、小黑盒一个插件搞定，**零跳转、零打扰、零上传**。
+> 在 VSCode 侧边栏看书 + 刷推荐流 + 看游戏资讯的"摸鱼"套件。微信读书、起点中文网、知乎、小黑盒一个插件搞定，**零跳转、零打扰、零上传**。
 
 [![Release](https://img.shields.io/github/v/release/Weichuandong/weread-vscode?color=blue)](https://github.com/Weichuandong/weread-vscode/releases)
 [![Open VSX](https://img.shields.io/open-vsx/v/weichuandong/weread-vscode?label=open%20vsx&color=purple)](https://open-vsx.org/extension/weichuandong/weread-vscode)
@@ -14,7 +14,7 @@
 
 | 亮点 | 一句话 |
 |---|---|
-| 🧩 **一插多模块** | 微信读书 (Folio) + 知乎 (Curio) + 小黑盒 (Arena) 共享同一份代码框架，Activity Bar 一边一个图标，不用装三个插件 |
+| 🧩 **一插多模块** | 微信读书 (Folio) + 起点中文网 (Saga) + 知乎 (Curio) + 小黑盒 (Arena) 共享同一份代码框架，Activity Bar 一边一个图标，不用装四个插件 |
 | 🪟 **原生侧栏 inline 阅读** | 章节正文直接在 VSCode webview 里渲染，**不开 iframe、不跳浏览器**，看着像在读文档，老板路过零破绽 |
 | 🤫 **零打扰静默 UX** | Cookie 失效不弹 toast / modal，只在 view 顶部挂一条被动 banner，点"重新导入"即可，再也不用一直点关闭弹窗 |
 | 📡 **完整离线能力** | 微信读书章节预缓存层（内存 LRU + 磁盘持久化），翻章自动后台静默预拉后续 N 章，**cookie 过期/断网/飞机上仍能继续看** |
@@ -95,6 +95,46 @@
 - ☁️ **云端进度同步** —— 章节切换、读到哪里都走微信读书接口，与手机/网页端实时互通
 - 🔐 **唯一登录方式：粘贴 Cookie** —— 浏览器 DevTools → Application → Cookies → 复制 `weread.qq.com` 全部 Cookie → 命令面板粘贴一次
 - 🛡️ Cookie 通过 VSCode `SecretStorage` 加密存储到本地系统钥匙串，不上传任何远端
+
+---
+
+### 📜 Saga — 起点中文网
+
+在 VSCode 侧边栏读起点网文：书架 / 书城 / 在读三个 tab，交互与 Folio 保持一致。接口来自起点移动站 `m.qidian.com` 前端自用的 `/webcommon/*` JSON 接口。
+
+#### 书城（发现新书）
+
+- 🔍 **全站搜书** —— 搜书名 / 作者，卡片带封面、作者、题材、字数、连载状态、收藏数、最新章节、简介，「加载更多」翻页
+- 🔃 **服务端排序** —— 综合 / 收藏 / 月票 / 推荐 / 字数 / 更新。起点搜索接口原生支持 `orderBy`，切排序会重新请求，排的是**全部结果**（不同于微信读书只能对已加载部分做客户端排序）
+- 🏆 **9 个榜单 × 15 个题材** —— 月票 / 畅销 / 阅读 / 推荐 / 书友 / 更新 / 签约 / 新书 / 新人榜，可按 玄幻 / 仙侠 / 都市 / 科幻 … 过滤，支持翻页
+- ➕ **一键加入书架** —— 加完立刻变「✓ 已在书架」；阅读页对不在书架的书也会给出「+ 加入书架」入口
+- 🆓 **免登录浏览与试读** —— 搜索、榜单、免费章节阅读都不需要 Cookie；只有书架、加书架、云端进度需要登录
+
+#### 书架
+
+- 🔎 **本地搜索** —— 按书名 / 作者过滤，纯前端过滤，不打断中文输入法，Esc 清空
+- 🗃️ **分组方式** —— 「云端分组」（起点里自建的书架分组，只读）/「阅读状态」（在读 / 未开始）/「不分组」
+- ↕️ **排序** —— 最近阅读（起点云端顺序）/ 有更新优先 / 书名拼音
+- 📍 每本书显示「读至 xx 章」与「更新至 xx 章」，有新章节时带红点
+
+#### 阅读器
+
+- 章节正文 inline 渲染：正文只保留纯文本段落（不信任任何标签），主题色跟随 VSCode
+- 📑 目录抽屉按**卷**分组，可搜索，VIP 章节打标，自动定位当前章
+- Aa 阅读设置（字号 / 行距 / 段距 / 页宽 / 字体），与 Folio 同一套档位，但偏好**独立保存**
+- ⌨️ ↑/↓ 小步、Space / PgDn 翻页、←/→ 切章、Home/End 章首尾
+- ☁️ **云端进度互通** —— 打开书时按「起点云端进度 > 书架记录 > 本地快照」定位章节，翻章后上报，手机 / 网页接着读
+- ⚡ 后台预拉下一章（仅免费章节，进程内缓存），翻页零等待；「作家的话」单独展示
+
+> ⚠️ **VIP 章节限制**：起点 web 端的 VIP 正文是**加密下发**（`cES≠0`）或带**字体反爬**（`fEnS≠0`），插件**不做破解**。未购买的 VIP 章节显示试读片段；已购买但加密下发的章节会提示到浏览器 / 起点 APP 阅读，并可「跳过，下一章」。可以直接内嵌阅读的是免费章节和限免章节。
+>
+> 分组的创建 / 移动请在起点 APP 或网页书架里操作，插件刷新即可同步。
+
+#### 登录
+
+- 🔐 **粘贴 Cookie** —— 浏览器登录 `m.qidian.com` → F12 → Network → 任意请求 → Request Headers → 复制完整 `Cookie`（需含 `ywkey` / `ywguid`）
+- 🛡️ SecretStorage 加密存储；登录失效时（接口 `code 1000` / 302 到登录页）只在顶部挂一条可关闭的横幅，不弹窗
+- 🛑 被起点 WAF 风控拦截时会明确提示，不尝试绕过
 
 ---
 
@@ -207,6 +247,13 @@
    - 中部章节正文，inline 看高亮划线，点高亮段查看想法
    - 底部点章节名打开目录抽屉；点想法/划线/书评图标打开社交抽屉
 
+### Saga（起点）
+
+1. 点击 Activity Bar 左侧 📜 图标，默认进入「书城」，不登录也能搜书、逛榜单、读免费章节
+2. 想看自己的书架：命令面板 `Saga: 导入 Cookie 登录` → 粘贴 Cookie，再切到「书架」tab
+3. 书城卡片上「开始阅读」直接进阅读器，「+ 加入书架」加到起点书架
+4. 阅读页底部「目录」打开分卷目录，「Aa」调整排版，←/→ 切章
+
 ### Curio（知乎）
 
 1. 点击 Activity Bar 左侧 💡 图标
@@ -242,6 +289,20 @@
 | `weread.chapterCacheStats` | Folio: 查看已缓存章节 (下钻浏览) |
 | `weread.configurePrefetch` | Folio: 章节预缓存配置 (开关/章数) |
 | `weread.clearChapterCache` | Folio: 清空章节缓存 |
+
+### Saga（起点）
+
+| 命令 ID | 标题 |
+|---|---|
+| `qidian.importCookie` | Saga: 导入 Cookie 登录 |
+| `qidian.logout` | Saga: 退出登录 |
+| `qidian.checkLogin` | Saga: 检查登录状态 |
+| `qidian.refreshBookshelf` | Saga: 刷新书架 |
+| `qidian.openStore` | Saga: 打开书城 (榜单) |
+| `qidian.searchBooks` | Saga: 搜索书城 |
+| `qidian.openBook` | Saga: 打开书籍 |
+| `qidian.openInBrowser` | Saga: 在浏览器中打开 |
+| `qidian.resetReadingState` | Saga: 清除在读状态(卡死时使用) |
 
 ### Curio（知乎）
 
@@ -280,6 +341,14 @@
 | `weread.chapterPrefetch.ahead` | number | `10` | 向后预缓存的章节数 (0~50) |
 | `weread.chapterPrefetch.behind` | number | `1` | 向前预缓存的章节数 (0~10) |
 
+### Saga（起点）
+
+| 配置项 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `qidian.requestTimeout` | number | `15000` | HTTP 请求超时时间（毫秒） |
+| `qidian.userAgent` | string | iOS Safari UA | 请求 User-Agent（接口来自移动站，默认移动端 UA） |
+| `qidian.prefetchNextChapter` | boolean | `true` | 后台预拉下一章（仅免费章节，进程内缓存） |
+
 ### Curio（知乎）
 
 | 配置项 | 类型 | 默认值 | 说明 |
@@ -306,7 +375,7 @@
 ## ⚠️ 免责声明
 
 - 本插件**仅供个人使用**，不得用于商业用途、批量抓取或公开分发付费内容
-- 微信读书 / 知乎的接口、签名算法、加密算法**版权归各自平台所有**，本插件不对接口稳定性、版权合规性、账号安全做任何承诺
+- 微信读书 / 起点中文网 / 知乎 / 小黑盒的接口、签名算法、加密算法**版权归各自平台所有**，本插件不对接口稳定性、版权合规性、账号安全做任何承诺；起点 VIP 付费章节的加密内容插件不做任何解密
 - 使用本插件即表示你已阅读并同意各平台的服务条款，**因使用本插件产生的任何账号封禁、版权纠纷、数据丢失由使用者自行承担**
 - 本项目不存储、不上传你的 Cookie 或阅读数据到任何第三方服务器，所有 HTTP 请求直接面向目标平台
 

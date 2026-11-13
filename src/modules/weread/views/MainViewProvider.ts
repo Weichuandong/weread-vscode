@@ -177,8 +177,6 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
   private shelfGroupBy: ShelfGroupBy = 'archive';
   /** 书架排序方式, 持久化到 globalState */
   private shelfSortBy: ShelfSortBy = 'default';
-  /** 渲染后是否把光标放回书架搜索框(同书城, 整页重建会丢焦点) */
-  private shelfFocusSearch = false;
 
   // ---- 书城状态 ----
   /**
@@ -1534,26 +1532,25 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       case 'refreshShelf':
         void this.refreshShelf();
         break;
-      // ---- 书架视图: 搜索 / 分组 / 排序 / 标签 ----
-      case 'shelfSearch': {
-        // 纯本地过滤: 书架数据全量在内存里, 不打接口
+      // ---- 书架视图: 搜索 / 分组 / 排序 ----
+      //
+      // 三个会 render 的动作 (切分组/切排序/折叠分组) 都会捎带前端搜索框的当前值,
+      // 这里统一先吸收进 shelfKeyword, render 时才能把输入框原样回填。
+      case 'shelfSearchState': {
+        // ⚠️ 只记录, **绝不 render**。
+        //
+        // 书架搜索是纯前端过滤 (webview 里 toggle 书卡可见性), 这条消息唯一的用途是
+        // 让 extension 记住关键词, 以便"切分组/切排序"触发 render 后能把输入框回填回去。
+        // 一旦在这里 render, 就会重建整页 HTML 把 <input> 换掉 —— 中文输入法正在拼的
+        // 音节会被打断, 这正是 v3.2.1 的 bug。
         const kw = (msg.payload as { keyword?: string })?.keyword ?? '';
-        if (this.shelfKeyword !== kw) {
-          this.shelfKeyword = kw;
-          this.shelfFocusSearch = true;
-          this.render();
-        }
+        this.shelfKeyword = kw;
         break;
       }
-      case 'shelfClearSearch':
-        if (this.shelfKeyword) {
-          this.shelfKeyword = '';
-          this.shelfFocusSearch = true;
-          this.render();
-        }
-        break;
       case 'shelfGroupBy': {
-        const key = (msg.payload as { key?: string })?.key;
+        const p = msg.payload as { key?: string; keyword?: string } | undefined;
+        if (typeof p?.keyword === 'string') this.shelfKeyword = p.keyword;
+        const key = p?.key;
         const hit = SHELF_GROUPS.find((g) => g.key === key);
         if (hit && this.shelfGroupBy !== hit.key) {
           this.shelfGroupBy = hit.key;
@@ -1571,7 +1568,9 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
         break;
       }
       case 'shelfSortBy': {
-        const key = (msg.payload as { key?: string })?.key;
+        const p = msg.payload as { key?: string; keyword?: string } | undefined;
+        if (typeof p?.keyword === 'string') this.shelfKeyword = p.keyword;
+        const key = p?.key;
         const hit = SHELF_SORTS.find((s) => s.key === key);
         if (hit && this.shelfSortBy !== hit.key) {
           this.shelfSortBy = hit.key;
@@ -1581,7 +1580,9 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
         break;
       }
       case 'toggleGroup': {
-        const name = (msg.payload as { name?: string })?.name;
+        const p = msg.payload as { name?: string; keyword?: string } | undefined;
+        if (typeof p?.keyword === 'string') this.shelfKeyword = p.keyword;
+        const name = p?.name;
         if (typeof name === 'string') {
           if (this.expandedGroups.has(name)) {
             this.expandedGroups.delete(name);
@@ -1896,59 +1897,57 @@ ${prefsBlock}
     const toolbar = this.buildShelfToolbarHtml();
     const groups = this.computeGroups();
 
-    // 搜索把所有书都过滤光了 — 给个明确出口, 别让用户以为书架空了
-    if (groups.length === 0) {
-      return `<main class="content shelf">${toolbar}
-        <div class="empty">
-          <p>没有匹配「${escapeHtml(this.shelfKeyword)}」的书</p>
-          <button class="ghost" data-act="shelfClearSearch">清除搜索</button>
-        </div>
-      </main>`;
-    }
-
-    // 搜索时强制展开: 用户此刻要的是"结果", 不该还要一个个点开分组去找
-    // (只认搜索这一种情况 — 其它场景保留用户自己的折叠状态, 点标题才有反馈)
-    const forceOpen = !!this.shelfKeyword;
-
     // 选了"云端分组"却一个分组都没有 → 说明用户在 APP 里没建过分组。
     // 这里明确告诉他分组该去哪建, 免得在插件里到处找"新建分组"按钮 (web 端没这个接口)。
     const noArchiveHint =
-      this.shelfGroupBy === 'archive' && this.archives.length === 0 && !this.shelfKeyword
+      this.shelfGroupBy === 'archive' && this.archives.length === 0
         ? `<div class="shelf-tip">还没有分组。分组需要在微信读书 APP / 网页版里创建，这里点 ⟳ 刷新就能同步过来。</div>`
         : '';
 
+    // ⚠️ book-list **无论展开与否都渲染**, 折叠纯靠 CSS 隐藏。
+    //
+    // 这是为了让书架搜索做成"纯前端过滤": 所有书卡都在 DOM 里, 输入时直接 toggle
+    // 元素可见性即可, 不需要回传 extension → 不触发 render() → 不重建整页 HTML。
+    //
+    // 修复历史 (v3.3.0): 之前搜索走 input 事件 + 防抖 post → extension render() →
+    // webview.html 整个被替换。中文输入法正在拼的音节会随着 <input> 一起被销毁,
+    // 表现为"打几个拼音就被强制断掉", 根本没法输入汉字 (书城那边是回车才提交,
+    // 所以没这毛病)。DOM 常驻 + 前端过滤后, 输入过程中零重建, IME 完全不受干扰。
     const sections = groups
       .map((g) => {
-        const expanded = forceOpen || this.expandedGroups.has(g.name);
+        const expanded = this.expandedGroups.has(g.name);
         const arrow = expanded ? '▾' : '▸';
-        const body = expanded
-          ? `<div class="book-list">${g.books.map((b) => this.bookCardHtml(b)).join('')}</div>`
-          : '';
         return `<section class="shelf-section ${expanded ? 'open' : 'closed'}">
           <button class="shelf-section-title" data-toggle="${escapeAttr(g.name)}">
             <span class="arrow">${arrow}</span>
             <span class="name">${escapeHtml(g.name)}</span>
-            <span class="count">${g.books.length}</span>
+            <span class="count" data-total="${g.books.length}">${g.books.length}</span>
           </button>
-          ${body}
+          <div class="book-list">${g.books.map((b) => this.bookCardHtml(b)).join('')}</div>
         </section>`;
       })
       .join('');
 
-    return `<main class="content shelf">${toolbar}${noArchiveHint}${sections}</main>`;
+    // 搜索无命中时由前端 toggle 显示 (同样不走 render)
+    const noResult = `<div class="empty" id="shelf-no-result" hidden>
+      <p>没有匹配的书</p>
+      <button class="ghost" id="shelf-no-result-clear">清除搜索</button>
+    </div>`;
+
+    return `<main class="content shelf" id="shelf-main">${toolbar}${noArchiveHint}${sections}${noResult}</main>`;
   }
 
   /**
    * 书架工具条: 搜索框 + 分组方式 chips + 排序 chips。
    *
-   * 与书城工具条同构 (搜索框 sticky / 焦点靠 data-autofocus 恢复), 但这里的搜索是
-   * **纯本地过滤**, 书架数据本来就全量在内存里, 不需要也不该为过滤打接口。
+   * 搜索是 **纯前端过滤**: 输入时只在 webview 里 toggle 书卡可见性, 不回传 extension、
+   * 不触发 render。这既是性能考虑 (书架数据本来就全量在 DOM 里), 更是为了不打断中文
+   * 输入法 —— 详见 buildShelfHtml 里关于 v3.3.0 的注释。
+   *
+   * extension 端保留的 shelfKeyword 只用于"切分组/切排序导致 render 后回填输入框",
+   * 由前端在防抖后通过 shelfSearchState 消息同步过来, 那个消息**不会**触发 render。
    */
   private buildShelfToolbarHtml(): string {
-    const autofocus = this.shelfFocusSearch ? '1' : '0';
-    this.shelfFocusSearch = false;
-    const searching = !!this.shelfKeyword;
-
     const groupChips = SHELF_GROUPS.map(
       (g) =>
         `<button class="sort-chip ${this.shelfGroupBy === g.key ? 'active' : ''}" data-shelf-group="${g.key}" title="${escapeAttr(g.tip)}">${escapeHtml(g.label)}</button>`,
@@ -1958,19 +1957,16 @@ ${prefsBlock}
         `<button class="sort-chip ${this.shelfSortBy === s.key ? 'active' : ''}" data-shelf-sort="${s.key}" title="${escapeAttr(s.tip)}">${escapeHtml(s.label)}</button>`,
     ).join('');
 
+    // 清除按钮常驻 DOM, 由前端按输入框内容 toggle hidden —— 不能像书城那样靠
+    // 后端条件渲染, 否则"输入第一个字符时按钮出现"就得 render 一次, 又把 IME 打断了。
     return `
       <div class="shelf-toolbar">
         <div class="store-search">
           <span class="ss-icon" aria-hidden="true">🔎</span>
           <input id="shelf-search-input" class="ss-input" type="text" spellcheck="false"
                  placeholder="在书架里找书名 / 作者"
-                 value="${escapeAttr(this.shelfKeyword)}"
-                 data-autofocus="${autofocus}" />
-          ${
-            searching
-              ? `<button class="ss-btn" id="shelf-search-clear" title="清除搜索">✕</button>`
-              : ''
-          }
+                 value="${escapeAttr(this.shelfKeyword)}" />
+          <button class="ss-btn" id="shelf-search-clear" title="清除搜索" ${this.shelfKeyword ? '' : 'hidden'}>✕</button>
         </div>
         <div class="shelf-view-row">
           <span class="svr-label">分组</span>
@@ -1985,16 +1981,18 @@ ${prefsBlock}
   }
 
   /**
-   * 书架分桶 — 先过滤(搜索词) → 再分组(4 种方式) → 组内排序(4 种方式)。
+   * 书架分桶 → 组内排序。
    *
    * 分组方式:
    *   archive  微信读书 APP 里自建的云端分组(只读), 顺序保持服务端给的顺序
-   *   tag      本插件的本地标签, 一本书有多个标签会**同时出现在多个桶**里(符合标签语义)
    *   status   在读 / 已读完 / 未开始
    *   none     全部平铺一个桶
+   *
+   * 注意这里 **不做关键词过滤** —— 搜索是纯前端行为 (见 buildShelfHtml 注释),
+   * 全量书卡都要进 DOM, 前端才能靠 toggle 可见性实现零重建过滤。
    */
   private computeGroups(): { name: string; books: WereadBook[] }[] {
-    const books = this.filteredShelfBooks();
+    const books = this.books;
     if (books.length === 0) return [];
 
     const groups: { name: string; books: WereadBook[] }[] = [];
@@ -2047,17 +2045,6 @@ ${prefsBlock}
     return groups;
   }
 
-  /** 按搜索词过滤书架 (书名 / 作者, 大小写不敏感) */
-  private filteredShelfBooks(): WereadBook[] {
-    const kw = this.shelfKeyword.trim().toLowerCase();
-    if (!kw) return this.books;
-    return this.books.filter((b) => {
-      const title = (b.title ?? '').toLowerCase();
-      const author = (b.author ?? '').toLowerCase();
-      return title.includes(kw) || author.includes(kw);
-    });
-  }
-
   /**
    * 取一本书的阅读进度百分比。
    *
@@ -2107,8 +2094,11 @@ ${prefsBlock}
         : b.finished
         ? `<span class="progress done">已读完</span>`
         : '';
+    // data-search-key: 书名 + 作者的小写拼接, 供 webview 端做零重建的即时过滤
+    // (书架搜索不回传 extension, 见 buildShelfHtml 注释)
+    const searchKey = `${b.title ?? ''} ${b.author ?? ''}`.toLowerCase();
     return `
-      <button class="book-card" data-book-id="${escapeAttr(b.bookId)}" title="${escapeAttr(b.title ?? '')}">
+      <button class="book-card" data-book-id="${escapeAttr(b.bookId)}" data-search-key="${escapeAttr(searchKey)}" title="${escapeAttr(b.title ?? '')}">
         <div class="cover-wrap ${cover ? '' : 'no-cover'}">${coverHtml}<div class="cover-fallback">${escapeHtml((b.title ?? '?').slice(0, 1))}</div></div>
         <div class="meta">
           <div class="title">${escapeHtml(b.title ?? '(未命名)')}</div>
@@ -3071,6 +3061,15 @@ ${prefsBlock}
         display: flex; flex-direction: column; gap: 2px;
         padding: 2px 0 4px 14px;
       }
+      /* 折叠改由 CSS 控制 —— book-list 始终在 DOM 里, 前端搜索才能过滤到
+       * 折叠分组内部的书 (详见 buildShelfHtml 里 v3.3.0 的注释) */
+      .shelf-section.closed .book-list { display: none; }
+      /* 搜索进行中: 折叠的分组也要把命中的书露出来, 否则用户以为搜不到 */
+      .shelf.searching .shelf-section.closed .book-list { display: flex; }
+      /* 前端过滤用 hidden 属性; .book-card 是 flex, 必须显式压过去 */
+      .shelf .book-card[hidden],
+      .shelf .shelf-section[hidden],
+      .shelf .shelf-tip[hidden] { display: none !important; }
       .book-card {
         display: flex; align-items: center; gap: 10px;
         width: 100%; padding: 6px 8px;
@@ -4372,59 +4371,131 @@ ${prefsBlock}
         });
       });
 
+      // 书架搜索框的当前值 — 供"会触发 render 的操作"(折叠分组/切分组/切排序) 捎带上,
+      // 免得防抖同步还没跑完就 render, 输入框内容被清掉。
+      function shelfKeywordNow() {
+        const el = document.getElementById('shelf-search-input');
+        return el ? el.value : '';
+      }
+
       // 书架分组折叠/展开
       document.querySelectorAll('.shelf-section-title[data-toggle]').forEach(el => {
         el.addEventListener('click', () => {
           const name = el.getAttribute('data-toggle');
-          if (name) post('toggleGroup', { name });
+          if (name) post('toggleGroup', { name, keyword: shelfKeywordNow() });
         });
       });
 
-      // ===== 书架工具条: 本地搜索 / 分组方式 / 排序 / 打标签 =====
-      // 搜索是纯本地过滤 (书架数据全在 extension 端内存里), 所以敲一下就能出结果;
-      // 但整页重建会丢焦点, 于是跟书城一样走 data-autofocus + 光标回末尾。
+      // ===== 书架工具条: 本地搜索 / 分组方式 / 排序 =====
+      //
+      // 搜索是**纯前端过滤**, 全程不回传 extension、不触发 render:
+      //   所有书卡 (含折叠分组内部的) 都已经在 DOM 里, 输入时只 toggle 元素的 hidden。
+      //
+      // 为什么必须这么做 (v3.3.0 修复):
+      //   老实现是 input 防抖 → post → extension render() → webview.html 整个被替换。
+      //   中文输入法正在拼的音节会随着 <input> 一起被销毁, 表现为"打几个拼音就被强制
+      //   断掉", 汉字根本输不进去。书城那边是回车才提交所以没事, 书架是边打边过滤才踩雷。
+      //
+      // 仅在防抖 400ms 后发一条 shelfSearchState 给 extension **记录**关键词 (不 render),
+      // 这样切分组/切排序真的 render 时能把输入框内容回填回去。
       (function setupShelfToolbar() {
+        const shelfMain = document.getElementById('shelf-main');
         const input = document.getElementById('shelf-search-input');
-        if (input) {
-          if (input.getAttribute('data-autofocus') === '1') {
-            setTimeout(function() {
-              try {
-                input.focus();
-                const v = input.value;
-                input.setSelectionRange(v.length, v.length);
-              } catch (e) {}
-            }, 30);
-          }
-          // 防抖 250ms: 每个字符都回传会触发整页重建, 打字会卡
-          let timer = null;
-          input.addEventListener('input', function() {
-            if (timer) clearTimeout(timer);
-            timer = setTimeout(function() { post('shelfSearch', { keyword: input.value }); }, 250);
-          });
-          input.addEventListener('keydown', function(e) {
-            if (e.key === 'Enter') {
-              e.preventDefault();
-              if (timer) clearTimeout(timer);
-              post('shelfSearch', { keyword: input.value });
-            } else if (e.key === 'Escape') {
-              e.preventDefault();
-              if (input.value) { input.value = ''; post('shelfClearSearch'); }
-            }
-          });
-        }
         const clearBtn = document.getElementById('shelf-search-clear');
-        if (clearBtn) clearBtn.addEventListener('click', function() { post('shelfClearSearch'); });
+        const noResult = document.getElementById('shelf-no-result');
+        const noResultClear = document.getElementById('shelf-no-result-clear');
 
+        // 分组/排序 chips 在任何情况下都要绑 (书架为空时 shelfMain 也可能不在)
         document.querySelectorAll('[data-shelf-group]').forEach(function(el) {
           el.addEventListener('click', function() {
-            post('shelfGroupBy', { key: el.getAttribute('data-shelf-group') });
+            post('shelfGroupBy', { key: el.getAttribute('data-shelf-group'), keyword: shelfKeywordNow() });
           });
         });
         document.querySelectorAll('[data-shelf-sort]').forEach(function(el) {
           el.addEventListener('click', function() {
-            post('shelfSortBy', { key: el.getAttribute('data-shelf-sort') });
+            post('shelfSortBy', { key: el.getAttribute('data-shelf-sort'), keyword: shelfKeywordNow() });
           });
         });
+
+        if (!shelfMain || !input) return;
+
+        const cards = Array.prototype.slice.call(shelfMain.querySelectorAll('.book-card[data-search-key]'));
+        const sections = Array.prototype.slice.call(shelfMain.querySelectorAll('.shelf-section'));
+        const tip = shelfMain.querySelector('.shelf-tip');
+
+        function applyFilter(raw) {
+          const kw = (raw || '').trim().toLowerCase();
+          const searching = kw.length > 0;
+          // searching class: 让 CSS 把折叠分组里的命中书也露出来
+          shelfMain.classList.toggle('searching', searching);
+          if (tip) tip.hidden = searching;
+
+          let total = 0;
+          for (let i = 0; i < cards.length; i++) {
+            const card = cards[i];
+            const ok = !searching || (card.getAttribute('data-search-key') || '').indexOf(kw) >= 0;
+            card.hidden = !ok;
+            if (ok) total++;
+          }
+
+          // 分组标题的计数徽章跟着命中数走, 没命中的分组整个收起来
+          for (let i = 0; i < sections.length; i++) {
+            const sec = sections[i];
+            const badge = sec.querySelector('.count');
+            if (!searching) {
+              sec.hidden = false;
+              if (badge) badge.textContent = badge.getAttribute('data-total') || badge.textContent;
+              continue;
+            }
+            const hit = sec.querySelectorAll('.book-card[data-search-key]:not([hidden])').length;
+            sec.hidden = hit === 0;
+            if (badge) badge.textContent = String(hit);
+          }
+
+          if (noResult) noResult.hidden = !(searching && total === 0);
+          if (clearBtn) clearBtn.hidden = !searching;
+        }
+
+        function clearSearch() {
+          input.value = '';
+          applyFilter('');
+          post('shelfSearchState', { keyword: '' });
+          input.focus();
+        }
+
+        // IME 保护: 拼音输入过程中 (compositionstart ~ end) 不过滤 —— 半成品拼音串
+        // 匹配不到任何书, 列表会疯狂闪空; 等用户上屏成词了再过滤一次即可。
+        let composing = false;
+        let timer = null;
+        function scheduleStateSync() {
+          if (timer) clearTimeout(timer);
+          timer = setTimeout(function() { post('shelfSearchState', { keyword: input.value }); }, 400);
+        }
+
+        input.addEventListener('compositionstart', function() { composing = true; });
+        input.addEventListener('compositionend', function() {
+          composing = false;
+          applyFilter(input.value);
+          scheduleStateSync();
+        });
+        input.addEventListener('input', function() {
+          if (composing) return;
+          applyFilter(input.value);
+          scheduleStateSync();
+        });
+        input.addEventListener('keydown', function(e) {
+          // e.isComposing: 中文候选框里按回车是"选词"而不是"提交搜索", 必须放行
+          if (e.key === 'Escape' && !e.isComposing) {
+            e.preventDefault();
+            if (input.value) clearSearch();
+          }
+        });
+
+        if (clearBtn) clearBtn.addEventListener('click', clearSearch);
+        if (noResultClear) noResultClear.addEventListener('click', clearSearch);
+
+        // render 后回填的关键词 (切分组/排序时) 需要立刻按它过滤一遍, 保证视图一致
+        if (input.value) applyFilter(input.value);
       })();
 
       // ===== 书城: 搜索 / 榜单切换 / 书卡操作 =====
@@ -4449,6 +4520,9 @@ ${prefsBlock}
             }, 30);
           }
           input.addEventListener('keydown', function(e) {
+            // e.isComposing: 中文输入法候选框里按 Enter 是"选词上屏", 不是"提交搜索"。
+            // 不挡的话用户刚打完拼音按回车, 搜的是半截拼音 (还会触发 render 打断输入)。
+            if (e.isComposing) return;
             if (e.key === 'Enter') {
               e.preventDefault();
               post('storeSearch', { keyword: input.value });

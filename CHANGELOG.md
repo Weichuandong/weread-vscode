@@ -2,6 +2,39 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)，所有重要变更都会记录在这里。
 
+## [3.3.0] - 2026-11-13
+
+> **新增 Saga（起点中文网）与 Codex（网页小说阅读器）两个模块；修复 Folio 书架搜索打断中文输入法的问题。**
+
+### Added — Saga (起点中文网)
+
+- 📜 **新的 Activity Bar 视图 Saga**（`qidianVscode.main`），书架 / 书城 / 在读三个 tab，复用 Folio 的视觉语言与排版档位（[`src/modules/qidian/`](src/modules/qidian)）
+- 🔌 **接口**：全部走起点移动站前端自用的 `/webcommon/*` JSON 接口（从 m 站 vite 产物逆向，见 [`types/index.ts`](src/modules/qidian/types/index.ts) 头注释的接口表）。CSRF 双提交：Cookie 与查询参数带同一个 `_csrfToken`，未登录时本地生成
+- 🔍 **书城**：搜索 `GET /webcommon/search/list`（服务端 `orderBy` 排序：综合 / 收藏 / 月票 / 推荐 / 字数 / 更新）；9 个榜单 `GET /webcommon/rank/{type}list` × 15 个题材过滤；两者都支持「加载更多」，翻页边界按 bookId 去重；搜索、榜单、免费章节阅读**均无需登录**
+- ➕ **加入书架** `POST /webcommon/bookshelf/addbooks`，识别 `1002 已在书架 / 1003 书架已满`；"已在书架"由搜索接口 `isInShelf` + 已加载书架 + 本会话刚加入三处合并
+- 📚 **书架**：`/webcommon/bookshelf/mgroups` + 按分组翻页拉 `/webcommon/bookshelf/mlist` 合并；分组方式（云端分组 / 阅读状态 / 不分组）、排序（最近 / 有更新 / 书名）、纯前端搜索（IME 保护）、折叠状态，偏好持久化
+- 📖 **阅读**：目录 `/webcommon/book/mCategory`（按卷分组、VIP 打标、可搜索）、正文 `/webcommon/chapter/getMChapterInfo`（只保留纯文本段落，杜绝脚本 / 样式注入）、作家的话、Aa 排版（偏好独立于 Folio 保存）、键盘翻页、后台预拉下一章
+- ☁️ **云端进度**：打开书时 `getReadStatus` 定位章节，切章后 `updReadStatus` 上报，与手机 / 网页互通
+- 🔐 **登录**：粘贴 Cookie（需 `ywkey`），SecretStorage 存储；`code 1000` / 302 跳登录页识别为失效，挂可关闭横幅；`Saga: 检查登录状态` 命令现场校验
+- 🛑 **不破解**：VIP 章节加密下发（`cES≠0`）或字体反爬（`fEnS≠0`）时只显示试读 / 提示到浏览器阅读；WAF 风控页明确提示，不绕过
+
+### Added — Codex (网页小说阅读器)
+
+- 🔗 **新的 Activity Bar 视图 Codex**（`webnovelVscode.main`），书签 / 在读两个 tab（[`src/modules/webnovel/`](src/modules/webnovel)）：粘贴任意「笔趣阁」类小说站的章节页或目录页链接即可阅读，无需登录
+- 🧩 **通用解析**（纯启发式，不写死站点）：正文容器识别 + 站点水印 / 广告行过滤；`xxx.html / xxx_2.html …` 章内分页自动回溯到第一页并合并成整章，跨页被腰斩的段落接回；按链接文字识别上一章 / 下一章 / 目录；GBK / UTF-8 自动识别
+- 📑 **目录**：按章节 URL 模板识别章节链接，丢弃"最新章节"区块，自动合并 `<select>` / "下一页"目录分页，倒序目录自动翻正；阅读时统一用底部目录抽屉，贴目录页链接时先展示可搜索的整页目录
+- 📖 **阅读**：阅读区、目录抽屉、Aa 排版、键盘翻页与 Saga 共用同一套实现（排版偏好独立保存）；后台预拉下一章；最近阅读记录，点一下从上次读到的章节继续
+- 💾 **离线缓存**：底部「⤓ 缓存」按钮选择缓存后续 20 / 50 / 100 / 自定义章数，或全书；落盘到扩展 globalStorage，跨会话保留，已缓存章节自动跳过，失败自动重试一次；进度通知可随时取消，目录里给已缓存章节打标；同时保存离线目录，断网也能从书签继续读、翻章（[`ChapterStore`](src/modules/webnovel/services/ChapterStore.ts) / [`CacheDownloader`](src/modules/webnovel/services/CacheDownloader.ts)）；并发数可配 `webnovel.cacheConcurrency`
+
+### Fixed
+
+- ⌨️ **Folio 书架搜索打断中文输入法** —— 以前每输入一个字符，扩展端都会重新渲染整个页面，拼音输到一半输入框就被换掉，汉字输不进去。现在改成纯前端过滤：所有书卡都留在页面里（折叠分组改由 CSS 隐藏），输入时只切换书卡是否显示；拼音组词过程中暂停过滤，分组标题的计数跟着命中数变化，没搜到时给出「清除搜索」按钮（[`MainViewProvider.ts`](src/modules/weread/views/MainViewProvider.ts)）
+
+### Changed
+
+- [`readingPrefs.ts`](src/modules/weread/views/readingPrefs.ts) 的 `loadReadingPrefs` / `saveReadingPrefs` 新增可选 `storageKey` 参数（默认值不变，Folio 行为不受影响），供 Saga 独立保存排版偏好
+- Saga 的 `skeletonHtml` / `buildSettingsPopoverHtml` 改为导出，前端脚本的 `acquireVsCodeApi()` 实例挂到 `window.__qdVscode`，供 Codex 复用
+
 ## [3.2.1] - 2026-09-03
 
 > **仓库地址跟进改名 + README 徽章改为动态。** 纯元数据维护，无功能改动。

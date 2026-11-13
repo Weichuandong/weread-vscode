@@ -110,9 +110,12 @@ const GLOBAL_STATE_KEY = 'weread.readingPrefs.v1';
  *   一旦扩散到 CSS 变量会导致整页正文消失, 比 reset 体验更糟。
  *   这里按字段做"白名单 + 范围校验", 任何不合法值直接回落到默认。
  */
-export function loadReadingPrefs(context: vscode.ExtensionContext): ReadingPrefs {
+export function loadReadingPrefs(
+  context: vscode.ExtensionContext,
+  storageKey: string = GLOBAL_STATE_KEY,
+): ReadingPrefs {
   const raw =
-    context.globalState.get<Partial<ReadingPrefs>>(GLOBAL_STATE_KEY) ?? {};
+    context.globalState.get<Partial<ReadingPrefs>>(storageKey) ?? {};
   return {
     fontSize: FONT_SIZE_STEPS.includes(raw.fontSize as number)
       ? (raw.fontSize as number)
@@ -134,11 +137,16 @@ export function loadReadingPrefs(context: vscode.ExtensionContext): ReadingPrefs
   };
 }
 
+/**
+ * @param storageKey 默认是 Folio (微信读书) 的 key; 其它阅读模块 (如 Saga 起点) 传自己的 key,
+ *                   各模块排版偏好互不影响。
+ */
 export async function saveReadingPrefs(
   context: vscode.ExtensionContext,
   prefs: ReadingPrefs,
+  storageKey: string = GLOBAL_STATE_KEY,
 ): Promise<void> {
-  await context.globalState.update(GLOBAL_STATE_KEY, prefs);
+  await context.globalState.update(storageKey, prefs);
 }
 
 /**

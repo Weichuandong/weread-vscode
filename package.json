@@ -1,7 +1,7 @@
 {
   "name": "weread-vscode",
-  "displayName": "TouchPlus — 微信读书 / 知乎 / 小黑盒 摸鱼套件",
-  "description": "VSCode 摸鱼套件：微信读书阅读 + 知乎推荐流 + 小黑盒(MAX+)游戏资讯（守望先锋/CS:GO/APEX/英雄联盟/绝地求生/三角洲），统一侧边栏，零跳转零打扰",
+  "displayName": "TouchPlus — 微信读书 / 起点 / 网页小说 / 知乎 / 小黑盒 摸鱼套件",
+  "description": "VSCode 摸鱼套件：微信读书阅读 + 起点中文网（书架/书城/阅读）+ 网页小说阅读器（粘贴链接即读，自动合并分页/解析目录）+ 知乎推荐流 + 小黑盒(MAX+)游戏资讯（守望先锋/CS:GO/APEX/英雄联盟/绝地求生/三角洲），统一侧边栏，零跳转零打扰",
   "version": "3.2.1",
   "publisher": "weichuandong",
   "license": "MIT",
@@ -26,6 +26,11 @@
   ],
   "keywords": [
     "weread",
+    "qidian",
+    "起点",
+    "网文",
+    "网页小说",
+    "笔趣阁",
     "zhihu",
     "xiaoheihe",
     "摸鱼",
@@ -82,6 +87,16 @@
           "id": "xiaoheiheVscode",
           "title": "Arena",
           "icon": "resources/xiaoheihe.svg"
+        },
+        {
+          "id": "qidianVscode",
+          "title": "Saga",
+          "icon": "resources/qidian.svg"
+        },
+        {
+          "id": "webnovelVscode",
+          "title": "Codex",
+          "icon": "resources/webnovel.svg"
         }
       ]
     },
@@ -111,6 +126,24 @@
           "name": "arena",
           "icon": "resources/xiaoheihe.svg",
           "contextualTitle": "Arena"
+        }
+      ],
+      "qidianVscode": [
+        {
+          "type": "webview",
+          "id": "qidianVscode.main",
+          "name": "saga",
+          "icon": "resources/qidian.svg",
+          "contextualTitle": "Saga"
+        }
+      ],
+      "webnovelVscode": [
+        {
+          "type": "webview",
+          "id": "webnovelVscode.main",
+          "name": "codex",
+          "icon": "resources/webnovel.svg",
+          "contextualTitle": "Codex"
         }
       ]
     },
@@ -238,6 +271,80 @@
         "command": "xiaoheihe.dumpTopicMap",
         "title": "Arena: 导出板块 topicMap 字典 (复制 + 打开预览)",
         "icon": "$(export)"
+      },
+      {
+        "command": "qidian.importCookie",
+        "title": "Saga: 导入 Cookie 登录",
+        "icon": "$(sign-in)"
+      },
+      {
+        "command": "qidian.logout",
+        "title": "Saga: 退出登录",
+        "icon": "$(sign-out)"
+      },
+      {
+        "command": "qidian.checkLogin",
+        "title": "Saga: 检查登录状态",
+        "icon": "$(pulse)"
+      },
+      {
+        "command": "qidian.refreshBookshelf",
+        "title": "Saga: 刷新书架",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "qidian.openStore",
+        "title": "Saga: 打开书城 (榜单)",
+        "icon": "$(library)"
+      },
+      {
+        "command": "qidian.searchBooks",
+        "title": "Saga: 搜索书城",
+        "icon": "$(search)"
+      },
+      {
+        "command": "qidian.openBook",
+        "title": "Saga: 打开书籍"
+      },
+      {
+        "command": "qidian.openInBrowser",
+        "title": "Saga: 在浏览器中打开",
+        "icon": "$(link-external)"
+      },
+      {
+        "command": "qidian.resetReadingState",
+        "title": "Saga: 清除在读状态(卡死时使用)",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "webnovel.openUrl",
+        "title": "Codex: 打开网页小说链接",
+        "icon": "$(link)"
+      },
+      {
+        "command": "webnovel.cacheChapters",
+        "title": "Codex: 离线缓存章节 (后续 N 章 / 全书)",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "webnovel.clearCache",
+        "title": "Codex: 清空全部离线缓存",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "webnovel.openInBrowser",
+        "title": "Codex: 在浏览器中打开",
+        "icon": "$(link-external)"
+      },
+      {
+        "command": "webnovel.clearHistory",
+        "title": "Codex: 清空最近阅读记录",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "webnovel.resetReadingState",
+        "title": "Codex: 清除在读状态(卡死时使用)",
+        "icon": "$(clear-all)"
       }
     ],
     "menus": {
@@ -341,6 +448,71 @@
           "command": "xiaoheihe.resetImei",
           "when": "view == xiaoheiheVscode.main",
           "group": "9_recovery@1"
+        },
+        {
+          "command": "qidian.refreshBookshelf",
+          "when": "view == qidianVscode.main",
+          "group": "navigation@1"
+        },
+        {
+          "command": "qidian.searchBooks",
+          "when": "view == qidianVscode.main",
+          "group": "navigation@2"
+        },
+        {
+          "command": "qidian.openStore",
+          "when": "view == qidianVscode.main",
+          "group": "1_actions@1"
+        },
+        {
+          "command": "qidian.importCookie",
+          "when": "view == qidianVscode.main",
+          "group": "1_actions@3"
+        },
+        {
+          "command": "qidian.checkLogin",
+          "when": "view == qidianVscode.main",
+          "group": "1_actions@4"
+        },
+        {
+          "command": "qidian.logout",
+          "when": "view == qidianVscode.main",
+          "group": "1_actions@5"
+        },
+        {
+          "command": "qidian.resetReadingState",
+          "when": "view == qidianVscode.main",
+          "group": "9_recovery@1"
+        },
+        {
+          "command": "webnovel.openUrl",
+          "when": "view == webnovelVscode.main",
+          "group": "navigation@1"
+        },
+        {
+          "command": "webnovel.openInBrowser",
+          "when": "view == webnovelVscode.main",
+          "group": "1_actions@1"
+        },
+        {
+          "command": "webnovel.cacheChapters",
+          "when": "view == webnovelVscode.main",
+          "group": "5_cache@1"
+        },
+        {
+          "command": "webnovel.clearCache",
+          "when": "view == webnovelVscode.main",
+          "group": "5_cache@2"
+        },
+        {
+          "command": "webnovel.clearHistory",
+          "when": "view == webnovelVscode.main",
+          "group": "9_recovery@1"
+        },
+        {
+          "command": "webnovel.resetReadingState",
+          "when": "view == webnovelVscode.main",
+          "group": "9_recovery@2"
         }
       ]
     },
@@ -507,6 +679,53 @@
             ],
             "default": "header",
             "description": "登录态 cookie 注入位置。改完不用重启，下次请求生效。一般保持默认；接口报 '非法请求' / '验证参数错误' 时可临时切到 'off' 排除是不是 cookie 鉴权失败导致。"
+          }
+        }
+      },
+      {
+        "title": "Saga",
+        "properties": {
+          "qidian.requestTimeout": {
+            "type": "number",
+            "default": 15000,
+            "description": "起点 HTTP 请求超时时间（毫秒）"
+          },
+          "qidian.userAgent": {
+            "type": "string",
+            "default": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+            "description": "起点请求使用的 User-Agent（接口来自移动站 m.qidian.com，默认使用移动端 UA）"
+          },
+          "qidian.prefetchNextChapter": {
+            "type": "boolean",
+            "default": true,
+            "description": "阅读时后台静默预拉下一章（仅免费章节，进程内缓存），翻页零等待"
+          }
+        }
+      },
+      {
+        "title": "Codex",
+        "properties": {
+          "webnovel.requestTimeout": {
+            "type": "number",
+            "default": 15000,
+            "description": "网页小说 HTTP 请求超时时间（毫秒）"
+          },
+          "webnovel.userAgent": {
+            "type": "string",
+            "default": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+            "description": "抓取网页使用的 User-Agent（默认移动端 UA，小说站移动版页面更干净；部分站点会按 UA 跳转 PC / 移动版）"
+          },
+          "webnovel.prefetchNextChapter": {
+            "type": "boolean",
+            "default": true,
+            "description": "阅读时后台静默预拉下一章（含分页合并，进程内缓存），翻页零等待"
+          },
+          "webnovel.cacheConcurrency": {
+            "type": "number",
+            "default": 2,
+            "minimum": 1,
+            "maximum": 5,
+            "description": "离线缓存时同时下载的章节数（默认 2；调大更快，但容易被小说站限流 / 封 IP）"
           }
         }
       }
