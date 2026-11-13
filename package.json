@@ -2,7 +2,7 @@
   "name": "weread-vscode",
   "displayName": "TouchPlus — 微信读书 / 起点 / 网页小说 / 知乎 / 小黑盒 摸鱼套件",
   "description": "VSCode 摸鱼套件：微信读书阅读 + 起点中文网（书架/书城/阅读）+ 网页小说阅读器（粘贴链接即读，自动合并分页/解析目录）+ 知乎推荐流 + 小黑盒(MAX+)游戏资讯（守望先锋/CS:GO/APEX/英雄联盟/绝地求生/三角洲），统一侧边栏，零跳转零打扰",
-  "version": "3.2.1",
+  "version": "3.3.0",
   "publisher": "weichuandong",
   "license": "MIT",
   "author": {
